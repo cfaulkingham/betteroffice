@@ -93,6 +93,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   const editingRef = useRef(editing);
   const draftRef = useRef(draft);
   const committedTextRef = useRef('');
+  const textRefusedRef = useRef(false);
   const editWrapRef = useRef<HTMLDivElement>(null);
   const editBoxRef = useRef<HTMLTextAreaElement>(null);
   editingRef.current = editing;
@@ -178,6 +179,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     setDraft(value);
     draftRef.current = value;
     const next = { pageId, shapeId, selectAll: override === undefined };
+    textRefusedRef.current = false;
     setEditing(next);
     editingRef.current = next;
   }, []);
@@ -214,18 +216,27 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     ...shapeStencils,
     { id: 'document', nameKey: 'shapesPanel.documentShapes', shapes: documentStencilEntries(documentStencil.masters) },
   ], [documentStencil]);
-  const commitTextEdit = useCallback(() => {
-    const current = editingRef.current;
-    const handle = handleRef.current;
-    if (!current || !handle) return;
-    const text = draftRef.current;
+  const closeTextEdit = useCallback(() => {
+    textRefusedRef.current = false;
     setEditing(null);
     editingRef.current = null;
-    if (text === committedTextRef.current) return;
+  }, []);
+
+  const commitTextEdit = useCallback((): boolean => {
+    const current = editingRef.current;
+    const handle = handleRef.current;
+    if (!current || !handle) return true;
+    const text = draftRef.current;
+    if (text === committedTextRef.current) {
+      closeTextEdit();
+      return true;
+    }
     try { handle.setShapeText(current.pageId, current.shapeId, text); }
-    catch (value) { reportError(value); return; }
+    catch (value) { textRefusedRef.current = true; reportError(value); return false; }
+    closeTextEdit();
     refresh(undefined, true);
-  }, [refresh, reportError]);
+    return true;
+  }, [closeTextEdit, refresh, reportError]);
 
   useEffect(() => {
     sessionRef.current = { file, clientId: sessionClientId, initialUpdate };
@@ -233,7 +244,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     let handle: DiagramHandle | null = null;
     let stopUpdates = () => {};
     let stopResync = () => {};
-    handleRef.current?.dispose(); handleRef.current = null; imageCache.current.clear(); setSelection([]); setContextMenu(null); setClipboard(null); setEditing(null); setDraft(''); modelRef.current = { snapshot: null, pageIndex: 0, frame: null, layers: [] }; setModel(modelRef.current); setError(null); setDirty(false); setDocumentStencil({ loaded: false, masters: [] }); setActiveStencilId('standard');
+    handleRef.current?.dispose(); handleRef.current = null; imageCache.current.clear(); setSelection([]); setContextMenu(null); setClipboard(null); setEditing(null); textRefusedRef.current = false; setDraft(''); modelRef.current = { snapshot: null, pageIndex: 0, frame: null, layers: [] }; setModel(modelRef.current); setError(null); setDirty(false); setDocumentStencil({ loaded: false, masters: [] }); setActiveStencilId('standard');
     if (!file) { setLoading(false); return; }
     setLoading(true);
     const openingFonts = fontsRef.current;
@@ -313,6 +324,8 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     () => (model.frame && editedTextId ? { ...model.frame, primitives: withoutTextBox(model.frame.primitives, editedTextId) } : model.frame),
     [model.frame, editedTextId],
   );
+  const editOverlay = editing && model.frame && editedTextId ? textEditOverlay(model.frame, editedTextId, zoom) : null;
+  const hasEditOverlay = editOverlay !== null;
 
   useEffect(() => {
     const canvas = mainCanvasRef.current; const frame = paintFrame;
@@ -373,9 +386,13 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   }, [selection]);
 
   useEffect(() => {
-    if (!editing) return;
-    if (selection.length !== 1 || selection[0].pageId !== editing.pageId || selection[0].shapeId !== editing.shapeId) setEditing(null);
-  }, [editing, selection]);
+    if (!editing || textRefusedRef.current) return;
+    if (selection.length !== 1 || selection[0].pageId !== editing.pageId || selection[0].shapeId !== editing.shapeId) closeTextEdit();
+  }, [editing, selection, closeTextEdit]);
+
+  useEffect(() => {
+    if (editing && !hasEditOverlay) closeTextEdit();
+  }, [editing, hasEditOverlay, closeTextEdit]);
 
   useEffect(() => {
     const box = editBoxRef.current;
@@ -394,12 +411,21 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
 
   useEffect(() => {
     if (!editing) return;
+    let refocus: ReturnType<typeof setTimeout> | undefined;
     const onDown = (event: globalThis.PointerEvent) => {
       if (editWrapRef.current?.contains(event.target as Node)) return;
-      commitTextEdit();
+      if (commitTextEdit()) return;
+      if (!workspaceRef.current?.contains(event.target as Node)) return;
+      clearTimeout(refocus);
+      refocus = setTimeout(() => {
+        if (editingRef.current === editing) editBoxRef.current?.focus();
+      }, 0);
     };
     document.addEventListener('pointerdown', onDown, true);
-    return () => document.removeEventListener('pointerdown', onDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', onDown, true);
+      clearTimeout(refocus);
+    };
   }, [editing, commitTextEdit]);
 
   useEffect(() => () => {
@@ -1424,7 +1450,6 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     setZoom(clampZoom(Math.min((rect.width - WORKSPACE_MARGIN) / frame.width, (rect.height - WORKSPACE_MARGIN) / frame.height)));
   }, []);
   const download = useCallback((bytes: Uint8Array) => { const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer; const url = URL.createObjectURL(new Blob([buffer], { type: 'application/vnd.visio' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'diagram.vsdx'; anchor.click(); URL.revokeObjectURL(url); setDirty(false); }, []);
-  const editOverlay = editing && model.frame && editedTextId ? textEditOverlay(model.frame, editedTextId, zoom) : null;
   const integrity = diagnostics.filter((diagnostic) => diagnostic.category === 'integrity');
   const fidelity = diagnostics.filter((diagnostic) => diagnostic.category === 'fidelity');
   return <div ref={editorRootRef} className={className} style={styles.root} aria-label={t('editor.appLabel')} onKeyDown={onEditorKeyDown}>
@@ -1467,7 +1492,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
                 ref={editBoxRef}
                 value={draft}
                 onChange={(event) => setDraft(event.target.value)}
-                onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); commitTextEdit(); mainCanvasRef.current?.focus(); return; } if (isOwnedBrowserShortcut(event)) event.preventDefault(); event.stopPropagation(); }}
+                onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); if (textRefusedRef.current) { closeTextEdit(); mainCanvasRef.current?.focus(); return; } if (commitTextEdit()) mainCanvasRef.current?.focus(); return; } if (isOwnedBrowserShortcut(event)) event.preventDefault(); event.stopPropagation(); }}
                 aria-label={t('shapes.editingText', { name: editing.shapeId })}
                 rows={1}
                 style={{
