@@ -18,6 +18,8 @@
 //!   declared stop; explicit stops within a hanging indent are retained; a positive
 //!   left indent gains an implicit stop at the indent itself, so a tab on a
 //!   hanging first line lands on the body text edge.
+//! - A tab advances to the next stop *past* the pen; a stop the pen already
+//!   rests on is spent, within the rounding whisker px coordinates carry.
 //! - When the resolved span shrinks below a pixel — following content wider
 //!   than an `end` stop's room — the tab gives up on the stop and takes plain
 //!   default-grid spacing instead.
@@ -28,6 +30,11 @@ use super::input::TabStopIn;
 pub(super) const DEFAULT_TAB_INTERVAL_TWIPS: f32 = 720.0;
 /// Two positions closer than this count as the same stop.
 const STOP_COINCIDENCE_TWIPS: f32 = 20.0;
+/// A pen this close to a stop rests *on* it: an `end` stop parks the pen exactly
+/// on itself, and the twips-px-twips round trip in f32 reads a whisker short.
+/// The observed error is 1e-4 twips and authored stops are whole twips apart,
+/// so this absorbs the noise without reaching a distinct stop.
+const PEN_ON_STOP_TWIPS: f32 = 0.05;
 /// The implicit grid is laid out to ten inches past the left indent.
 const GRID_CEILING_SPAN_TWIPS: f32 = 14_400.0;
 
@@ -144,7 +151,10 @@ pub(super) fn calculate_tab_width(
     let grid = compute_tab_stops(declared, left_indent_twips);
 
     // past every stop in the grid: plain default-interval spacing
-    let Some(&(pos, kind)) = grid.iter().find(|s| s.0 > current_x_twips) else {
+    let Some(&(pos, kind)) = grid
+        .iter()
+        .find(|s| s.0 > current_x_twips + PEN_ON_STOP_TWIPS)
+    else {
         return default_grid_advance(current_x_px);
     };
 
