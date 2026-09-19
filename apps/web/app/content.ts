@@ -40,9 +40,9 @@ export const ECOSYSTEMS = [
 
 export const SUITE = {
   label: "Suite",
-  heading: "One suite, three editors",
+  heading: "One suite, four editors",
   prose:
-    "DOCX, XLSX and PPTX editors are published on npm and render inside your app. VSDX support is available from source. Batch shape-data editing validates every row before applying a change, with per-row receipts and undo.",
+    "DOCX, XLSX and PPTX editors are published on npm and render inside your app. The VSDX diagram editor is available from source.",
 };
 
 export const EDITORS = [
@@ -63,6 +63,12 @@ export const EDITORS = [
     format: "pptx",
     desc: "Slide model, masters and shape editing on the same shared core.",
     status: "available",
+  },
+  {
+    name: "Diagrams",
+    format: "vsdx",
+    desc: "Source preview: edit diagrams, pan and zoom around the page, and update shape data in validated batches.",
+    status: "source preview",
   },
 ];
 
