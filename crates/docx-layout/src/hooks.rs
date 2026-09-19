@@ -576,8 +576,11 @@ pub fn layout_floating_table(
     paginator.push_fragment_direct(fragment);
 
     if full_width {
-        let advance_to = y + measure.total_height + finite(floating.bottom_from_text);
-        if advance_to > paginator.state(state_idx).pen_y {
+        // Charges the band to the page even when it opens above the pen; flow
+        // already emitted into it keeps its place.
+        let pen_y = paginator.state(state_idx).pen_y;
+        let advance_to = pen_y.max(y) + measure.total_height + finite(floating.bottom_from_text);
+        if advance_to > pen_y {
             paginator.set_pen_y(state_idx, advance_to);
         }
     }
