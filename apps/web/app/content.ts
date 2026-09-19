@@ -42,7 +42,7 @@ export const SUITE = {
   label: "Suite",
   heading: "One suite, three editors",
   prose:
-    "DOCX, XLSX and PPTX editors are published on npm and render inside your app.",
+    "DOCX, XLSX and PPTX editors are published on npm and render inside your app. VSDX support is available from source. Batch shape-data editing validates every row before applying a change, with per-row receipts and undo.",
 };
 
 export const EDITORS = [
