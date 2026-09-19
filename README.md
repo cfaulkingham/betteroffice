@@ -58,15 +58,16 @@ What to install for which language, with a first example each:
 - `packages/` — the TypeScript editor packages
 - `bindings/` — the Python bindings
 - `apps/web` — [betteroffice.dev](https://betteroffice.dev) (Next.js on Cloudflare Workers)
+- `apps/demo` — editor playground
 - `apps/docs` — documentation
 
 ## Development
 
 ```bash
 bun install
-bun run build:xlsx-wasm # compile the ignored spreadsheet wasm asset
-bun run build:docx-wasm # compile the ignored document wasm assets
-bun run dev          # web app
+bun run dev:demo     # editor playground; builds the wasm bundles on first run
+bun run dev          # betteroffice.dev site (no wasm needed)
+bun run dev:docs     # documentation site
 bun run rust:check   # fmt + clippy + tests for the engines
 ```
 
