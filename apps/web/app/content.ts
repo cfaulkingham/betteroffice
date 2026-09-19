@@ -67,7 +67,7 @@ export const EDITORS = [
   {
     name: "Diagrams",
     format: "vsdx",
-    desc: "Source preview: edit diagrams, pan and zoom around the page, and update shape data in validated batches.",
+    desc: "Source preview: edit diagrams with pan and zoom, update shape data in batches, and export to Word or PowerPoint through Rust.",
     status: "source preview",
   },
 ];
