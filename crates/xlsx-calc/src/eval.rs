@@ -308,8 +308,8 @@ pub fn evaluate(expr: &Expr, ctx: &EvalContext<'_>) -> CellValue {
             Ok(n) => num(n / 100.0),
             Err(e) => err(e),
         },
-        Expr::FuncCall { name, args } => match crate::functions::lookup(name) {
-            Some(f) => f(args, ctx),
+        Expr::FuncCall { func, args, .. } => match func {
+            Some(f) => f.call(args, ctx),
             None => {
                 ctx.record_unsupported_function();
                 err(ErrorValue::Name)
@@ -673,7 +673,7 @@ impl Area {
 /// result is #REF!.
 pub(crate) fn as_area(arg: &Expr, ctx: &EvalContext<'_>) -> Option<Area> {
     match arg {
-        Expr::FuncCall { name, args } if name.eq_ignore_ascii_case("OFFSET") => {
+        Expr::FuncCall { name, args, .. } if name.eq_ignore_ascii_case("OFFSET") => {
             crate::functions::lookups::offset_area(args, ctx).ok()
         }
         Expr::Ref { sheet, cell } => Some(Area {

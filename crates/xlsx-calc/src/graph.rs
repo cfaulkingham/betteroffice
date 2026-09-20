@@ -323,7 +323,7 @@ fn push_defined_name_uses(owner: SheetId, expr: &Expr, pending: &mut Vec<Defined
                 expressions.push(rhs);
                 expressions.push(lhs);
             }
-            Expr::FuncCall { name, args } => expressions.extend(
+            Expr::FuncCall { name, args, .. } => expressions.extend(
                 args.iter()
                     .enumerate()
                     .rev()
@@ -347,7 +347,7 @@ fn push_volatile_name_uses(owner: SheetId, expr: &Expr, pending: &mut Vec<Define
     let mut uses = Vec::new();
     while let Some(expression) = expressions.pop() {
         match expression {
-            Expr::FuncCall { name, args } => {
+            Expr::FuncCall { name, args, .. } => {
                 let upper = name.to_ascii_uppercase();
                 if VOLATILE_FNS.contains(&upper.as_str())
                     || (upper == "OFFSET" && offset_target(args).is_none())
