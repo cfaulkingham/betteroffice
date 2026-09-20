@@ -379,3 +379,26 @@ fn reference_dim(args: &[Expr], ctx: &EvalContext<'_>, pick: fn(&Area) -> usize)
         },
     }
 }
+
+/// TRANSPOSE(array): a 1x1 input transposes to itself and a blank to 0; a
+/// wider one is the array form, which the engine does not implement.
+pub(crate) fn transpose(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    if args.len() != 1 {
+        return err(ErrorValue::Value);
+    }
+    let value = match as_area(&args[0], ctx) {
+        Some(area) if area.rows == 1 && area.cols == 1 => match area.get(ctx, 0, 0) {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        },
+        Some(_) => {
+            ctx.record_unsupported_function();
+            return err(ErrorValue::Value);
+        }
+        None => evaluate(&args[0], ctx),
+    };
+    match value {
+        CellValue::Empty => num(0.0),
+        value => value,
+    }
+}

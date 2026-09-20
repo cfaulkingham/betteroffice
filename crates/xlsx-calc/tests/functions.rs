@@ -410,6 +410,38 @@ fn case_insensitive_names() {
     ]);
 }
 
+#[test]
+fn transpose_is_identity_on_single_values() {
+    check(&[
+        ("TRANSPOSE(A1)", n(10.0)),
+        ("TRANSPOSE(B1)", t("apple")),
+        ("TRANSPOSE(5)", n(5.0)),
+        ("TRANSPOSE(\"hi\")", t("hi")),
+        ("TRANSPOSE(TRUE)", b(true)),
+        ("TRANSPOSE(2+3)", n(5.0)),
+        ("TRANSPOSE(TRANSPOSE(A1))", n(10.0)),
+        ("TRANSPOSE(A6)", n(0.0)), // blanks transpose to 0, not empty
+        ("TRANSPOSE(1/0)", e(ErrorValue::Div0)),
+        ("TRANSPOSE()", e(ErrorValue::Value)),
+        ("TRANSPOSE(A1, A2)", e(ErrorValue::Value)),
+    ]);
+}
+
+/// the engine has no array value type, so a multi-cell TRANSPOSE is #VALUE!
+/// wherever it appears rather than flowing into the caller.
+#[test]
+fn transpose_of_a_multi_cell_area_has_no_representable_result() {
+    check(&[
+        ("TRANSPOSE(A1:A5)", e(ErrorValue::Value)),
+        ("TRANSPOSE(H1:K1)", e(ErrorValue::Value)),
+        ("TRANSPOSE(E1:F4)", e(ErrorValue::Value)),
+        ("TRANSPOSE(A:A)", e(ErrorValue::Value)),
+        ("SUM(TRANSPOSE(A1:A5))", e(ErrorValue::Value)),
+        ("SUMPRODUCT(C1:C5, TRANSPOSE(A1:A5))", e(ErrorValue::Value)),
+        ("ROWS(TRANSPOSE(E1:F4))", e(ErrorValue::Value)),
+    ]);
+}
+
 /// matrix fixture: a 2x3 at M1:O2, a 3x2 at M4:N6, a 2x1 at M8:M9, and
 /// one-row operands at M11:N11 (trailing text) and M13:N13 (trailing blank).
 fn matrix_fixture() -> Workbook {

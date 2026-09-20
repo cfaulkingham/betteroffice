@@ -133,6 +133,9 @@ is not yet wired — a follow-up.
 | `OFFSET(reference, rows, cols, [height], [width])` | Returns a reference, so it feeds the area-taking functions. Sizes default to the reference's own; a negative size extends back from the shifted corner; a zero size or a rectangle off the sheet → `#REF!`. A multi-cell result in scalar context is `#VALUE!` (see below). |
 | `XLOOKUP(value, lookup, return, [if_not_found], …)` | **Exact match only**; match/search modes beyond exact are not yet implemented. |
 | `CHOOSE(index, …)` | Only the chosen argument is evaluated. |
+| `ROW` / `COLUMN([ref])` | **A reference is required** — the evaluator has no notion of the calling cell, so the no-arg form is `#VALUE!`. |
+| `ROWS` / `COLUMNS(area)` | Dimension counts. |
+| `TRANSPOSE(array)` | **1x1 only** — the evaluator has no array value, so a multi-cell argument is `#VALUE!`. Blanks transpose to `0`. |
 | `ROW` / `COLUMN([ref])` | The reference's top-left position; with no reference, the calling cell's own. A context built without a calling cell (`EvalContext::new`) still answers `#VALUE!` to the no-arg form. |
 | `ROWS` / `COLUMNS(area)` | Dimension counts; the area is required. |
 
@@ -173,6 +176,10 @@ with `~` escaping a literal `*`, `?`, or `~`.
   itself is handled generically by the dependency graph.
 - **`TODAY` / `NOW`** return `#VALUE!` when no clock is injected via
   `EvalContext::with_now`.
+- **Array results** have no representation: `CellValue` is scalar and recalc
+  writes one value per cell, so `TRANSPOSE` (and any future `MMULT`) can only
+  answer the 1x1 case. Anything larger is `#VALUE!`, the same answer a bare
+  range gets in scalar context.
 - **Array results** have no representation: `CellValue` is a single scalar and
   the model records no array-formula range, so `MMULT` returns the top-left
   element of its product. That is the value Excel caches in the anchor cell of
