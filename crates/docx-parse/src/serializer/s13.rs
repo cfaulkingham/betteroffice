@@ -5,6 +5,7 @@
 //! paragraph remains authored exactly as it appeared in the source package.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use indexmap::IndexMap;
@@ -929,14 +930,43 @@ fn process_image_part<'a>(
     Ok(())
 }
 
+fn run_has_drawing_image(run: &Run) -> bool {
+    run.content
+        .iter()
+        .any(|content| matches!(content, RunContent::Drawing { .. }))
+}
+
+fn blocks_have_drawing_image(blocks: &[BlockContent]) -> bool {
+    blocks.iter().any(|block| match block {
+        BlockContent::Paragraph(paragraph) => {
+            paragraph.content.iter().any(|content| match content {
+                ParagraphContent::Inline(InlineNode::Run(run)) => run_has_drawing_image(run),
+                ParagraphContent::Tracked(tracked) => tracked.content.iter().any(
+                    |inline| matches!(inline, InlineNode::Run(run) if run_has_drawing_image(run)),
+                ),
+                _ => false,
+            })
+        }
+        BlockContent::Table(table) => table.rows.iter().any(|row| {
+            row.cells
+                .iter()
+                .any(|cell| blocks_have_drawing_image(&cell.content))
+        }),
+        BlockContent::BlockSdt(_) | BlockContent::RawXml(_) => false,
+    })
+}
+
 fn visit_new_images(
     blocks: &mut [BlockContent],
     visit: &mut impl FnMut(&mut Image) -> Result<(), ParseError>,
 ) -> Result<(), ParseError> {
     for block in blocks {
+        if !blocks_have_drawing_image(std::slice::from_ref(block)) {
+            continue;
+        }
         match block {
             BlockContent::Paragraph(paragraph) => {
-                for content in &mut paragraph.content {
+                for content in &mut Arc::make_mut(paragraph).content {
                     match content {
                         ParagraphContent::Inline(InlineNode::Run(run)) => {
                             visit_run_images(run, visit)?
@@ -953,7 +983,7 @@ fn visit_new_images(
                 }
             }
             BlockContent::Table(table) => {
-                for row in &mut table.rows {
+                for row in &mut Arc::make_mut(table).rows {
                     for cell in &mut row.cells {
                         visit_new_images(&mut cell.content, visit)?;
                     }
@@ -1332,24 +1362,43 @@ fn process_hyperlink_part<'a>(
     }
 }
 
+fn block_has_hyperlink(block: &BlockContent) -> bool {
+    match block {
+        BlockContent::Paragraph(paragraph) => paragraph
+            .content
+            .iter()
+            .any(|content| matches!(content, ParagraphContent::Inline(InlineNode::Hyperlink(_)))),
+        BlockContent::Table(table) => table.rows.iter().any(|row| {
+            row.cells
+                .iter()
+                .any(|cell| cell.content.iter().any(block_has_hyperlink))
+        }),
+        BlockContent::BlockSdt(sdt) => sdt.content.iter().any(block_has_hyperlink),
+        BlockContent::RawXml(_) => false,
+    }
+}
+
 fn visit_hyperlinks(blocks: &mut [BlockContent], visit: &mut impl FnMut(&mut Hyperlink)) {
     for block in blocks {
+        if !block_has_hyperlink(block) {
+            continue;
+        }
         match block {
             BlockContent::Paragraph(paragraph) => {
-                for content in &mut paragraph.content {
+                for content in &mut Arc::make_mut(paragraph).content {
                     if let ParagraphContent::Inline(InlineNode::Hyperlink(hyperlink)) = content {
                         visit(hyperlink);
                     }
                 }
             }
             BlockContent::Table(table) => {
-                for row in &mut table.rows {
+                for row in &mut Arc::make_mut(table).rows {
                     for cell in &mut row.cells {
                         visit_hyperlinks(&mut cell.content, visit);
                     }
                 }
             }
-            BlockContent::BlockSdt(sdt) => visit_hyperlinks(&mut sdt.content, visit),
+            BlockContent::BlockSdt(sdt) => visit_hyperlinks(&mut Arc::make_mut(sdt).content, visit),
             BlockContent::RawXml(_) => {}
         }
     }
