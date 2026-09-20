@@ -45,6 +45,7 @@ function). Aliases map to a single implementation: `CONCAT`/`CONCATENATE`,
 | `SUMIF(range, criteria, [sum_range])` | `sum_range` is anchored at its top-left with the criteria shape. |
 | `SUMIFS(sum_range, crit_range, crit, …)` | All ranges must share dimensions. |
 | `SUMPRODUCT(array1, [array2], …)` | Element-wise product summed; non-numeric cells = 0; arrays must match length. |
+| `MMULT(array1, array2)` | `cols(array1)` must equal `rows(array2)`; any non-numeric operand cell → `#VALUE!`. Returns the top-left product element (see Deviations). |
 | `PRODUCT` | No numbers → 0. |
 | `ABS`, `SIGN` | — |
 | `ROUND` | Half away from zero. |
@@ -172,6 +173,11 @@ with `~` escaping a literal `*`, `?`, or `~`.
   itself is handled generically by the dependency graph.
 - **`TODAY` / `NOW`** return `#VALUE!` when no clock is injected via
   `EvalContext::with_now`.
+- **Array results** have no representation: `CellValue` is a single scalar and
+  the model records no array-formula range, so `MMULT` returns the top-left
+  element of its product. That is the value Excel caches in the anchor cell of
+  the array formula that entered it; the remaining cells of a legacy CSE range
+  carry no formula and keep their stored values.
 - **`ROW` / `COLUMN`** with no reference answer the calling cell's own position.
   Recalculation supplies it; a context built directly by `EvalContext::new`
   leaves `cell` unset and those forms stay `#VALUE!`.
