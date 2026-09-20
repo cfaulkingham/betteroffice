@@ -2121,7 +2121,8 @@ fn resolve_content(
             .alignment
             .as_deref()
             .or(properties.alignment.as_deref());
-        let marker = resolve_marker(properties.bullet.as_ref(), paragraph.level, &mut numbering);
+        let marker = resolve_marker(properties.bullet.as_ref(), paragraph.level, &mut numbering)
+            .map(|marker| symbol_bullet(&marker, properties.bullet_font.as_ref(), theme));
         paragraphs.push(ResolvedParagraph {
             align: parse_align(alignment),
             justify: is_full_justification(alignment),
@@ -4117,6 +4118,28 @@ fn rect_covering_text(rect: PxRect, text: Option<&TextHit>) -> PxRect {
         w: (right - left).max(rect.w),
         h: (bottom - top).max(rect.h),
     }
+}
+
+/// A `buFont` symbol face reaches its glyphs by font position, so `buChar`
+/// names a slot rather than the character to draw. Checked against
+/// PowerPoint's own render of the corpus: Wingdings `§` draws a small filled
+/// square, Wingdings 3's `U+F075` a solid right-pointing triangle.
+fn symbol_bullet(marker: &str, font: Option<&BulletFont>, theme: &Theme) -> String {
+    let Some(BulletFont::Typeface(typeface)) = font else {
+        return marker.to_owned();
+    };
+    let typeface = if typeface.starts_with('+') {
+        resolve_theme_font_ref(Some(theme), typeface)
+    } else {
+        typeface.clone()
+    };
+    let Some(font) = ooxml_text::SymbolFont::named(&typeface) else {
+        return marker.to_owned();
+    };
+    marker
+        .chars()
+        .map(|character| font.substitute(character).unwrap_or(character))
+        .collect()
 }
 
 /// Per-level `a:buAutoNum` state: the number last drawn and the `startAt`
