@@ -47,7 +47,7 @@ const BACKGROUND_FILL_BASE: u32 = 1_001;
 const SINGLE_LINE_PITCH_EM: f32 = 1.2;
 const MAX_FONT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_FONTS: usize = 256;
-const MAX_RENDER_SHAPES: usize = 20_000;
+pub(crate) const MAX_RENDER_SHAPES: usize = 20_000;
 const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TEXT_LINES: usize = 100_000;
 const MAX_TEXT_PARAGRAPHS: usize = 20_000;
@@ -272,6 +272,7 @@ impl SlideRenderer {
             && let Some(asset_id) = picture.media_part_path.clone()
         {
             builder.primitives.push(Primitive::Image {
+                geometry_fallback: false,
                 object_id: 0,
                 shape_id: None,
                 name: "Background".to_owned(),
@@ -664,7 +665,9 @@ impl<'a> LayoutBuilder<'a> {
                     asset_id.as_deref(),
                     &shape.blip_effects,
                     source.map(|picture| &picture.crop),
-                    source.and_then(|picture| picture_mask(picture, rect)),
+                    source
+                        .map(|picture| picture_mask(picture, rect))
+                        .unwrap_or_default(),
                     outline,
                     shadow,
                 );
@@ -891,7 +894,7 @@ impl<'a> LayoutBuilder<'a> {
         media_part_path: Option<&str>,
         effects: &[BlipEffect],
         crop: Option<&PictureCrop>,
-        mask: Option<Vec<GeometryPathCommand>>,
+        mask: PictureMask,
         outline: Option<Stroke>,
         shadow: Option<Shadow>,
     ) {
@@ -903,7 +906,7 @@ impl<'a> LayoutBuilder<'a> {
                 transform,
                 media_part_path,
                 crop,
-                mask.as_deref(),
+                &mask,
             )
         {
             if let Some(outline) = outline {
@@ -919,9 +922,10 @@ impl<'a> LayoutBuilder<'a> {
                     h: rect.h,
                     geometry: "rect".to_owned(),
                     path: mask
+                        .path
                         .clone()
                         .unwrap_or_else(|| geometry_path("rect", &BTreeMap::new(), 1.0)),
-                    geometry_fallback: false,
+                    geometry_fallback: mask.geometry_fallback,
                     adjust_values: BTreeMap::new(),
                     fill: None,
                     stroke: Some(outline),
@@ -942,7 +946,8 @@ impl<'a> LayoutBuilder<'a> {
             asset_id: media_part_path.map(str::to_owned),
             effects: image_effects(effects, self.theme),
             crop: crop.map(image_crop).unwrap_or_default(),
-            path: mask,
+            path: mask.path,
+            geometry_fallback: mask.geometry_fallback,
             stroke: outline,
             shadow,
             transform,
@@ -958,7 +963,7 @@ impl<'a> LayoutBuilder<'a> {
         transform: Transform,
         media_part_path: Option<&str>,
         crop: Option<&PictureCrop>,
-        mask: Option<&[GeometryPathCommand]>,
+        mask: &PictureMask,
     ) -> bool {
         if self.metafile_budget == 0 {
             return false;
@@ -974,7 +979,8 @@ impl<'a> LayoutBuilder<'a> {
             return true;
         };
         let clip = mask
-            .map(<[_]>::to_vec)
+            .path
+            .clone()
             .unwrap_or_else(|| geometry_path("rect", &BTreeMap::new(), 1.0));
         for mut op in drawing.ops.iter().cloned() {
             place_in_source_rect(&mut op.path, crop);
@@ -990,10 +996,11 @@ impl<'a> LayoutBuilder<'a> {
                 h: rect.h,
                 geometry: "custom".to_owned(),
                 path: op.path,
-                geometry_fallback: false,
+                geometry_fallback: mask.geometry_fallback,
                 adjust_values: BTreeMap::new(),
                 fill: op.fill.map(|color| Paint::Solid { color }),
                 stroke: op.stroke.map(|stroke| Stroke {
+                    join: None,
                     color: stroke.color,
                     paint: None,
                     width: ((stroke.width * crop.2 * f64::from(rect.w)) as f32).max(1.0),
@@ -1039,7 +1046,16 @@ impl<'a> LayoutBuilder<'a> {
         if paths.is_empty()
             || !matches!(&primitive, Primitive::Shape { geometry, .. } if geometry == "custom")
         {
-            self.primitives.push(picture_filled(primitive, picture));
+            for (index, (primitive, has_fill)) in crate::geometry::preset_primitives(primitive)
+                .into_iter()
+                .enumerate()
+            {
+                if index > 0 {
+                    self.charge_shape()?;
+                }
+                let picture = picture.filter(|_| has_fill);
+                self.primitives.push(picture_filled(primitive, picture));
+            }
             return Ok(());
         }
         for (index, custom) in paths.iter().enumerate() {
@@ -3678,6 +3694,7 @@ fn shadow(
     }
     let (anchor_x, anchor_y) = shadow_anchor(&outer.alignment, rect);
     Some(Shadow {
+        paths: Vec::new(),
         color,
         blur: safe_geometry(outer.blur_radius as f32 * (space.scale_x + space.scale_y) / 2.0),
         dx: safe_geometry(dx + anchor_x * (1.0 - scale_x)),
@@ -3759,6 +3776,7 @@ fn stroke(outline: &ShapeOutline, theme: &Theme) -> Option<Stroke> {
         .map(|width| width as f32 / EMU_PER_CSS_PIXEL)
         .unwrap_or(1.0);
     Some(Stroke {
+        join: outline.join.clone(),
         color,
         width,
         dashed: outline
@@ -3806,20 +3824,25 @@ fn image_crop(crop: &PictureCrop) -> ImageCrop {
     }
 }
 
-/// Resolves a picture's nonrectangular preset mask.
-fn picture_mask(
-    picture: &Picture,
-    rect: PxRect,
-) -> Option<Vec<ooxml_drawingml::GeometryPathCommand>> {
+#[derive(Default)]
+struct PictureMask {
+    path: Option<Vec<GeometryPathCommand>>,
+    geometry_fallback: bool,
+}
+
+fn picture_mask(picture: &Picture, rect: PxRect) -> PictureMask {
     if picture.geometry.is_empty() || picture.geometry == "rect" || rect.h <= 0.0 {
-        return None;
+        return PictureMask::default();
     }
-    let path = geometry_path(
+    let (path, geometry_fallback) = geometry_path_with_fallback(
         &picture.geometry,
         &picture.adjust_values,
         f64::from(rect.w) / f64::from(rect.h),
     );
-    (!path.is_empty()).then_some(path)
+    PictureMask {
+        path: (!path.is_empty()).then_some(path),
+        geometry_fallback,
+    }
 }
 
 fn custom_paths(shape: Option<&ShapeNode>) -> &[CustomGeometryPath] {
@@ -3857,6 +3880,7 @@ fn picture_filled(primitive: Primitive, picture: Option<&PictureFill>) -> Primit
             h,
             geometry,
             path,
+            geometry_fallback,
             stroke,
             shadow,
             transform,
@@ -3873,6 +3897,7 @@ fn picture_filled(primitive: Primitive, picture: Option<&PictureFill>) -> Primit
             effects: Vec::new(),
             crop: picture_fill_crop(picture),
             path: (geometry != "rect").then_some(path),
+            geometry_fallback,
             stroke,
             shadow,
             transform,
@@ -4198,9 +4223,9 @@ mod tests {
             w: 100.0,
             h: 50.0,
         };
-        assert!(picture_mask(&picture, rect).is_none());
+        assert!(picture_mask(&picture, rect).path.is_none());
         picture.geometry = "ellipse".to_owned();
-        let path = picture_mask(&picture, rect).unwrap();
+        let path = picture_mask(&picture, rect).path.unwrap();
         assert_eq!(path.len(), 6);
         assert_eq!(
             path[0],
@@ -7131,6 +7156,7 @@ mod tests {
                     h: 96.0,
                 },
             )
+            .path
             .unwrap();
             let rendered = renderer().layout_slide(&package, &snapshot, 0).unwrap();
             let shapes = rendered
@@ -7161,6 +7187,34 @@ mod tests {
             assert_eq!(*path, mask);
             assert!(fill.is_none());
             assert_eq!(stroke.color, "#0000FF");
+        }
+    }
+
+    #[test]
+    fn unsupported_picture_masks_report_fallbacks_for_bitmaps_and_metafiles() {
+        for media in [b"not a metafile".to_vec(), triangle_emf()] {
+            let (mut package, snapshot) = deck_with_master_picture(media);
+            let ShapeNode::Picture(picture) = package.masters[0].shapes.last_mut().unwrap() else {
+                panic!()
+            };
+            picture.geometry = "unknownPreset".into();
+            let rendered = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+            let primitives: Vec<_> = rendered
+                .display_list
+                .primitives
+                .iter()
+                .filter(|p| match p {
+                    Primitive::Shape { name, .. } | Primitive::Image { name, .. } => name == "Logo",
+                    _ => false,
+                })
+                .collect();
+            assert!(!primitives.is_empty());
+            for primitive in primitives {
+                assert_eq!(
+                    serde_json::to_value(primitive).unwrap()["geometryFallback"],
+                    true
+                );
+            }
         }
     }
 

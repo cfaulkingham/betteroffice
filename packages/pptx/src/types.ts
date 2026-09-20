@@ -301,12 +301,14 @@ export interface Stroke {
   width: number;
   dashed?: boolean;
   paint?: Paint;
+  join?: 'round' | 'bevel' | 'miter';
   headEnd?: StrokeEnd;
   tailEnd?: StrokeEnd;
 }
 
 /** An `a:outerShdw`: a blurred copy of the shape's own path, offset and tinted. */
 export interface Shadow {
+  paths?: Array<{ path: GeometryPathCommand[]; fill: boolean; stroke?: Stroke }>;
   color: string;
   blur?: number;
   dx?: number;
@@ -336,7 +338,7 @@ export interface ShapePrimitive extends PrimitiveBase {
   name: string;
   geometry: string;
   path: GeometryPathCommand[];
-  /** The authored preset is unsupported and `path` is a rectangle fallback. */
+  /** An unsupported outline or clip was replaced by a rectangle. */
   geometryFallback?: boolean;
   clip?: GeometryPathCommand[];
   evenOdd?: boolean;
@@ -370,6 +372,8 @@ export interface ImagePrimitive extends PrimitiveBase {
   crop?: ImageCrop;
   /** Outline the picture is masked to, when its `spPr` gives it one. */
   path?: GeometryPathCommand[];
+  /** The authored mask is unsupported and uses a rectangle fallback. */
+  geometryFallback?: boolean;
   stroke?: Stroke;
   shadow?: Shadow;
 }

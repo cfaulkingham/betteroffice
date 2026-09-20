@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use ooxml_drawingml::{
-    GeometryPathCommand, preset_geometry_default_adjustments, preset_geometry_to_path,
+    GeometryPathCommand, preset_geometry_default_adjustments, preset_geometry_layers,
+    preset_geometry_to_path,
 };
 use proptest::prelude::*;
 use proptest::sample::select;
@@ -83,6 +84,9 @@ const PRESETS: &[&str] = &[
     "cloudCallout",
     "wedgeEllipseCallout",
     "wedgeRoundRectCallout",
+    "wedgeRectCallout",
+    "swooshArrow",
+    "circularArrow",
 ];
 
 /// Presets added here whose ECMA-376 definition curves rather than only turning corners.
@@ -103,6 +107,7 @@ const NEW_PRESETS: &[&str] = &[
 /// Callouts whose ECMA-376 tail target is unpinned, so it points outside the frame by design.
 const CALLOUTS: &[&str] = &[
     "cloudCallout",
+    "wedgeRectCallout",
     "wedgeEllipseCallout",
     "wedgeRoundRectCallout",
 ];
@@ -113,8 +118,8 @@ const HULL_OUTSIDE_FRAME: &[&str] = &["ellipseRibbon", "noSmoking"];
 /// Points sampled along each curve when a test needs the outline rather than its hull.
 const CURVE_SAMPLES: usize = 24;
 
-/// ECMA-376 lets `mathMultiply`'s arms overrun the frame near the top of its adjust.
-const SPEC_OVERRUNS_FRAME: &[&str] = &["mathMultiply"];
+/// These presets can exceed their frames at valid adjustments or aspect ratios.
+const SPEC_OVERRUNS_FRAME: &[&str] = &["mathMultiply", "swooshArrow"];
 
 /// `cloudCallout`'s body overruns the 43200 frame its own path declares by about 1%.
 const BODY_SLACK: f64 = 0.02;
@@ -400,6 +405,13 @@ proptest! {
                 prop_assert!(x.is_finite() && y.is_finite(), "{shape} emitted ({x}, {y})");
             }
         }
+        for shape in PRESETS.iter().chain(["arc", "cube", "leftBrace", "rightBrace", "ribbon2"].iter()) {
+            for layer in preset_geometry_layers(shape, &adjustments, aspect).into_iter().flatten() {
+                for (x, y) in coordinates(&layer.commands) {
+                    prop_assert!(x.is_finite() && y.is_finite(), "{shape} layer emitted ({x}, {y})");
+                }
+            }
+        }
     }
 
     #[test]
@@ -667,5 +679,18 @@ proptest! {
                 .count();
             prop_assert!(curves > 0, "{shape} drew only straight edges");
         }
+    }
+}
+
+#[test]
+fn single_path_consumers_do_not_receive_partial_layered_presets() {
+    for shape in ["arc", "cube", "leftBrace", "rightBrace", "ribbon2"] {
+        assert!(preset_geometry_to_path(shape, &HashMap::new(), 1.0).is_none());
+        assert!(
+            preset_geometry_layers(shape, &HashMap::new(), 1.0)
+                .unwrap()
+                .len()
+                > 1
+        );
     }
 }
