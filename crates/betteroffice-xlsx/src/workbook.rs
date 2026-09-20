@@ -195,10 +195,26 @@ pub struct Workbook {
     proposals: ProposalSet,
     last_calculation: CalculationResult,
     update_observers: Arc<Mutex<UpdateObservers>>,
-    /// Where each chart frame sat in the source package, by `frame_id`. Every
-    /// replica opens the same bytes, so this is the one anchor baseline they
-    /// all agree on however far their own editing has since diverged.
+    /// Anchor of each chart frame in the source package, by `frame_id`.
     opened_anchors: BTreeMap<String, ChartAnchor>,
+    /// Mutation counter; chart resolutions cache against it.
+    model_epoch: u64,
+    /// Resolved `ChartSpace` per (chart part, owner sheet), valid for the
+    /// stored epoch and part-bytes hash.
+    chart_cache: Mutex<HashMap<(String, String), CachedChartSpace>>,
+}
+
+struct CachedChartSpace {
+    bytes_hash: u64,
+    epoch: u64,
+    space: Arc<ChartSpace>,
+}
+
+fn chart_bytes_hash(bytes: &[u8]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hasher::write(&mut h, bytes);
+    std::hash::Hasher::write_usize(&mut h, bytes.len());
+    std::hash::Hasher::finish(&h)
 }
 
 impl Workbook {
@@ -360,6 +376,8 @@ impl Workbook {
             last_calculation: CalculationResult::default(),
             update_observers: Arc::new(Mutex::new(UpdateObservers::default())),
             opened_anchors,
+            model_epoch: 0,
+            chart_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1563,15 +1581,7 @@ impl Workbook {
             &viewport,
             metrics,
             gridlines,
-            |chart| {
-                resolve_chart_space(
-                    self.source_package.as_ref(),
-                    &self.model.styles.theme,
-                    &self.model,
-                    &sheet_ref.name,
-                    chart,
-                )
-            },
+            |chart| self.resolve_chart_space(&sheet_ref.name, chart),
         )
         .map_err(Error::from)?;
         if gridlines {
@@ -1628,12 +1638,9 @@ impl Workbook {
             }
         }
         let ghosts: Vec<GhostEdit> = ghosts.into_values().collect();
-        let source_package = self.source_package.as_ref();
-        let theme = &self.model.styles.theme;
-        let model = &self.model;
         let owner = sheet_ref.name.clone();
         build_display_list_with_charts_and_ghosts(&self.model, sheet, viewport, &ghosts, |chart| {
-            resolve_chart_space(source_package, theme, model, &owner, chart)
+            self.resolve_chart_space(&owner, chart)
         })
         .map_err(Error::from)
     }
@@ -1761,13 +1768,10 @@ impl Workbook {
         let height = ((viewport.height * options.scale).ceil() as u32).max(1);
         validate_render_size(width, height)?;
         validate_display_region(sheet_ref, &self.model.styles, &viewport)?;
-        let source_package = self.source_package.as_ref();
-        let theme = &self.model.styles.theme;
-        let model = &self.model;
         let owner = sheet_ref.name.clone();
         let display_list =
             build_display_list_with_charts(&self.model, sheet, &viewport, |chart| {
-                resolve_chart_space(source_package, theme, model, &owner, chart)
+                self.resolve_chart_space(&owner, chart)
             })?;
         let display_list = if options.scale == 1.0 {
             display_list
@@ -1936,6 +1940,7 @@ impl Workbook {
     }
 
     fn commit_user(&mut self, ops: &[Op]) -> Result<()> {
+        self.bump_model_epoch();
         let preserved_before = (!self.is_collaborative()).then(|| self.preserved.clone());
         let names_before = self.sheet_names();
         if self.is_collaborative() {
@@ -1977,6 +1982,7 @@ impl Workbook {
     }
 
     fn commit_agent(&mut self, ops: &[Op], agent_id: String) -> Result<()> {
+        self.bump_model_epoch();
         let preserved_before = (!self.is_collaborative()).then(|| self.preserved.clone());
         let names_before = self.sheet_names();
         if self.is_collaborative() {
@@ -2050,6 +2056,7 @@ impl Workbook {
     }
 
     fn rebuild_and_recalculate(&mut self, options: CalculationOptions) -> CalculationResult {
+        self.bump_model_epoch();
         self.edited_since_open = true;
         let (graph, result) = rebuild_and_recalc_all(&mut self.model, options.now_serial);
         self.graph = Some(graph);
@@ -2410,8 +2417,23 @@ impl Workbook {
     /// The one way a model becomes this workbook's own. Everything arriving
     /// from the shared document is projected on the way out, so what is left to
     /// check here is what a local batch can still get wrong.
+    /// Model writes funnel through here, `commit_*` or `rebuild_and_recalculate`;
+    /// the bump invalidates chart resolutions.
+    fn bump_model_epoch(&mut self) {
+        self.model_epoch = self.model_epoch.wrapping_add(1);
+        self.chart_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
     fn install_model(&mut self, model: WorkbookModel) -> Result<()> {
         self.model = model;
+        self.model_epoch = self.model_epoch.wrapping_add(1);
+        self.chart_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         Ok(())
     }
 }
@@ -3374,29 +3396,52 @@ fn validate_viewport(viewport: &Viewport) -> Result<()> {
     Ok(())
 }
 
-/// The `ChartSpace` both renderers draw. The part supplies the chart's shape;
-/// the references inside it are resolved against the current workbook, so an
-/// ordinary cell edit reaches the chart without a save.
-fn resolve_chart_space(
-    package: Option<&xlsx_parse::PreservedPackage>,
-    theme: &xlsx_model::Theme,
-    model: &WorkbookModel,
-    owner: &str,
-    chart: &SheetChart,
-) -> std::result::Result<ChartSpace, RenderError> {
-    let package = package.ok_or_else(|| RenderError::ChartSourceUnavailable {
-        part: chart.part.clone(),
-    })?;
-    let bytes = package
-        .part_bytes(&chart.part)
-        .ok_or_else(|| RenderError::ChartPartMissing {
-            part: chart.part.clone(),
-        })?;
-    xlsx_parse::preserved_chart_space(bytes, model, owner, theme).ok_or_else(|| {
-        RenderError::ChartParseFailed {
-            part: chart.part.clone(),
+impl Workbook {
+    /// `ChartSpace` for a chart part, resolved against `owner`; cached per
+    /// epoch and part bytes.
+    fn resolve_chart_space(
+        &self,
+        owner: &str,
+        chart: &SheetChart,
+    ) -> std::result::Result<Arc<ChartSpace>, RenderError> {
+        let package =
+            self.source_package
+                .as_ref()
+                .ok_or_else(|| RenderError::ChartSourceUnavailable {
+                    part: chart.part.clone(),
+                })?;
+        let bytes =
+            package
+                .part_bytes(&chart.part)
+                .ok_or_else(|| RenderError::ChartPartMissing {
+                    part: chart.part.clone(),
+                })?;
+        let bytes_hash = chart_bytes_hash(bytes);
+        let epoch = self.model_epoch;
+        let key = (chart.part.clone(), owner.to_owned());
+        let mut cache = self.chart_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(&key)
+            && hit.epoch == epoch
+            && hit.bytes_hash == bytes_hash
+        {
+            return Ok(hit.space.clone());
         }
-    })
+        let space =
+            xlsx_parse::preserved_chart_space(bytes, &self.model, owner, &self.model.styles.theme)
+                .ok_or_else(|| RenderError::ChartParseFailed {
+                    part: chart.part.clone(),
+                })
+                .map(Arc::new)?;
+        cache.insert(
+            key,
+            CachedChartSpace {
+                bytes_hash,
+                epoch,
+                space: space.clone(),
+            },
+        );
+        Ok(space)
+    }
 }
 
 fn validate_display_region(sheet: &Sheet, styles: &Stylesheet, viewport: &Viewport) -> Result<()> {
