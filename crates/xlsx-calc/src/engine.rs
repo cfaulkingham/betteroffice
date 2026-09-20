@@ -356,6 +356,21 @@ mod tests {
         assert_eq!(value(&wb, s, "B1"), num(4.0));
     }
 
+    /// OFFSET reads its anchor's coordinates, not its value, so a cell may
+    /// offset from itself: Greptile flagged `A1=SUM(OFFSET(A1,1,0,3,1))`
+    /// reporting A1 as cyclic and zeroing a valid result.
+    #[test]
+    fn a_cell_may_offset_from_its_own_position() {
+        let (mut wb, s) = one_sheet();
+        for (cell, v) in [("A2", 1.0), ("A3", 2.0), ("A4", 3.0)] {
+            put_num(&mut wb, s, cell, v);
+        }
+        put_formula(&mut wb, s, "A1", "SUM(OFFSET(A1,1,0,3,1))");
+        let report = rebuild_and_recalc_all(&mut wb, None).1;
+        assert!(report.cycle_cells.is_empty());
+        assert_eq!(value(&wb, s, "A1"), num(6.0));
+    }
+
     #[test]
     fn chain_propagates_transitively() {
         let (mut wb, s) = one_sheet();
@@ -403,6 +418,42 @@ mod tests {
         let r = recalc_after(&mut wb, &mut graph, &[(s, a1("A5"))], None);
         assert_eq!(value(&wb, s, "B1"), num(110.0));
         assert_eq!(changed_a1(&r), vec!["B1"]);
+    }
+
+    #[test]
+    fn static_offset_recalcs_when_its_target_changes() {
+        let (mut wb, s) = one_sheet();
+        for (i, cell) in ["A1", "A2", "A3", "A4"].iter().enumerate() {
+            put_num(&mut wb, s, cell, (i + 1) as f64);
+        }
+        put_formula(&mut wb, s, "B1", "SUM(OFFSET(A1, 1, 0, 3, 1))");
+        let (mut graph, _) = rebuild_and_recalc_all(&mut wb, None);
+        assert_eq!(value(&wb, s, "B1"), num(9.0));
+
+        put_num(&mut wb, s, "A3", 100.0);
+        let r = recalc_after(&mut wb, &mut graph, &[(s, a1("A3"))], None);
+        assert_eq!(value(&wb, s, "B1"), num(106.0));
+        assert_eq!(changed_a1(&r), vec!["B1"]);
+    }
+
+    #[test]
+    fn unresolvable_offset_recalcs_when_its_target_changes() {
+        let (mut wb, s) = one_sheet();
+        for (i, cell) in ["A1", "A2", "A3"].iter().enumerate() {
+            put_num(&mut wb, s, cell, (i + 1) as f64);
+        }
+        put_num(&mut wb, s, "D1", 2.0);
+        put_formula(&mut wb, s, "B1", "OFFSET(A1, D1, 0)");
+        let (mut graph, _) = rebuild_and_recalc_all(&mut wb, None);
+        assert_eq!(value(&wb, s, "B1"), num(3.0));
+
+        put_num(&mut wb, s, "A3", 30.0);
+        recalc_after(&mut wb, &mut graph, &[(s, a1("A3"))], None);
+        assert_eq!(value(&wb, s, "B1"), num(30.0));
+
+        put_num(&mut wb, s, "D1", 1.0);
+        recalc_after(&mut wb, &mut graph, &[(s, a1("D1"))], None);
+        assert_eq!(value(&wb, s, "B1"), num(2.0));
     }
 
     #[test]
