@@ -297,6 +297,7 @@ impl SlideRenderer {
                     .and_then(|source| source.fill)
                     .and_then(|fill| paint(fill, theme))
             })
+            .filter(|paint| !is_invisible(paint))
             .or_else(|| {
                 Some(Paint::Solid {
                     color: "#ffffff".to_owned(),
@@ -4764,6 +4765,18 @@ fn emu_to_px(value: i64) -> f32 {
 
 /// A slide's page box is a whole number of points, the unit PowerPoint
 /// exports and prints it in, so the extent snaps there before the px scale.
+/// a slide is white paper, so a background the deck made fully transparent is
+/// not a hole onto whatever is behind it.
+fn is_invisible(paint: &Paint) -> bool {
+    fn clear(color: &str) -> bool {
+        color.len() == 9 && color.as_bytes()[7..] == *b"00"
+    }
+    match paint {
+        Paint::Solid { color } => clear(color),
+        Paint::Gradient { stops, .. } => !stops.is_empty() && stops.iter().all(|s| clear(&s.color)),
+    }
+}
+
 fn slide_extent_px(value: i64) -> f32 {
     safe_geometry(((value as f64 / EMU_PER_POINT).round() * CSS_PIXELS_PER_POINT) as f32)
 }
@@ -5788,7 +5801,7 @@ mod tests {
 
     #[test]
     fn gradient_stops_reach_the_display_list_in_position_order() {
-        use ooxml_drawingml::{ColorValue, GradientFill, GradientStop as ModelStop};
+        use ooxml_drawingml::{ColorValue, GradientStop as ModelStop};
 
         let stop = |position, rgb: &str, alpha| ModelStop {
             position,
@@ -5814,7 +5827,7 @@ mod tests {
                 let fill = ShapeFill {
                     fill_type: "gradient".to_owned(),
                     color: None,
-                    gradient: Some(GradientFill {
+                    gradient: Some(ooxml_drawingml::GradientFill {
                         gradient_type: kind.to_owned(),
                         angle: Some(45.0),
                         stops: indices.map(|index| ordered[index].clone()).to_vec(),
@@ -6471,6 +6484,82 @@ mod tests {
             referenced.display_list.primitives[0],
             rendered.display_list.primitives[0]
         );
+    }
+
+    /// a deck whose master fills the slide at alpha 0 still renders on paper.
+    #[test]
+    fn a_fully_transparent_background_renders_as_white_paper() {
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_311).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        package.slides[0].background_reference = None;
+        package.slides[0].background = Some(ShapeFill {
+            fill_type: "solid".to_owned(),
+            color: Some(ColorValue {
+                rgb: Some("123456".to_owned()),
+                alpha: Some(0.0),
+                ..ColorValue::default()
+            }),
+            gradient: None,
+        });
+        let rendered = renderer().layout_slide(&package, &snapshot, 0).unwrap();
+        assert_eq!(
+            rendered.display_list.background,
+            Some(Paint::Solid {
+                color: "#ffffff".to_owned()
+            })
+        );
+    }
+
+    /// a gradient whose every stop is transparent is paper too, while one
+    /// visible stop keeps the gradient.
+    #[test]
+    fn a_gradient_paints_unless_every_stop_is_transparent() {
+        let clear = |alpha: f64| ColorValue {
+            rgb: Some("123456".to_owned()),
+            alpha: Some(alpha),
+            ..ColorValue::default()
+        };
+        let gradient = |stops: Vec<ColorValue>| ShapeFill {
+            fill_type: "gradient".to_owned(),
+            color: None,
+            gradient: Some(ooxml_drawingml::GradientFill {
+                gradient_type: "linear".to_owned(),
+                angle: None,
+                stops: stops
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, color)| ooxml_drawingml::GradientStop {
+                        position: index as f64,
+                        color,
+                    })
+                    .collect(),
+            }),
+        };
+        let mut package = pptx_parse::parse_pptx(FIXTURE).unwrap();
+        let session = DeckSession::open(FIXTURE, 8_317).unwrap();
+        let snapshot = session.snapshot().unwrap();
+        package.slides[0].background_reference = None;
+        package.slides[0].background = Some(gradient(vec![clear(0.0), clear(0.0)]));
+        assert_eq!(
+            renderer()
+                .layout_slide(&package, &snapshot, 0)
+                .unwrap()
+                .display_list
+                .background,
+            Some(Paint::Solid {
+                color: "#ffffff".to_owned()
+            })
+        );
+        package.slides[0].background = Some(gradient(vec![clear(0.0), clear(1.0)]));
+        assert!(matches!(
+            renderer()
+                .layout_slide(&package, &snapshot, 0)
+                .unwrap()
+                .display_list
+                .background,
+            Some(Paint::Gradient { .. })
+        ));
     }
 
     #[test]
