@@ -592,6 +592,8 @@ fn parse_worksheet(
                             .filter(|h| h.is_finite() && (0.0..=MAX_ROW_HEIGHT_PT).contains(h)),
                         custom_height: attr(&e, b"customHeight")?
                             .is_some_and(|value| is_truthy(&value)),
+                        zero_height: attr(&e, b"zeroHeight")?
+                            .is_some_and(|value| is_truthy(&value)),
                     };
                 }
                 _ => {}
@@ -724,6 +726,9 @@ fn ranges_intersect(left: CellRange, right: CellRange) -> bool {
 
 /// apply a `<col>` width across its `[min, max]` span (clamped to sheet bounds).
 /// widths are stored per-column since the model has no column-range concept.
+/// a negative authored width has no extent to render, so it narrows to zero
+/// the way a hidden column does; the authored value stays in `legacy` and the
+/// source span is reused verbatim on save.
 fn parse_col(
     e: &quick_xml::events::BytesStart,
     sheet: &mut Sheet,
@@ -736,7 +741,7 @@ fn parse_col(
         None if hidden => 0.0,
         None => return Ok(()),
     };
-    let width = if hidden { 0.0 } else { width };
+    let width = if hidden { 0.0 } else { width.max(0.0) };
     let min = attr(e, b"min")?
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(1);

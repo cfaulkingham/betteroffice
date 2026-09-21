@@ -215,12 +215,15 @@ pub struct PrintMetrics {
 }
 
 impl PrintMetrics {
+    /// a zero default row height is how a sheet declares `zeroHeight="1"`:
+    /// every row without an explicit `ht` collapses, exactly as a zero default
+    /// column width already collapses unsized columns.
     pub fn is_valid(&self) -> bool {
         !self.font_family.is_empty()
             && self.font_family.len() <= 1024
             && (36.0..=600.0).contains(&self.dpi)
             && (1.0..=256.0).contains(&self.max_digit_width)
-            && (1.0..=409.0).contains(&self.default_row_height_pt)
+            && (0.0..=409.0).contains(&self.default_row_height_pt)
             && self
                 .default_column_width
                 .is_none_or(|w| (0.0..=255.0).contains(&w))
@@ -323,12 +326,23 @@ impl GridGeometry {
         let mut row_y = Vec::with_capacity(n_rows as usize + 1);
         row_y.push(0.0);
         for r in 0..n_rows {
+            // `zeroHeight` hides every row that does not carry its own `ht`
+            let unsized_px = if sheet.format.zero_height {
+                0.0
+            } else {
+                default_row_px
+            };
             let h = sheet
                 .row_heights
                 .get(&r)
                 .map(|&h| row_pt_to_px(scale.map_or(h, |s| floor_pt(h * s))))
-                .or_else(|| fitted.get(&r).map(|&h| row_pt_to_px(h)))
-                .unwrap_or(default_row_px);
+                .or_else(|| {
+                    fitted
+                        .get(&r)
+                        .map(|&h| row_pt_to_px(h))
+                        .filter(|_| !sheet.format.zero_height)
+                })
+                .unwrap_or(unsized_px);
             let start = row_y.last().copied().unwrap_or(0.0);
             row_y.push(start + h);
         }
@@ -630,6 +644,32 @@ mod tests {
         sheet.format.default_row_height_pt = Some(20.0);
         let grid = GridGeometry::new(&sheet, &styles);
         assert!((grid.row_y(1) - row_pt_to_px(63.0)).abs() < 0.001);
+    }
+
+    /// `zeroHeight` hides rows without their own `ht`; a sized row still shows.
+    #[test]
+    fn zero_height_collapses_only_the_unsized_rows() {
+        let mut styles = Stylesheet::default();
+        styles.fonts.push(Font {
+            size_pt: Some(30.0),
+            ..Font::default()
+        });
+        styles.cell_xfs.push(Xf {
+            font: Some(0),
+            ..Xf::default()
+        });
+        let mut sheet = sheet_with(&[], &[(1, 24.0)]);
+        sheet.format.zero_height = true;
+        sheet.set_cell(
+            CellRef::new(0, 0),
+            xlsx_model::workbook::Cell {
+                style: Some(0),
+                ..Default::default()
+            },
+        );
+        let grid = GridGeometry::new(&sheet, &styles);
+        assert_eq!(grid.row_y(1), 0.0);
+        assert!((grid.row_y(2) - grid.row_y(1) - row_pt_to_px(24.0)).abs() < 0.001);
     }
 
     #[test]
