@@ -3,8 +3,8 @@
 
 use xlsx_model::styles::{BorderStyle, Color, Fill, FormatCode, HAlign, VAlign};
 use xlsx_model::{
-    Cell, CellRef, CellValue, DateSystem, DefinedName, ErrorValue, FreezePane, Hyperlink, SheetId,
-    Workbook,
+    Cell, CellRef, CellValue, ColStyle, DateSystem, DefinedName, ErrorValue, FreezePane, Hyperlink,
+    SheetId, Workbook,
 };
 
 use crate::write::{
@@ -446,6 +446,50 @@ fn negative_column_width_narrows_to_zero_and_saves_verbatim() {
     assert_eq!(sheet.col_widths.get(&1), Some(&12.5));
     let saved = serialize_workbook_with_package(&parsed.workbook, &parsed.package).unwrap();
     assert_eq!(part_bytes(&saved, "xl/worksheets/sheet1.xml"), source);
+}
+
+#[test]
+fn a_column_style_run_survives_without_a_width() {
+    let body = r#"
+        <cols>
+            <col min="1" max="16384" style="7"/>
+            <col min="2" max="3" width="12.5" style="9" customWidth="1"/>
+        </cols>
+        <sheetData/>
+    "#;
+    let wb = parse_workbook(&package(body, &[], false)).unwrap();
+    let sheet = &wb.sheets[0];
+    assert_eq!(
+        sheet.col_styles,
+        vec![
+            ColStyle {
+                first: 0,
+                last: 16383,
+                xf: 7
+            },
+            ColStyle {
+                first: 1,
+                last: 2,
+                xf: 9
+            },
+        ]
+    );
+    assert_eq!(sheet.col_style(0), Some(7));
+    assert_eq!(sheet.col_style(2), Some(9));
+    assert_eq!(sheet.col_widths.get(&0), None);
+    assert_eq!(sheet.col_widths.get(&1), Some(&12.5));
+}
+
+#[test]
+fn a_worksheet_past_the_column_style_cap_is_refused() {
+    let runs: String = (1..=crate::MAX_COL_STYLES + 1)
+        .map(|i| format!(r#"<col min="{i}" max="{i}" style="1"/>"#))
+        .collect();
+    let body = format!("<cols>{runs}</cols><sheetData/>");
+    assert!(matches!(
+        parse_workbook(&package(&body, &[], false)),
+        Err(ParseError::TooManyColumnStyles)
+    ));
 }
 
 #[test]

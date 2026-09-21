@@ -124,6 +124,14 @@ pub struct SheetFormat {
     pub zero_height: bool,
 }
 
+/// a `<col>` run's style: the `cellXfs` index its columns give a cell that names none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColStyle {
+    pub first: ColId,
+    pub last: ColId,
+    pub xf: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Sheet {
     pub name: String,
@@ -135,6 +143,8 @@ pub struct Sheet {
     pub row_heights: BTreeMap<RowId, f64>,
     /// parsed from `sheetFormatPr`; read by the renderer, never by the writer.
     pub format: SheetFormat,
+    /// `<col>` style runs in source order; read by the renderer, never the writer.
+    pub col_styles: Vec<ColStyle>,
     pub charts: Vec<SheetChart>,
     /// anchors of `t="array"` formulas mapped to the rectangle their result
     /// occupies. authored from the file, then kept current by recalc.
@@ -171,6 +181,16 @@ impl Sheet {
 
     pub fn cell(&self, at: CellRef) -> Option<&Cell> {
         self.cells.get(&(at.row, at.col))
+    }
+
+    /// the style a `<col>` run gives a cell that names none; later runs win.
+    /// only the fill and the row fit consult it; other facets read `Cell::style`.
+    pub fn col_style(&self, col: ColId) -> Option<u32> {
+        self.col_styles
+            .iter()
+            .rev()
+            .find(|run| (run.first..=run.last).contains(&col))
+            .map(|run| run.xf)
     }
 
     pub fn cell_mut(&mut self, at: CellRef) -> Option<&mut Cell> {

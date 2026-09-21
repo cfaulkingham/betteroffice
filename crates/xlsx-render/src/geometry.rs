@@ -185,8 +185,9 @@ fn autofit_rows(
         if sheet.row_heights.contains_key(&at.row) || spanned.contains(&(at.row, at.col)) {
             continue;
         }
-        if let Some(height) = autofit_height(styles, cell.style, default_pt, cached_default, normal)
-        {
+        // a cell naming no style still inherits its column's
+        let style = cell.style.or_else(|| sheet.col_style(at.col));
+        if let Some(height) = autofit_height(styles, style, default_pt, cached_default, normal) {
             let entry = fitted.entry(at.row).or_insert(height);
             if height > *entry {
                 *entry = height;

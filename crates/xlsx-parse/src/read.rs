@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use quick_xml::events::Event;
 use xlsx_model::addr::{MAX_COLS, MAX_ROWS};
 use xlsx_model::{
-    Cell, CellRange, CellRef, CellValue, DateSystem, DefinedName, ErrorValue, FreezePane,
+    Cell, CellRange, CellRef, CellValue, ColStyle, DateSystem, DefinedName, ErrorValue, FreezePane,
     Hyperlink, Sheet, SheetFormat, SheetId, Stylesheet, Table, Workbook,
 };
 
@@ -16,8 +16,8 @@ use crate::xml::{
     attr, collect_text, find_part, local_name, next_event, reader, resolve_part_path,
 };
 use crate::{
-    MAX_CELLS, MAX_DEFINED_NAMES, MAX_HYPERLINKS, MAX_SHARED_STRINGS, MAX_TABLE_COLUMNS,
-    MAX_TABLES, ParseError,
+    MAX_CELLS, MAX_COL_STYLES, MAX_DEFINED_NAMES, MAX_HYPERLINKS, MAX_SHARED_STRINGS,
+    MAX_TABLE_COLUMNS, MAX_TABLES, ParseError,
 };
 
 /// excel's row-height ceiling in points.
@@ -724,11 +724,12 @@ fn ranges_intersect(left: CellRange, right: CellRange) -> bool {
         && left.end.col >= right.start.col
 }
 
-/// apply a `<col>` width across its `[min, max]` span (clamped to sheet bounds).
-/// widths are stored per-column since the model has no column-range concept.
-/// a negative authored width has no extent to render, so it narrows to zero
-/// the way a hidden column does; the authored value stays in `legacy` and the
-/// source span is reused verbatim on save.
+/// apply a `<col>` width and style across its `[min, max]` span (clamped to
+/// sheet bounds). widths are stored per-column since the model has no
+/// column-range concept; the style keeps its run, which a whole-sheet `<col>`
+/// spans 16,384 columns wide. a negative authored width has no extent to
+/// render, so it narrows to zero the way a hidden column does; the authored
+/// value stays in `legacy` and the source span is reused verbatim on save.
 fn parse_col(
     e: &quick_xml::events::BytesStart,
     sheet: &mut Sheet,
@@ -736,12 +737,10 @@ fn parse_col(
 ) -> Result<(), ParseError> {
     let hidden = attr(e, b"hidden")?.is_some_and(|value| is_truthy(&value));
     let authored = attr(e, b"width")?.and_then(|v| v.parse::<f64>().ok());
-    let width = match authored {
-        Some(w) => w,
-        None if hidden => 0.0,
-        None => return Ok(()),
-    };
-    let width = if hidden { 0.0 } else { width.max(0.0) };
+    let style = attr(e, b"style")?.and_then(|v| v.parse::<u32>().ok());
+    if authored.is_none() && !hidden && style.is_none() {
+        return Ok(());
+    }
     let min = attr(e, b"min")?
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(1);
@@ -750,6 +749,21 @@ fn parse_col(
         .unwrap_or(min);
     let min = min.clamp(1, MAX_COLS);
     let max = max.clamp(min, MAX_COLS);
+    if let Some(xf) = style {
+        if sheet.col_styles.len() >= MAX_COL_STYLES {
+            return Err(ParseError::TooManyColumnStyles);
+        }
+        sheet.col_styles.push(ColStyle {
+            first: min - 1,
+            last: max - 1,
+            xf,
+        });
+    }
+    let width = match authored {
+        _ if hidden => 0.0,
+        Some(w) => w.max(0.0),
+        None => return Ok(()),
+    };
     for col in min..=max {
         sheet.col_widths.insert(col - 1, width);
         if let Some(authored) = authored {
