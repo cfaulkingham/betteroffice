@@ -797,7 +797,7 @@ describe('XlsxEditor host integration', () => {
     expect(api!.selectCells(99, selectionAt({ row: 0, col: 0 }))).toBe(false);
   });
 
-  it('notifies on applied edits and saves through the host API', async () => {
+  it('notifies on drafts and applied edits and saves through the host API', async () => {
     let api: XlsxEditorApi | undefined;
     let changes = 0;
     const view = render(
@@ -819,8 +819,10 @@ describe('XlsxEditor host integration', () => {
     fireEvent.doubleClick(surface, pointAt(plain, target));
     const editor = await waitFor(() => view.getByTestId('xlsx-cell-editor'));
     fireEvent.change(editor, { target: { value: 'Host edit' } });
-    fireEvent.keyDown(editor, { key: 'Enter' });
     expect(changes).toBe(1);
+    expect(api!.handle.cell(0, target.row, target.col).input).toBe('Line item 1');
+    fireEvent.keyDown(editor, { key: 'Enter' });
+    expect(changes).toBe(2);
 
     await act(async () => {
       api!.selectCells(0, selectionAt({ row: 3, col: 1 }));
@@ -830,7 +832,7 @@ describe('XlsxEditor host integration', () => {
     await act(async () => {
       saved = api!.save();
     });
-    expect(changes).toBe(1);
+    expect(changes).toBe(2);
 
     const reopened = openWorkbook(saved);
     try {
@@ -1041,6 +1043,7 @@ describe('XlsxEditor pending host edits', () => {
           source === 'cell' ? 'xlsx-cell-editor' : 'xlsx-formula-input'
         );
         fireEvent.change(input, { target: { value: 'Saved draft' } });
+        expect(changes).toBe(1);
         expect(api!.selectCells(-1, selectionAt(target))).toBe(false);
         expect(api!.handle.cell(0, target.row, target.col).input).toBe('Line item 1');
         let saved: Uint8Array | undefined;
@@ -1050,7 +1053,7 @@ describe('XlsxEditor pending host edits', () => {
           else api!.selectCells(0, selectionAt({ row: 3, col: 1 }));
         });
         expect(api!.handle.cell(0, target.row, target.col).input).toBe('Saved draft');
-        expect(changes).toBe(1);
+        expect(changes).toBe(2);
         if (saved) {
           const reopened = openWorkbook(saved);
           try {

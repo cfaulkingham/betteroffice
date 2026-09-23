@@ -116,7 +116,7 @@ export interface XlsxEditorProps {
   fileName?: string;
   /** Receive saved bytes instead of triggering a browser download. */
   onSave?: (bytes: Uint8Array) => void;
-  /** Called after a user edit changes the workbook. */
+  /** Called when a user draft or committed edit changes. */
   onChange?: () => void;
   /** Receive load and edit failures in the host application. */
   onError?: (error: Error) => void;

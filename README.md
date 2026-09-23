@@ -17,6 +17,8 @@
   <a href="https://betteroffice.dev"><img src="https://betteroffice.dev/api/badge?label=&amp;message=betteroffice.dev&amp;color=0a0a0a" alt="betteroffice.dev"></a>
 </p>
 
+This fork maintains the editor and engine changes used by [Field Station](https://github.com/cfaulkingham/field-station). See [FIELD_STATION.md](FIELD_STATION.md) for building pinned packages, updating the application, and merging upstream changes.
+
 ## Features
 
 - **Documents, spreadsheets, and slides.** Open, edit, render, and save DOCX,

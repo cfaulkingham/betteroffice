@@ -44,7 +44,7 @@ jobs:
         with:
           tool: wasm-pack@0.15.0
       - name: Install locked package dependencies
-        run: bun install --frozen-lockfile --ignore-scripts --filter './packages/*'
+        run: bun install --frozen-lockfile --ignore-scripts --filter betteroffice --filter './packages/*'
       - name: Test package provenance checks
         run: node --test scripts/pack-fieldstation.test.mjs
       - name: Build fork packages
