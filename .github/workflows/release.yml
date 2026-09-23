@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   release:
-    if: github.ref == 'refs/heads/main'
+    if: github.repository == 'openooxml/betteroffice' && github.ref == 'refs/heads/main'
     name: Release
     runs-on: ubuntu-latest
     timeout-minutes: 45
