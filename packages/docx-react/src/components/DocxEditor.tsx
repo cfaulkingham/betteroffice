@@ -264,6 +264,8 @@ export interface DocxEditorBaseProps extends DocxEditorPluginProps {
   onChange?: (document: Document) => void;
   /** Receives the version after a committed edit or a changed document is presented by the worker. */
   onDocumentChange?: (change: DocxDocumentChange) => void;
+  /** Immediate edit notification, before the debounced legacy document projection. */
+  onEdit?: () => void;
   /** Callback when selection changes */
   onSelectionChange?: (state: SelectionState | null) => void;
   /** Recoverable worker reports include `{ recoverable: true }`; fatal and legacy reports omit `info`. */
@@ -409,6 +411,8 @@ export interface DocxEditorBaseProps extends DocxEditorPluginProps {
    * invokes this callback.
    */
   onPrint?: () => void;
+  /** Delegate all rasterized pages to a native host print workflow. */
+  onPrintPages?: (pages: HTMLCanvasElement[]) => void | Promise<void>;
   /** Callback when content is copied */
   onCopy?: () => void;
   /** Callback when content is cut */
@@ -912,6 +916,7 @@ const LegacyDocxEditor = forwardRef<DocxEditorRef, DocxEditorBaseProps>(function
     author = 'User',
     onChange,
     onDocumentChange,
+    onEdit,
     onSelectionChange,
     onError,
     onMemoryPressure,
@@ -947,6 +952,7 @@ const LegacyDocxEditor = forwardRef<DocxEditorRef, DocxEditorBaseProps>(function
     watermarkPresets,
     printOptions: _printOptions,
     onPrint,
+    onPrintPages,
     onCopy: _onCopy,
     onCut: _onCut,
     onPaste: _onPaste,
@@ -1489,6 +1495,7 @@ const LegacyDocxEditor = forwardRef<DocxEditorRef, DocxEditorBaseProps>(function
     onOpen,
     onError,
     onPrint,
+    onPrintPages,
     onDocumentNameChange,
     loadBuffer,
     focusActiveEditor,
@@ -1664,6 +1671,7 @@ const LegacyDocxEditor = forwardRef<DocxEditorRef, DocxEditorBaseProps>(function
 
   const handleDocumentChange = useCallback(
     (newDocument: Document) => {
+      onEdit?.();
       commitLegacyDocumentChange(
         newDocument,
         yrsCore.documentFromYrs,
@@ -1685,6 +1693,7 @@ const LegacyDocxEditor = forwardRef<DocxEditorRef, DocxEditorBaseProps>(function
       notifyDocumentVersion,
       yrsCore.session,
       onChange,
+      onEdit,
       pushDocument,
       scheduleLegacyProjection,
       yrsCore.documentFromYrs,
@@ -2778,6 +2787,7 @@ const LegacyDocxEditor = forwardRef<DocxEditorRef, DocxEditorBaseProps>(function
               measurementFontProvider={measurementFontProvider}
               rustFontChainsProviderRef={rustFontChainsProviderRef}
               onYrsContentChange={handleYrsContentChange}
+              onYrsEdit={onEdit}
               onPagedSelectionChange={handlePagedSelectionChange}
               onYrsSelectionChange={handleYrsToolbarSelectionChange}
               onViewerSelectionChange={handlePagedViewerSelectionChange}

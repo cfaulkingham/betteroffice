@@ -254,6 +254,8 @@ export interface PagedEditorProps {
   showHiddenText?: boolean;
   /** Callback when Yrs content changes. */
   onYrsContentChange?: () => void;
+  /** Immediate host edit signal; does not project the document. */
+  onYrsEdit?: () => void;
   /** Callback when the native Yrs undo/redo availability changes. */
   onYrsHistoryChange?: (canUndo: boolean, canRedo: boolean) => void;
   /** Callback when selection changes. */
@@ -567,6 +569,7 @@ const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
       zoom = 1,
       showHiddenText = false,
       onYrsContentChange,
+      onYrsEdit,
       onYrsHistoryChange,
       onSelectionChange,
       onYrsSelectionChange,
@@ -715,6 +718,7 @@ const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
     const onViewerSelectionChangeRef = useRef(onViewerSelectionChange);
     const onYrsPartSelectionChangeRef = useRef(onYrsPartSelectionChange);
     const onYrsContentChangeRef = useRef(onYrsContentChange);
+    const onYrsEditRef = useRef(onYrsEdit);
     const onYrsHistoryChangeRef = useRef(onYrsHistoryChange);
     const onReadyRef = useRef(onReady);
     // Keep refs in sync with latest props
@@ -723,6 +727,7 @@ const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
     onViewerSelectionChangeRef.current = onViewerSelectionChange;
     onYrsPartSelectionChangeRef.current = onYrsPartSelectionChange;
     onYrsContentChangeRef.current = onYrsContentChange;
+    onYrsEditRef.current = onYrsEdit;
     onYrsHistoryChangeRef.current = onYrsHistoryChange;
     onReadyRef.current = onReady;
 
@@ -1062,6 +1067,7 @@ const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
           refreshYrsLayout(updateOrigin, inWorker);
         }
         if (docChanged) {
+          onYrsEditRef.current?.();
           // Compatibility callbacks stay off the synchronous input path.
           if (documentChangeTimerRef.current !== null) {
             clearTimeout(documentChangeTimerRef.current);

@@ -141,7 +141,7 @@ export interface DocxPrintJob {
   /** Renders `displayList` into the reserved window and waits for its pages to load. */
   prepare(displayList: DisplayList): Promise<void>;
   /** Prints the prepared pages; false when the reserved window was closed first. */
-  print(): boolean;
+  print(): boolean | Promise<boolean>;
   cancel(): void;
 }
 
@@ -168,6 +168,7 @@ export function useFileIO({
   onOpen,
   onError,
   onPrint,
+  onPrintPages,
   onDocumentNameChange,
   loadBuffer,
   focusActiveEditor,
@@ -188,6 +189,7 @@ export function useFileIO({
   onOpen: ((file: File) => void | Promise<void>) | undefined;
   onError: ((error: Error) => void) | undefined;
   onPrint: (() => void) | undefined;
+  onPrintPages?: (pages: HTMLCanvasElement[]) => void | Promise<void>;
   onDocumentNameChange: ((name: string) => void) | undefined;
   loadBuffer: (buffer: DocxInput) => Promise<void>;
   focusActiveEditor: () => void;
@@ -269,6 +271,22 @@ export function useFileIO({
   );
 
   const reservePrint = useCallback((): DocxPrintJob => {
+    if (onPrintPages) {
+      let pages: HTMLCanvasElement[] | null = null;
+      return {
+        async prepare(displayList) {
+          pages = await rasterizeDisplayListPages(displayList, {
+            resolveImage: shownImageResolver?.() ?? resolveImage, fontFamilies,
+          });
+        },
+        async print() {
+          if (!pages) return false;
+          await onPrintPages(pages);
+          return true;
+        },
+        cancel() { pages = null; },
+      };
+    }
     const w = openPrintWindow('Print', '');
     return {
       async prepare(displayList) {
@@ -297,7 +315,7 @@ export function useFileIO({
         if (w && !w.closed) w.close();
       },
     };
-  }, [resolveImage, shownImageResolver, fontFamilies, onPrint]);
+  }, [resolveImage, shownImageResolver, fontFamilies, onPrint, onPrintPages]);
 
   const handleDownloadDocument = useCallback((): Promise<DocxSaveOutcome> => {
     if (saveRequestRef.current) return saveRequestRef.current;
