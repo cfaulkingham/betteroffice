@@ -37,6 +37,7 @@ jobs:
       contents: read
 
   publish:
+    if: github.repository == 'openooxml/betteroffice'
     name: Publish betteroffice-${{ inputs.binding }}
     needs: dist
     runs-on: ubuntu-latest

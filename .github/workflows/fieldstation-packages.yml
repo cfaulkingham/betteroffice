@@ -1,0 +1,61 @@
+name: Field Station packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'packages/**'
+      - 'scripts/**'
+      - 'Cargo.*'
+      - 'bun.lock'
+      - 'package.json'
+      - '.github/workflows/fieldstation-packages.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fieldstation-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  packages:
+    if: github.repository == 'cfaulkingham/betteroffice'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.14'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fieldstation-wasm
+      - uses: ./.github/actions/wasm-toolchain
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.0
+      - name: Install locked package dependencies
+        run: bun install --frozen-lockfile --ignore-scripts --filter './packages/*'
+      - name: Test package provenance checks
+        run: node --test scripts/pack-fieldstation.test.mjs
+      - name: Build fork packages
+        run: node scripts/pack-fieldstation.mjs --output dist/fieldstation-artifacts
+      - name: Test spreadsheet engine operations
+        run: cargo test --locked -p betteroffice-xlsx -p betteroffice-xlsx-ops
+      - name: Test editor packages
+        run: bun test --isolate packages/xlsx/src packages/xlsx-react/src packages/docx-react/src packages/vsdx-react/src
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fieldstation-betteroffice-${{ github.sha }}
+          path: dist/fieldstation-artifacts/
+          if-no-files-found: error
+          retention-days: 90

@@ -13,6 +13,7 @@ concurrency:
 
 jobs:
   deploy:
+    if: github.repository == 'openooxml/betteroffice'
     name: Deploy ${{ matrix.app }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
