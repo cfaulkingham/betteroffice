@@ -8,10 +8,10 @@ The maintained changes cover spreadsheet dirty/error/save/print/clipboard callba
 
 ## Building application packages
 
-Install Node.js, Bun, Rust with `wasm32-unknown-unknown`, `wasm-pack` 0.15.0, and Binaryen (`wasm-opt` on PATH). The CI workflow records the same build process. It does not require npm, crates.io, or PyPI publishing credentials.
+Install Node.js, Bun 1.3.14, Rust with `wasm32-unknown-unknown`, `wasm-pack` 0.15.0, and Binaryen (`wasm-opt` on PATH). The CI workflow records the same build process. It does not require npm, crates.io, or PyPI publishing credentials.
 
 ```sh
-bun install --frozen-lockfile --ignore-scripts --filter './packages/*'
+bun install --frozen-lockfile --ignore-scripts --filter betteroffice --filter './packages/*'
 node --test scripts/pack-fieldstation.test.mjs
 node scripts/pack-fieldstation.mjs
 ```
