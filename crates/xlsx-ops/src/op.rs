@@ -152,6 +152,10 @@ pub enum Op {
         index: usize,
         name: String,
     },
+    MoveSheet {
+        from: usize,
+        to: usize,
+    },
     RemoveSheet {
         index: usize,
     },

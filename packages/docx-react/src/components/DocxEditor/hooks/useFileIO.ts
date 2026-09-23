@@ -111,6 +111,7 @@ export function useFileIO({
   onOpen,
   onError,
   onPrint,
+  onPrintPages,
   onDocumentNameChange,
   loadBuffer,
   focusActiveEditor,
@@ -125,6 +126,7 @@ export function useFileIO({
   onOpen: ((file: File) => void | Promise<void>) | undefined;
   onError: ((error: Error) => void) | undefined;
   onPrint: (() => void) | undefined;
+  onPrintPages?: (pages: HTMLCanvasElement[]) => void | Promise<void>;
   onDocumentNameChange: ((name: string) => void) | undefined;
   loadBuffer: (buffer: DocxInput) => Promise<void>;
   focusActiveEditor: () => void;
@@ -163,13 +165,18 @@ export function useFileIO({
   );
 
   const handleDirectPrint = useCallback(() => {
+    if (onPrintPages) {
+      if (!displayList) { onError?.(new Error('The document is not ready to print.')); return; }
+      void rasterizeDisplayListPages(displayList, { resolveImage }).then(onPrintPages).catch((error) => onError?.(toFileIOError(error, 'Printing failed.')));
+      return;
+    }
     if (!displayList) {
       window.print();
       onPrint?.();
       return;
     }
     printDisplayListPages(displayList, resolveImage, onPrint);
-  }, [displayList, resolveImage, onPrint]);
+  }, [displayList, resolveImage, onPrint, onPrintPages, onError]);
 
   const handleDownloadDocument = useCallback(async () => {
     const buffer = await handleSave();

@@ -135,6 +135,8 @@ export interface DocxEditorProps {
   author?: string;
   /** Callback when document changes */
   onChange?: (document: Document) => void;
+  /** Immediate edit notification, before the debounced legacy document projection. */
+  onEdit?: () => void;
   /** Callback when selection changes */
   onSelectionChange?: (state: SelectionState | null) => void;
   /** Callback on error */
@@ -236,6 +238,8 @@ export interface DocxEditorProps {
    * invokes this callback.
    */
   onPrint?: () => void;
+  /** Delegate all rasterized pages to a native host print workflow. */
+  onPrintPages?: (pages: HTMLCanvasElement[]) => void | Promise<void>;
   /** Callback when content is copied */
   onCopy?: () => void;
   /** Callback when content is cut */
@@ -562,6 +566,7 @@ export const DocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(function Do
     onOpen,
     author = 'User',
     onChange,
+    onEdit,
     onSelectionChange,
     onError,
     onFontsLoaded: onFontsLoadedCallback,
@@ -591,6 +596,7 @@ export const DocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(function Do
     watermarkPresets,
     printOptions: _printOptions,
     onPrint,
+    onPrintPages,
     onCopy: _onCopy,
     onCut: _onCut,
     onPaste: _onPaste,
@@ -893,6 +899,7 @@ export const DocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(function Do
     onOpen,
     onError,
     onPrint,
+    onPrintPages,
     onDocumentNameChange,
     loadBuffer,
     focusActiveEditor,
@@ -962,6 +969,7 @@ export const DocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(function Do
 
   const handleDocumentChange = useCallback(
     (newDocument: Document) => {
+      onEdit?.();
       commitLegacyDocumentChange(
         newDocument,
         yrsCore.documentFromYrs,
@@ -980,6 +988,7 @@ export const DocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(function Do
       handleContentHousekeeping,
       notifyDocumentChange,
       onChange,
+      onEdit,
       pushDocument,
       scheduleLegacyProjection,
       yrsCore.documentFromYrs,
@@ -1876,6 +1885,7 @@ export const DocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(function Do
               measurementFontProvider={measurementFontProvider}
               rustFontChainsProviderRef={rustFontChainsProviderRef}
               onYrsContentChange={handleYrsContentChange}
+              onYrsEdit={onEdit}
               onYrsHistoryChange={handleYrsHistoryChange}
               onPagedSelectionChange={handlePagedSelectionChange}
               onYrsSelectionChange={handleYrsToolbarSelectionChange}

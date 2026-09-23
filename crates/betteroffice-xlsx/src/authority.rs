@@ -1462,6 +1462,13 @@ impl WorkbookAuthority {
                     let key = self.allocate_sheet_key();
                     keys.insert(*index, key);
                 }
+                Op::MoveSheet { from, to } => {
+                    if *from >= keys.len() || *to >= keys.len() {
+                        return Err("sheet move index is out of range".to_string());
+                    }
+                    let key = keys.remove(*from);
+                    keys.insert(*to, key);
+                }
                 Op::RemoveSheet { index } => {
                     if *index >= keys.len() {
                         return Err(format!("sheet removal index {index} is out of range"));
@@ -1522,6 +1529,7 @@ pub(crate) fn is_structural_op(op: &Op) -> bool {
             | Op::MergeCells { .. }
             | Op::UnmergeCells { .. }
             | Op::AddSheet { .. }
+            | Op::MoveSheet { .. }
             | Op::RemoveSheet { .. }
             | Op::RenameSheet { .. }
             | Op::RestoreSheet { .. }
@@ -2314,6 +2322,7 @@ fn requires_full_semantic_sync(op: &Op) -> bool {
             | Op::RestoreColStyles { .. }
             | Op::SetCharts { .. }
             | Op::SetChartAnchor { .. }
+            | Op::MoveSheet { .. }
             | Op::RemoveSheet { .. }
             | Op::RenameSheet { .. }
             | Op::RestoreSheet { .. }
@@ -2346,6 +2355,14 @@ fn targeted_sheet_keys(
                 }
                 tokens.insert(*index, SheetToken::Added(next_added));
                 next_added += 1;
+                targets.push(None);
+            }
+            Op::MoveSheet { from, to } => {
+                if *from >= tokens.len() || *to >= tokens.len() {
+                    return Err("sheet move index is out of range".to_string());
+                }
+                let token = tokens.remove(*from);
+                tokens.insert(*to, token);
                 targets.push(None);
             }
             Op::RemoveSheet { index } => {
@@ -2415,7 +2432,10 @@ fn op_sheet(op: &Op) -> Option<SheetId> {
         | Op::ApplyRangeFormat { sheet, .. }
         | Op::RenameSheet { sheet, .. }
         | Op::RestoreSheet { sheet, .. } => Some(*sheet),
-        Op::AddSheet { .. } | Op::RemoveSheet { .. } | Op::SetDefinedNames { .. } => None,
+        Op::AddSheet { .. }
+        | Op::MoveSheet { .. }
+        | Op::RemoveSheet { .. }
+        | Op::SetDefinedNames { .. } => None,
     }
 }
 

@@ -81,9 +81,15 @@ struct TextSearchMatch {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CellPosition {
     x: f32,
     y: f32,
+    width: f32,
+    height: f32,
+    column_width: Option<f64>,
+    row_height: Option<f64>,
+    row_height_scale: f64,
 }
 
 #[derive(Deserialize)]
@@ -583,7 +589,22 @@ impl Session {
             .workbook
             .cell_scroll_position(SheetId(args.sheet), CellRef::new(args.row, args.col))
             .map_err(|error| error.to_string())?;
-        serde_json::to_string(&CellPosition { x, y }).map_err(|error| error.to_string())
+        let sheet = self
+            .workbook
+            .sheet(SheetId(args.sheet))
+            .map_err(|error| error.to_string())?;
+        let styles = &self.workbook.model().styles;
+        let geometry = betteroffice_xlsx::GridGeometry::new(sheet, styles);
+        serde_json::to_string(&CellPosition {
+            x,
+            y,
+            width: geometry.col_x(args.col + 1) - geometry.col_x(args.col),
+            height: geometry.row_y(args.row + 1) - geometry.row_y(args.row),
+            column_width: sheet.col_widths.get(&args.col).copied(),
+            row_height: sheet.row_heights.get(&args.row).copied(),
+            row_height_scale: betteroffice_xlsx::GridGeometry::row_height_scale(sheet, styles),
+        })
+        .map_err(|error| error.to_string())
     }
 
     pub fn range_cells_json(&self, args: &str) -> Result<String, String> {

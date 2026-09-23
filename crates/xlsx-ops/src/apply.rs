@@ -270,6 +270,32 @@ pub fn apply_in_place(wb: &mut Workbook, op: &Op) -> Result<InvertedOp, OpError>
             shift_defined_name_scopes(wb, idx);
             Ok(InvertedOp(vec![Op::RemoveSheet { index: idx }]))
         }
+        Op::MoveSheet { from, to } => {
+            if *from >= wb.sheets.len() || *to >= wb.sheets.len() {
+                return Err(OpError::SheetIndexOutOfRange((*from).max(*to)));
+            }
+            let sheet = wb.sheets.remove(*from);
+            wb.sheets.insert(*to, sheet);
+            for defined in &mut wb.defined_names {
+                if let Some(sheet) = defined.local_sheet {
+                    let index = sheet.0 as usize;
+                    let moved = if index == *from {
+                        *to
+                    } else if from < to && index > *from && index <= *to {
+                        index - 1
+                    } else if to < from && index >= *to && index < *from {
+                        index + 1
+                    } else {
+                        index
+                    };
+                    defined.local_sheet = Some(SheetId(moved as u32));
+                }
+            }
+            Ok(InvertedOp(vec![Op::MoveSheet {
+                from: *to,
+                to: *from,
+            }]))
+        }
         Op::RemoveSheet { index } => remove_sheet(wb, *index),
         Op::RenameSheet { sheet, name } => {
             let old = wb

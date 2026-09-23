@@ -76,6 +76,7 @@ export function DocxEditorPagedArea({
   readOnly,
   showHiddenText = false,
   onYrsContentChange,
+  onYrsEdit,
   onYrsHistoryChange,
   onPagedSelectionChange,
   onYrsSelectionChange,
@@ -155,6 +156,7 @@ export function DocxEditorPagedArea({
   readOnly: boolean;
   showHiddenText?: boolean;
   onYrsContentChange: () => void;
+  onYrsEdit?: () => void;
   onYrsHistoryChange: (canUndo: boolean, canRedo: boolean) => void;
   onPagedSelectionChange: () => void;
   onYrsSelectionChange: (selection: YrsToolbarSelection) => void;
@@ -436,6 +438,7 @@ export function DocxEditorPagedArea({
         readOnly={readOnly}
         showHiddenText={showHiddenText}
         onYrsContentChange={onYrsContentChange}
+        onYrsEdit={onYrsEdit}
         onYrsHistoryChange={onYrsHistoryChange}
         onSelectionChange={onPagedSelectionChange}
         onYrsSelectionChange={onYrsSelectionChange}

@@ -52,6 +52,11 @@ export interface SheetInfo {
 export interface CellPosition {
   x: number;
   y: number;
+  width: number;
+  height: number;
+  columnWidth: number | null;
+  rowHeight: number | null;
+  rowHeightScale: number;
 }
 
 /**

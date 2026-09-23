@@ -34,7 +34,7 @@ export { resolveDragGeometry };
 export type { DragStart };
 
 export interface VsdxShapeSelection { pageId: string; shapeId: string; hit: HitTestResult; }
-export interface VsdxEditorApi { handle: DiagramHandle; refresh: () => void; }
+export interface VsdxEditorApi { handle: DiagramHandle; refresh: () => void; save: () => Uint8Array; }
 /** Save edits before changing a session identity or seed, or remount for a new session. */
 export interface VsdxEditorCollaborationOptions {
   clientId: number;
@@ -51,6 +51,9 @@ export interface VsdxEditorProps {
   className?: string;
   onReady?: (api: VsdxEditorApi) => void;
   onChange?: () => void;
+  onSave?: (bytes: Uint8Array) => void;
+  fileName?: string;
+  isDirty?: boolean;
   onError?: (error: Error) => void;
   leftPanel?: ReactNode;
   rightPanel?: ReactNode;
@@ -59,7 +62,7 @@ export interface VsdxEditorProps {
 
 interface EditorModel { snapshot: DiagramSnapshot | null; pageIndex: number; frame: PageDisplayList | null; layers: PageLayer[]; }
 
-export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, className, onReady, onChange, onError, leftPanel, rightPanel, statusBar }: VsdxEditorProps) {
+export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, className, onReady, onChange, onSave, fileName, isDirty, onError, leftPanel, rightPanel, statusBar }: VsdxEditorProps) {
   const strings = useMemo(() => deepMerge(en, i18n) as typeof en, [i18n]);
   const t = useMemo(() => createT(strings), [strings]);
   const handleRef = useRef<DiagramHandle | null>(null);
@@ -209,6 +212,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     textRefusedRef.current = false;
     setEditing(next);
     editingRef.current = next;
+    if (override !== undefined && override !== committed) onChangeRef.current?.();
   }, []);
   const refresh = useCallback((requestedPage?: number, notify = false) => {
     const handle = handleRef.current;
@@ -249,18 +253,19 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
     editingRef.current = null;
   }, []);
 
-  const commitTextEdit = useCallback((): boolean => {
+  const commitTextEdit = useCallback((keepOpen = false): boolean => {
     const current = editingRef.current;
     const handle = handleRef.current;
     if (!current || !handle) return true;
     const text = draftRef.current;
     if (text === committedTextRef.current) {
-      closeTextEdit();
+      if (!keepOpen) closeTextEdit();
       return true;
     }
     try { handle.setShapeText(current.pageId, current.shapeId, text); }
     catch (value) { textRefusedRef.current = true; reportError(value); return false; }
-    closeTextEdit();
+    if (keepOpen) committedTextRef.current = text;
+    else closeTextEdit();
     refresh(undefined, true);
     return true;
   }, [closeTextEdit, refresh, reportError]);
@@ -282,7 +287,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
         handle = openDiagram(file, { clientId: sessionClientId, fonts: openingFonts, initialUpdate }); registeredFontsRef.current = openingFonts; installFonts(loadedFonts, browserFontsRef.current); handleRef.current = handle; activeCollaboration?.onReplica?.(handle); attachedCollaborationRef.current = activeCollaboration;
         stopUpdates = handle.onUpdate(() => refresh(undefined, true));
         stopResync = handle.onResync(() => refresh(undefined, true));
-        refresh(0); setLoading(false); onReadyRef.current?.({ handle, refresh: () => refresh(undefined, false) });
+        refresh(0); setLoading(false); onReadyRef.current?.({ handle, refresh: () => refresh(undefined, false), save: () => { if (!commitTextEdit(true)) throw new Error('The current text edit could not be saved.'); return handle!.save(); } });
       } catch (value) { setLoading(false); reportError(value); }
     }, (value: unknown) => { if (!disposed) { setLoading(false); reportError(value); } });
     return () => {
@@ -1621,7 +1626,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
       live.scrollTop = target.top;
     });
   }, []);
-  const download = useCallback((bytes: Uint8Array) => { const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer; const url = URL.createObjectURL(new Blob([buffer], { type: 'application/vnd.visio' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'diagram.vsdx'; anchor.click(); URL.revokeObjectURL(url); setDirty(false); }, []);
+  const download = useCallback((bytes: Uint8Array) => { if (onSave) { onSave(bytes); return; } const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer; const url = URL.createObjectURL(new Blob([buffer], { type: 'application/vnd.visio' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = fileName ?? 'diagram.vsdx'; anchor.click(); URL.revokeObjectURL(url); setDirty(false); }, [onSave, fileName]);
   const surfaceExtent = model.frame ? surfaceSize(model.frame.width, model.frame.height, zoom) : null;
   const pageCssWidth = model.frame ? model.frame.width * zoom : 0;
   const pageCssHeight = model.frame ? model.frame.height * zoom : 0;
@@ -1629,7 +1634,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
   useEffect(syncRulerScroll, [syncRulerScroll, model.frame, showRulers]);
   const fidelity = diagnostics.filter((diagnostic) => diagnostic.category === 'fidelity');
   return <div ref={editorRootRef} className={className} style={styles.root} aria-label={t('editor.appLabel')} onKeyDown={onEditorKeyDown}>
-    <header style={styles.titleBar}><strong>{t('ribbon.documentName')}</strong><span style={{ color: dirty ? '#a16207' : '#526273' }}>{dirty ? t('ribbon.dirty') : t('ribbon.saved')}</span></header>
+    <header style={styles.titleBar}><strong>{fileName ?? t('ribbon.documentName')}</strong><span style={{ color: (isDirty ?? dirty) ? '#a16207' : '#526273' }}>{(isDirty ?? dirty) ? t('ribbon.dirty') : t('ribbon.saved')}</span></header>
     <RibbonCommandsProvider handle={handleRef.current} snapshot={model.snapshot} pageId={model.snapshot?.pages[model.pageIndex]?.id} selection={selection} frame={model.frame} clipboard={clipboard} onClipboardChange={setClipboard} onSelectShape={(next) => setSelection([next])} pageBreaks={pageBreakToggle} probes={writeProbes} onMutation={() => refresh(undefined, true)} onError={reportError} onDownload={download}>
     <RibbonCommandsBridge target={commandsRef} />
     <Ribbon t={t} hasSelection={selection.length > 0} connector={{ active: connectorMode, disabled: !model.frame, onToggle: toggleConnector }} view={{ grid: showGrid, snap: snapEnabled, rulers: showRulers }} onToggleView={toggleView} />
@@ -1667,7 +1672,7 @@ export function VsdxEditor({ file, fonts, clientId, collaboration, i18n, classNa
               <textarea
                 ref={editBoxRef}
                 value={draft}
-                onChange={(event) => setDraft(event.target.value)}
+                onChange={(event) => { draftRef.current = event.target.value; setDraft(event.target.value); onChangeRef.current?.(); }}
                 onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); if (textRefusedRef.current) { closeTextEdit(); mainCanvasRef.current?.focus(); return; } if (commitTextEdit()) mainCanvasRef.current?.focus(); return; } if (isOwnedBrowserShortcut(event)) event.preventDefault(); event.stopPropagation(); }}
                 aria-label={t('shapes.editingText', { name: editing.shapeId })}
                 rows={1}

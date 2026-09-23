@@ -56,6 +56,16 @@ import type {
 import type { Translations } from '@betteroffice/xlsx-i18n';
 import { LocaleProvider, useTranslation } from './i18n';
 import { EditorToolbar } from './components/EditorToolbar';
+import { MenuSearch, type MenuCommand } from './components/MenuSearch';
+import { SheetTabs, type SheetAction } from './components/SheetTabs';
+import {
+  SheetHeaders,
+  HEADER_WIDTH,
+  HEADER_HEIGHT,
+  pixelsToTrackSize,
+  type TrackAxis,
+  type TrackSize,
+} from './components/SheetHeaders';
 import type {
   FormattingAction,
   MergeAction,
@@ -108,6 +118,14 @@ export interface XlsxEditorProps {
   onSave?: (bytes: Uint8Array) => void;
   /** Called after a user edit changes the workbook. */
   onChange?: () => void;
+  /** Receive load and edit failures in the host application. */
+  onError?: (error: Error) => void;
+  /** Host clipboard adapter for native webviews. */
+  clipboard?: { readText: () => Promise<string>; writeText: (text: string) => Promise<void> };
+  /** Host print action. */
+  onPrint?: () => void;
+  /** Save a rendered viewport through the host application. */
+  onExportPng?: (bytes: Uint8Array, name: string) => void | Promise<void>;
   /** Open a network-ready Yrs replica and repaint when peer updates arrive. */
   collaboration?: XlsxEditorCollaborationOptions;
   i18n?: Translations;
@@ -380,6 +398,10 @@ function XlsxEditorContent({
   fileName,
   onSave,
   onChange,
+  onError,
+  clipboard,
+  onPrint,
+  onExportPng,
   collaboration,
   onReady,
   className,
@@ -421,16 +443,22 @@ function XlsxEditorContent({
   onReadyRef.current = onReady;
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
   const readOnlyRef = useRef(readOnly);
   readOnlyRef.current = readOnly;
 
   const [sheetInfo, setSheetInfo] = useState<SheetInfo | null>(null);
+  const [menuSearchOpen, setMenuSearchOpen] = useState(false);
+  const [exportingPng, setExportingPng] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [renderError, setRenderError] = useState<string | null>(null);
   const [frame, setFrame] = useState<DisplayList | null>(null);
   const [selection, setSelection] = useState<Selection | null>(null);
   const [editing, setEditing] = useState<EditState | null>(null);
   const [focusedCell, setFocusedCell] = useState<CellEdit | null>(null);
+  useEffect(() => { if (error) onErrorRef.current?.(new Error(error)); }, [error]);
   const [formulaDraft, setFormulaDraft] = useState<string | null>(null);
   const [toolbarHeight, setToolbarHeight] = useState(DEFAULT_XLSX_TOOLBAR_HEIGHT);
   const [zoom, setZoom] = useState(1);
@@ -1165,7 +1193,7 @@ function XlsxEditorContent({
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [selection, activeSheet, applyResult, readOnly]);
+  }, [selection, activeSheet, applyResult, readOnly, clipboard]);
 
   const copySelection = useCallback(async () => {
     const handle = handleRef.current;
@@ -1178,15 +1206,16 @@ function XlsxEditorContent({
       const tsv = toTsv(
         cells.map((row) => row.map((c) => ({ input: c.input, isFormula: c.isFormula })))
       );
-      await navigator.clipboard.writeText(tsv);
-    } catch {
-      // clipboard denied or read failed — nothing to paste, leave state as-is.
+      await (clipboard ?? navigator.clipboard).writeText(tsv);
+      return true;
+    } catch (error) {
+      onErrorRef.current?.(error instanceof Error ? error : new Error(String(error)));
+      return false;
     }
-  }, [selection, activeSheet]);
+  }, [selection, activeSheet, clipboard]);
 
   const cutSelection = useCallback(async () => {
-    await copySelection();
-    clearCells();
+    if (await copySelection()) clearCells();
   }, [copySelection, clearCells]);
 
   const pasteSelection = useCallback(async () => {
@@ -1194,7 +1223,7 @@ function XlsxEditorContent({
     if (!handle || !selection || readOnly) return;
     let text: string;
     try {
-      text = await navigator.clipboard.readText();
+      text = await (clipboard ?? navigator.clipboard).readText();
     } catch {
       return;
     }
@@ -1218,7 +1247,7 @@ function XlsxEditorContent({
       anchor: { row: r.top, col: r.left },
       focus: { row: r.top + grid.length - 1, col: r.left + width - 1 },
     });
-  }, [selection, activeSheet, applyResult, readOnly]);
+  }, [selection, activeSheet, applyResult, readOnly, clipboard]);
 
   const formatSelection = useCallback(
     (action: FormattingAction) => {
@@ -1379,9 +1408,11 @@ function XlsxEditorContent({
     }
   }, [applyResult, readOnly]);
 
-  const print = useCallback(() => window.print(), []);
+  const print = useCallback(() => onPrint ? onPrint() : window.print(), [onPrint]);
 
-  const searchMenus = useCallback(() => undefined, []);
+  const searchMenus = useCallback(() => {
+    if (settlePendingEditsRef.current()) setMenuSearchOpen(true);
+  }, []);
 
   const mergeSelection = useCallback(
     (action: MergeAction) => {
@@ -1492,12 +1523,12 @@ function XlsxEditorContent({
     }
   }, [onSave, fileName]);
 
-  // render the current scroll window to png via the raster backend and download
-  // it — the same display list the canvas paints, rasterized in the core.
-  const exportPng = useCallback(() => {
+  const exportPng = useCallback(async () => {
     const handle = handleRef.current;
     const scroll = scrollRef.current;
-    if (!handle || !scroll) return;
+    if (!handle || !scroll || exportingPng || !settlePendingEditsRef.current()) return;
+    setExportingPng(true);
+    setExportError(null);
     try {
       const png = handle.renderPng({
         x: scroll.scrollLeft / zoom,
@@ -1505,11 +1536,16 @@ function XlsxEditorContent({
         width: scroll.clientWidth / zoom,
         height: scroll.clientHeight / zoom,
       });
-      downloadBytes(png, pngName(fileName), 'image/png');
+      if (onExportPng) await onExportPng(png, pngName(fileName));
+      else downloadBytes(png, pngName(fileName), 'image/png');
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const failure = e instanceof Error ? e : new Error(String(e));
+      setExportError(failure.message);
+      onErrorRef.current?.(failure);
+    } finally {
+      setExportingPng(false);
     }
-  }, [fileName, zoom]);
+  }, [fileName, zoom, onExportPng, exportingPng]);
 
   // commit the formula bar draft to the focused cell.
   const commitFormula = useCallback(
@@ -1873,6 +1909,37 @@ function XlsxEditorContent({
     ? normalizedSelection.right - normalizedSelection.left + 1
     : 1;
 
+  const getTrackSize = (axis: TrackAxis, index: number): number => {
+    const handle = handleRef.current;
+    if (!handle) return axis === 'row' ? 15 : 8.43;
+    const metrics = handle.cellPosition(
+      activeSheet, axis === 'row' ? index : 0, axis === 'column' ? index : 0
+    );
+    return axis === 'row'
+      ? metrics.rowHeight ?? pixelsToTrackSize(axis, metrics.height) / metrics.rowHeightScale
+      : metrics.columnWidth ?? pixelsToTrackSize(axis, metrics.width);
+  };
+  const getPixelsPerUnit = (axis: TrackAxis, index: number): number => {
+    if (axis === 'column') return 7;
+    const metrics = handleRef.current?.cellPosition(activeSheet, index, 0);
+    return (metrics?.rowHeightScale ?? 1) / 0.75;
+  };
+  const resizeTracks = (sizes: TrackSize[]): boolean => {
+    const handle = handleRef.current;
+    if (!handle || readOnly || !settlePendingEditsRef.current()) return false;
+    try {
+      if (sizes.length) {
+        applyResult(handle.applyOps(sizes.map(({ axis, index, value }) => axis === 'row'
+          ? { type: 'setRowHeight', sheet: activeSheet, row: index, height: value }
+          : { type: 'setColWidth', sheet: activeSheet, col: index, width: value })));
+      }
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return false;
+    }
+  };
+
   // switch sheets: retarget the core, reset scroll + selection, reread info.
   const switchSheet = (index: number) => {
     const handle = handleRef.current;
@@ -1894,6 +1961,65 @@ function XlsxEditorContent({
     }
   };
 
+  const manageSheet = (action: SheetAction): string | null => {
+    const handle = handleRef.current;
+    if (!handle || readOnly) return 'The workbook is not available for editing.';
+    if (!settlePendingEditsRef.current()) return 'Finish the current cell edit first.';
+    try {
+      const info = handle.sheetInfo();
+      const index = action.type === 'add' ? info.sheetNames.length : info.sheetIds.indexOf(action.id);
+      if (index < 0) return 'This worksheet is no longer in the workbook.';
+      let next = index;
+      let op: unknown;
+      switch (action.type) {
+        case 'add':
+          op = { type: 'addSheet', index, name: action.name };
+          break;
+        case 'rename':
+          if (info.sheetNames[index] === action.name) return null;
+          op = { type: 'renameSheet', sheet: index, name: action.name };
+          break;
+        case 'delete':
+          if (info.sheetNames.length <= 1) return 'Keep at least one worksheet in the workbook.';
+          next = info.activeSheet === index ? Math.min(index, info.sheetNames.length - 2)
+            : info.activeSheet > index ? info.activeSheet - 1 : info.activeSheet;
+          op = { type: 'removeSheet', index };
+          break;
+        case 'move':
+          if (index === action.to) return null;
+          if (action.to < 0 || action.to >= info.sheetNames.length) return 'Choose a position in this workbook.';
+          next = action.to;
+          op = { type: 'moveSheet', from: index, to: action.to };
+          break;
+      }
+      applyResult(handle.applyOps([op]));
+      switchSheet(next);
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  };
+
+  const menuCommands: MenuCommand[] = [
+    { label: t('toolbar.save'), run: save, disabled: !sheetInfo },
+    { label: 'Export visible sheet as PNG', run: () => { void exportPng(); }, disabled: !sheetInfo || !pngExportAvailable || exportingPng },
+    { label: t('toolbar.print'), run: print, disabled: !sheetInfo },
+    { label: t('toolbar.undo'), run: undo, disabled: !historyState.canUndo },
+    { label: t('toolbar.redo'), run: redo, disabled: !historyState.canRedo },
+    ...(['bold', 'italic', 'strikethrough', 'currency', 'percent', 'increaseDecimal', 'decreaseDecimal', 'paintFormat'] as const).map((action) => ({
+      label: t(`toolbar.${action}`), run: () => formatSelection(action), disabled: !selection,
+    })),
+    ...(['left', 'center', 'right'] as const).map((value) => ({
+      label: `Align ${value}`, run: () => formatSelection({ type: 'horizontalAlignment', value }), disabled: !selection,
+    })),
+    ...(['overflow', 'wrap', 'clip'] as const).map((value) => ({
+      label: t(`toolbar.wrapping.${value}`), run: () => formatSelection({ type: 'textWrapping', value }), disabled: !selection,
+    })),
+    ...([0.5, 0.75, 1, 1.25, 1.5, 2]).map((value) => ({
+      label: `Zoom ${value * 100}%`, run: () => setZoom(value),
+    })),
+  ];
+
   return (
     <div
       className={className}
@@ -1911,6 +2037,13 @@ function XlsxEditorContent({
         fontFamily: 'ui-sans-serif, system-ui, sans-serif',
       }}
     >
+      {menuSearchOpen && !readOnly && <MenuSearch commands={menuCommands} onClose={() => {
+        setMenuSearchOpen(false);
+        toolbarRef.current?.querySelector<HTMLButtonElement>('[data-testid="xlsx-search-menus"]')?.focus();
+      }} />}
+      {exportError && <div role="alert" style={{ padding: 8, color: '#b00020' }}>
+        {exportError} <button type="button" onClick={() => setExportError(null)}>Dismiss</button>
+      </div>}
       {!readOnly && (
         <div ref={toolbarRef} data-testid="xlsx-toolbar" style={xlsxToolbarStyles.shell}>
         <EditorToolbar
@@ -1957,10 +2090,10 @@ function XlsxEditorContent({
               <ToolbarButton
                 testId="xlsx-export-png"
                 onClick={exportPng}
-                disabled={!sheetInfo || !pngExportAvailable}
-                title={t('toolbar.exportPng')}
+                disabled={!sheetInfo || !pngExportAvailable || exportingPng}
+                title="Export visible sheet as PNG"
               >
-                <ToolbarIcon name="image" size={18} />
+                <ToolbarIcon name="image" size={18} /><span style={{ fontSize: 12 }}>PNG</span>
               </ToolbarButton>
             </ToolbarGroup>
             <div
@@ -1985,7 +2118,7 @@ function XlsxEditorContent({
                 placeholder={t('toolbar.formulaPlaceholder')}
                 aria-label={t('toolbar.formulaPlaceholder')}
                 disabled={!sheetInfo}
-                onChange={(e) => setFormulaDraft(e.target.value)}
+                onChange={(e) => { setFormulaDraft(e.target.value); onChangeRef.current?.(); }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
                     commitFormula(e.shiftKey ? 'up' : 'down');
@@ -2046,6 +2179,7 @@ function XlsxEditorContent({
         />
       )}
 
+      <div style={{ position: 'relative', flex: 1, minHeight: 0, minWidth: 0 }}>
       <div
         ref={scrollRef}
         data-testid="xlsx-scroll"
@@ -2056,7 +2190,7 @@ function XlsxEditorContent({
         onMouseLeave={onMouseLeave}
         onClick={onClick}
         onDoubleClick={onDoubleClick}
-        style={{ position: 'relative', flex: 1, overflow: 'auto', minHeight: 0, outline: 'none' }}
+        style={{ position: 'absolute', left: HEADER_WIDTH, top: HEADER_HEIGHT, right: 0, bottom: 0, overflow: 'auto', outline: 'none' }}
       >
         <div
           style={{
@@ -2149,9 +2283,10 @@ function XlsxEditorContent({
                 ref={editorInputRef}
                 data-testid="xlsx-cell-editor"
                 value={editing.value}
-                onChange={(e) =>
-                  setEditing((prev) => (prev ? { ...prev, value: e.target.value } : prev))
-                }
+                onChange={(e) => {
+                  setEditing((prev) => (prev ? { ...prev, value: e.target.value } : prev));
+                  onChangeRef.current?.();
+                }}
                 onKeyDown={(e) => {
                   e.stopPropagation();
                   if (e.key === 'Enter') {
@@ -2190,6 +2325,24 @@ function XlsxEditorContent({
             )}
           </div>
         </div>
+      </div>
+
+      {sheetInfo && grid && frame && (
+        <SheetHeaders
+          key={sheetInfo.sheetIds[activeSheet]}
+          grid={grid}
+          zoom={zoom}
+          width={frame.width * zoom}
+          height={frame.height * zoom}
+          selection={selection}
+          readOnly={readOnly}
+          getSize={getTrackSize}
+          getPixelsPerUnit={getPixelsPerUnit}
+          onBegin={() => settlePendingEditsRef.current()}
+          onResize={resizeTracks}
+          onFocusGrid={focusContainer}
+        />
+      )}
       </div>
 
       {a11yGrid && (
@@ -2258,41 +2411,13 @@ function XlsxEditorContent({
       )}
 
       {sheetInfo && sheetInfo.sheetNames.length > 0 && (
-        <div
-          data-testid="xlsx-sheet-tabs"
-          role="tablist"
-          aria-label={t('editor.sheetTabsLabel')}
-          style={{
-            display: 'flex',
-            gap: 2,
-            padding: '4px 6px',
-            borderTop: '1px solid #e0e0e0',
-            background: '#fafafa',
-            overflowX: 'auto',
-          }}
-        >
-          {sheetInfo.sheetNames.map((name, i) => {
-            const active = i === sheetInfo.activeSheet;
-            return (
-              <button
-                key={i}
-                role="tab"
-                aria-selected={active}
-                onClick={() => switchSheet(i)}
-                style={{
-                  border: 'none',
-                  padding: '4px 12px',
-                  cursor: 'pointer',
-                  borderBottom: active ? `2px solid ${BRAND}` : '2px solid transparent',
-                  fontWeight: active ? 600 : 400,
-                  background: active ? '#ffffff' : 'transparent',
-                }}
-              >
-                {name}
-              </button>
-            );
-          })}
-        </div>
+        <SheetTabs
+          sheets={sheetInfo.sheetNames.map((name, index) => ({ name, id: sheetInfo.sheetIds[index]! }))}
+          active={sheetInfo.activeSheet}
+          readOnly={readOnly}
+          onSelect={switchSheet}
+          onAction={manageSheet}
+        />
       )}
     </div>
   );

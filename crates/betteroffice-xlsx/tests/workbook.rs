@@ -7320,3 +7320,160 @@ fn profiled_mutations_time_each_stage_once() {
         Some("A2*2")
     );
 }
+
+#[test]
+fn move_sheet_keeps_identity_formulas_scoped_names_and_history() {
+    let mut workbook = Workbook::open(&defined_names_fixture()).unwrap();
+    let calc = CalculationOptions::default;
+    workbook
+        .edit_cell(SheetId(0), cell("A1"), "17", calc())
+        .unwrap();
+    workbook
+        .edit_cell(SheetId(2), cell("A1"), "=Data!A1*2", calc())
+        .unwrap();
+    workbook.set_active_sheet(SheetId(0)).unwrap();
+    let before = workbook.model().clone();
+    workbook
+        .apply_ops(vec![Op::MoveSheet { from: 0, to: 2 }], calc())
+        .unwrap();
+    let info = workbook.sheet_info().unwrap();
+    assert_eq!(info.sheet_names, ["Middle", "Tail", "Data"]);
+    assert_eq!(workbook.active_sheet(), SheetId(2));
+    assert_eq!(
+        workbook
+            .model()
+            .defined_names
+            .iter()
+            .find(|name| name.name == "LocalData")
+            .unwrap()
+            .local_sheet,
+        Some(SheetId(2))
+    );
+    let moved = workbook.model().clone();
+    let reopened = Workbook::open(&workbook.save().unwrap()).unwrap();
+    assert_eq!(
+        reopened.sheet_info().unwrap().sheet_names,
+        ["Middle", "Tail", "Data"]
+    );
+    assert_eq!(
+        reopened
+            .sheet(SheetId(1))
+            .unwrap()
+            .cell(cell("A1"))
+            .unwrap()
+            .value,
+        CellValue::Number { value: 34.0 }
+    );
+    workbook.undo(calc()).unwrap();
+    assert_eq!(workbook.model(), &before);
+    workbook.redo(calc()).unwrap();
+    assert_eq!(workbook.model(), &moved);
+    workbook
+        .edit_cell(SheetId(2), cell("A1"), "21", calc())
+        .unwrap();
+    assert_eq!(
+        workbook
+            .sheet(SheetId(1))
+            .unwrap()
+            .cell(cell("A1"))
+            .unwrap()
+            .value,
+        CellValue::Number { value: 42.0 }
+    );
+}
+
+#[test]
+fn move_sheet_preserves_imported_parts_and_rich_strings() {
+    let original = preservation_fixture();
+    let mut workbook = Workbook::open(&original).unwrap();
+    let calc = CalculationOptions::default;
+    workbook
+        .apply_ops(
+            vec![Op::AddSheet {
+                index: 1,
+                name: "Other".into(),
+            }],
+            calc(),
+        )
+        .unwrap();
+    let before = package_map(&workbook.save().unwrap());
+    workbook
+        .apply_ops(vec![Op::MoveSheet { from: 0, to: 1 }], calc())
+        .unwrap();
+    let saved = workbook.save().unwrap();
+    let after = package_map(&saved);
+    for path in [
+        "xl/worksheets/sheet1.xml",
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "xl/sharedStrings.xml",
+        "xl/tables/table1.xml",
+        "xl/comments1.xml",
+        "xl/drawings/drawing1.xml",
+        "customXml/item1.xml",
+    ] {
+        assert_eq!(before[path], after[path], "{path}");
+    }
+    let reopened = Workbook::open(&saved).unwrap();
+    assert_eq!(
+        reopened.sheet_info().unwrap().sheet_names,
+        ["Other", "Data"]
+    );
+    assert_eq!(
+        reopened
+            .sheet(SheetId(1))
+            .unwrap()
+            .cell(cell("A1"))
+            .unwrap()
+            .value,
+        CellValue::Text {
+            value: "original".into()
+        }
+    );
+    workbook.undo(calc()).unwrap();
+    assert_eq!(
+        workbook.sheet_info().unwrap().sheet_names,
+        ["Data", "Other"]
+    );
+    workbook.redo(calc()).unwrap();
+    assert_eq!(
+        package_map(&workbook.save().unwrap())["xl/worksheets/sheet1.xml"],
+        before["xl/worksheets/sheet1.xml"]
+    );
+}
+
+#[test]
+fn move_sheet_batches_use_the_new_order_and_reject_invalid_indices_atomically() {
+    let mut workbook = Workbook::open(&defined_names_fixture()).unwrap();
+    let calc = CalculationOptions::default;
+    let before = workbook.model().clone();
+    assert!(
+        workbook
+            .apply_ops(vec![Op::MoveSheet { from: 0, to: 3 }], calc())
+            .is_err()
+    );
+    assert_eq!(workbook.model(), &before);
+    assert!(!workbook.can_undo());
+    workbook
+        .apply_ops(
+            vec![
+                Op::MoveSheet { from: 2, to: 0 },
+                Op::RenameSheet {
+                    sheet: SheetId(0),
+                    name: "Moved".into(),
+                },
+            ],
+            calc(),
+        )
+        .unwrap();
+    assert_eq!(
+        workbook.sheet_info().unwrap().sheet_names,
+        ["Moved", "Data", "Middle"]
+    );
+    workbook.undo(calc()).unwrap();
+    assert_eq!(workbook.model(), &before);
+    let mut collaborative = Workbook::open_collaborative(&defined_names_fixture(), 21).unwrap();
+    assert!(matches!(
+        collaborative.apply_ops(vec![Op::MoveSheet { from: 0, to: 1 }], calc()),
+        Err(Error::CollaborativeStructureOperation)
+    ));
+}

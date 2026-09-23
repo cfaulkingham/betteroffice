@@ -120,6 +120,15 @@ impl PreservedSheetState {
         self.axes.insert(index, None);
     }
 
+    fn move_sheet(&mut self, from: usize, to: usize) {
+        let origin = self.origins.remove(from);
+        self.origins.insert(to, origin);
+        let strings = self.shared_string_cells.remove(from);
+        self.shared_string_cells.insert(to, strings);
+        let axes = self.axes.remove(from);
+        self.axes.insert(to, axes);
+    }
+
     fn remove(&mut self, index: usize) {
         if index < self.origins.len() {
             self.origins.remove(index);
@@ -2315,6 +2324,7 @@ impl Workbook {
         for op in ops {
             match op {
                 Op::AddSheet { .. }
+                | Op::MoveSheet { .. }
                 | Op::RemoveSheet { .. }
                 | Op::RenameSheet { .. }
                 | Op::RestoreSheet { .. } => {
@@ -2451,6 +2461,7 @@ impl Workbook {
         for op in ops {
             match *op {
                 Op::AddSheet { index, .. } => self.preserved.insert(index),
+                Op::MoveSheet { from, to } => self.preserved.move_sheet(from, to),
                 Op::RemoveSheet { index } => self.preserved.remove(index),
                 Op::InsertRows { sheet, .. }
                 | Op::DeleteRows { sheet, .. }
@@ -2985,6 +2996,7 @@ fn worksheet_edit_target(op: &Op) -> Option<SheetId> {
         | Op::SetRangeNumberFormat { sheet, .. }
         | Op::ApplyRangeFormat { sheet, .. } => Some(*sheet),
         Op::AddSheet { .. }
+        | Op::MoveSheet { .. }
         | Op::RemoveSheet { .. }
         | Op::RenameSheet { .. }
         | Op::RestoreSheet { .. }
@@ -3107,6 +3119,13 @@ fn validate_op(model: &WorkbookModel, op: &Op) -> Result<()> {
                 return Err(Error::InvalidOperation(format!(
                     "sheet index {index} out of range"
                 )));
+            }
+        }
+        Op::MoveSheet { from, to } => {
+            if *from >= model.sheets.len() || *to >= model.sheets.len() {
+                return Err(Error::InvalidOperation(
+                    "sheet move index out of range".to_string(),
+                ));
             }
         }
         Op::RemoveSheet { index } => {
@@ -3913,6 +3932,10 @@ fn validate_axis(axis: &str, at: u32, count: u32, limit: u32) -> Result<()> {
 fn rename_sheet_view(names: &mut Vec<String>, op: &Op) {
     match op {
         Op::AddSheet { index, name } => names.insert((*index).min(names.len()), name.clone()),
+        Op::MoveSheet { from, to } if *from < names.len() && *to < names.len() => {
+            let name = names.remove(*from);
+            names.insert(*to, name);
+        }
         Op::RemoveSheet { index } if *index < names.len() => {
             names.remove(*index);
         }
@@ -3936,6 +3959,7 @@ fn invalidates_proposals(op: &Op) -> bool {
             | Op::RestoreColStyles { .. }
             | Op::SetCharts { .. }
             | Op::AddSheet { .. }
+            | Op::MoveSheet { .. }
             | Op::RemoveSheet { .. }
             | Op::RenameSheet { .. }
             | Op::RestoreSheet { .. }
