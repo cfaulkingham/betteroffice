@@ -193,6 +193,7 @@ pub(crate) struct PreviewUnits {
     comments: Rc<Vec<CommentInterval>>,
     /// The lowering numbered SEQ fields across the whole body.
     sequences: bool,
+    untracked_state: bool,
     refresh: Option<Refresh>,
     #[cfg(test)]
     pub(crate) work: RecordingWork,
@@ -200,7 +201,7 @@ pub(crate) struct PreviewUnits {
 
 #[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
-enum AnySnapshot {
+pub(super) enum AnySnapshot {
     Null,
     Undefined,
     Bool(bool),
@@ -302,6 +303,7 @@ impl PreviewUnits {
                     record.seed.as_deref().map(BoundaryState::exact_snapshot),
                     record.after.exact_snapshot(),
                     record.capture_raw,
+                    record.local_stateful,
                 )
             })
             .collect::<Vec<_>>();
@@ -325,11 +327,13 @@ impl PreviewUnits {
 }
 
 #[cfg(test)]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RecordingWork {
     pub(crate) chunks: usize,
     pub(crate) copied_chunks: usize,
     pub(crate) reused_units: usize,
+    pub(crate) refresh_records: usize,
+    pub(crate) position_steps: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -337,6 +341,53 @@ pub(crate) struct TextEdit {
     pub(crate) range: Range<u32>,
     pub(crate) inserted: u32,
     pub(crate) epochs: (u64, u64),
+}
+
+#[derive(Debug)]
+pub(crate) struct ParagraphEdit {
+    pub(crate) raw: Range<u32>,
+    pub(crate) pm: Range<u64>,
+    pub(crate) delta: i64,
+}
+
+pub(crate) fn shift_paragraph_edits(
+    units: &mut PreviewUnits,
+    edits: &[ParagraphEdit],
+) -> Option<()> {
+    for edit in edits {
+        for record in &mut units.records {
+            #[cfg(test)]
+            crate::engine::TYPING_EXTRA_WORK.with(|work| {
+                let mut counts = work.get();
+                counts.preview_position_steps += 1;
+                work.set(counts);
+            });
+            if record.pm.end <= edit.pm.start {
+                continue;
+            }
+            if record.pm.start < edit.pm.end {
+                return None;
+            }
+            let shift_raw = |value: u32| u32::try_from(i64::from(value) + edit.delta).ok();
+            let shift_pm = |value: u64| value.checked_add_signed(edit.delta);
+            let shift_boundary = |boundary: &mut BoundaryState| -> Option<()> {
+                let position = &mut boundary.position;
+                if !position.safe || position.story_index < edit.raw.end {
+                    return None;
+                }
+                position.story_index = shift_raw(position.story_index)?;
+                position.paragraph_start = shift_raw(position.paragraph_start)?;
+                position.paragraph_pm_start = shift_pm(position.paragraph_pm_start)?;
+                position.pm_cursor = shift_pm(position.pm_cursor)?;
+                Some(())
+            };
+            shift_boundary(Rc::make_mut(record.seed.as_mut()?))?;
+            shift_boundary(Rc::make_mut(&mut record.after))?;
+            record.pm = shift_pm(record.pm.start)?..shift_pm(record.pm.end)?;
+            record.capture_raw = Some(shift_raw(record.capture_raw?)?);
+        }
+    }
+    Some(())
 }
 
 #[derive(Clone, Debug)]
@@ -349,7 +400,11 @@ struct Refresh {
     valid: bool,
 }
 
-pub(crate) fn refresh(units: &Rc<PreviewUnits>, edit: &TextEdit) -> Option<PreviewUnits> {
+pub(crate) fn refresh(
+    units: &Rc<PreviewUnits>,
+    edit: &TextEdit,
+    paragraph_edits: &[ParagraphEdit],
+) -> Option<PreviewUnits> {
     let shift = |raw: u32| {
         if raw <= edit.range.start {
             raw
@@ -360,15 +415,40 @@ pub(crate) fn refresh(units: &Rc<PreviewUnits>, edit: &TextEdit) -> Option<Previ
     let mut ranges = Vec::new();
     let mut edited = Vec::new();
     let mut captures = Vec::new();
+    #[cfg(test)]
+    let mut work = RecordingWork::default();
     for record in &units.records {
-        let start = record.seed.as_ref()?.position.story_index;
-        let end = record.after.position.story_index;
+        #[cfg(test)]
+        {
+            work.refresh_records += 1;
+        }
+        let mut start = record.seed.as_ref()?.position.story_index;
+        let mut end = record.after.position.story_index;
+        let mut capture = record.capture_raw?;
+        let mut changed = false;
+        for paragraph in paragraph_edits {
+            #[cfg(test)]
+            {
+                work.position_steps += 1;
+            }
+            changed |= start < paragraph.raw.end && end > paragraph.raw.start;
+            let shift_paragraph = |value: u32| {
+                if value > paragraph.raw.start {
+                    u32::try_from(i64::from(value) + paragraph.delta).ok()
+                } else {
+                    Some(value)
+                }
+            };
+            start = shift_paragraph(start)?;
+            end = shift_paragraph(end)?;
+            capture = shift_paragraph(capture)?;
+        }
         if !record.after.position.safe {
             return None;
         }
         ranges.push(shift(start)..shift(end));
-        edited.push(edit.range.start < end && edit.range.end >= start);
-        captures.push(shift(record.capture_raw?));
+        edited.push(changed || edit.range.start < end && edit.range.end >= start);
+        captures.push(shift(capture));
     }
     Some(PreviewUnits {
         records: Vec::with_capacity(units.records.len()),
@@ -380,6 +460,9 @@ pub(crate) fn refresh(units: &Rc<PreviewUnits>, edit: &TextEdit) -> Option<Previ
             cursor: 0,
             valid: true,
         }),
+        untracked_state: units.untracked_state,
+        #[cfg(test)]
+        work,
         ..PreviewUnits::default()
     })
 }
@@ -397,6 +480,7 @@ struct UnitRecord {
     seed: Option<Rc<BoundaryState>>,
     after: Rc<BoundaryState>,
     capture_raw: Option<u32>,
+    local_stateful: Option<bool>,
 }
 
 struct Window {
@@ -411,18 +495,22 @@ struct Window {
     mutated: bool,
     reused: Option<usize>,
     capture_raw: Option<u32>,
+    local_stateful: bool,
 }
 
 pub(super) struct UnitRecorder {
     units: PreviewUnits,
     window: Option<Window>,
+    certify_local: bool,
 }
 
 impl UnitRecorder {
-    pub(super) fn new(units: PreviewUnits) -> Self {
+    pub(super) fn new(mut units: PreviewUnits, certify_local: bool) -> Self {
+        units.untracked_state |= !certify_local;
         Self {
             units,
             window: None,
+            certify_local,
         }
     }
 
@@ -447,6 +535,10 @@ impl UnitRecorder {
         }
         raw >= range.start
             && (refresh.edited[refresh.cursor]
+                || self.certify_local
+                    && refresh.previous.records[refresh.cursor]
+                        .local_stateful
+                        .is_none()
                 || raw == range.start
                 || raw == refresh.captures[refresh.cursor]
                 || raw == range.end)
@@ -519,6 +611,7 @@ impl UnitRecorder {
                 mutated: is_break,
                 reused,
                 capture_raw: None,
+                local_stateful: false,
             });
             let expected = reused.map(|index| {
                 Rc::clone(&self.units.refresh.as_ref().unwrap().previous.records[index].ids)
@@ -531,6 +624,20 @@ impl UnitRecorder {
             });
         }
         let window = self.window.as_mut().unwrap();
+        if self.certify_local {
+            #[cfg(test)]
+            crate::engine::TYPING_EXTRA_WORK.with(|work| {
+                let mut counts = work.get();
+                counts.preview_certifications += 1;
+                work.set(counts);
+            });
+            window.local_stateful |= local::preview_touches_state(diff, txn);
+            for key in [INS, DEL] {
+                if let Some(value) = attribute(diff.attributes.as_deref(), key) {
+                    record_decision(value);
+                }
+            }
+        }
         if !window.mutated && (pilcrow || standalone) {
             let has_reads = READS.with(|reads| {
                 reads
@@ -591,7 +698,11 @@ impl UnitRecorder {
         let previous = window
             .reused
             .map(|index| &self.units.refresh.as_ref().unwrap().previous.records[index]);
+        if self.certify_local {
+            window.local_stateful |= !window.position.safe || !position.safe || reads.hidden_fields;
+        }
         if reads.ids.is_empty() && previous.is_none() {
+            self.units.untracked_state |= window.local_stateful;
             return;
         }
         if !position.safe || reads.hidden_fields {
@@ -622,6 +733,10 @@ impl UnitRecorder {
             pm,
             seed: window.seed,
             capture_raw: window.capture_raw,
+            local_stateful: self.certify_local.then(|| {
+                window.local_stateful
+                    || previous.is_some_and(|record| record.local_stateful == Some(true))
+            }),
             after: Rc::new(if let Some(previous) = previous {
                 previous
                     .after
@@ -732,7 +847,11 @@ pub(crate) fn lower_refreshed(
         .as_ref()
         .is_some_and(|units| units.refresh.as_ref().is_some_and(|refresh| !refresh.valid))
     {
-        *local = local::LocalLowering::new(!local.blocked);
+        *local = if local.legacy {
+            local::LocalLowering::fallback(local.enabled)
+        } else {
+            local::LocalLowering::new(local.enabled)
+        };
         return lower_recorded(doc, story, env, local, true);
     }
     if let Some(units) = preview.as_mut() {
@@ -748,6 +867,7 @@ pub(crate) struct Replay {
     map: LoweringMap,
     revealable: Vec<LayoutBlock>,
     ids: BTreeSet<String>,
+    local: local::LocalLowering,
 }
 
 fn replace_positions<T>(
@@ -761,11 +881,20 @@ fn replace_positions<T>(
     entries.sort_by_key(key);
 }
 
-pub(crate) fn targets(units: &PreviewUnits, changed: &BTreeSet<String>) -> bool {
-    units
-        .records
-        .iter()
-        .any(|record| !record.ids.is_disjoint(changed))
+pub(crate) fn targets(
+    units: &PreviewUnits,
+    changed: &BTreeSet<String>,
+    local: &local::LocalLowering,
+) -> bool {
+    local.enabled && (units.untracked_state || units.records.is_empty())
+        || units
+            .records
+            .iter()
+            .any(|record| !record.ids.is_disjoint(changed))
+}
+
+pub(crate) fn replayable(units: &PreviewUnits, local: &local::LocalLowering) -> bool {
+    !local.enabled || !units.untracked_state && !units.records.is_empty()
 }
 
 pub(crate) fn replay(
@@ -774,7 +903,12 @@ pub(crate) fn replay(
     units: &PreviewUnits,
     changed: &BTreeSet<String>,
     current: &[Rc<LayoutBlock>],
+    current_map: &LoweringMap,
+    local: &local::LocalLowering,
 ) -> Option<Vec<Replay>> {
+    if !replayable(units, local) {
+        return None;
+    }
     let txn = doc.yrs_doc().transact();
     let story = story_ref(&txn, "body").ok()?;
     let with_media;
@@ -792,13 +926,22 @@ pub(crate) fn replay(
         if record.ids.is_disjoint(changed) {
             continue;
         }
+        if local.enabled
+            && (record.local_stateful != Some(false)
+                || record
+                    .chunks
+                    .iter()
+                    .any(|chunk| local::preview_touches_state(chunk, &txn)))
+        {
+            return None;
+        }
         let seed = record.seed.as_ref()?;
         let mut list_state = seed.list_state.clone();
         let mut opaque_sequences = seed.opaque_sequences.clone();
         let mut output = LoweringOutput::at(seed.position);
         let mut revealed = Some(Vec::new());
         let mut active_stories = BTreeSet::from(["body".to_owned()]);
-        let mut local = local::LocalLowering::new(false);
+        let mut replay_local = local::LocalLowering::new(local.enabled && !local.blocked);
         let _reads = ReadGuard::new();
         let (replacement, position, hidden_field_blocks) = walk_story_chunks(
             &txn,
@@ -810,7 +953,7 @@ pub(crate) fn replay(
             &mut output,
             &mut opaque_sequences,
             &mut revealed,
-            &mut local,
+            &mut replay_local,
             &story,
             &units.comments,
             &record.chunks,
@@ -827,7 +970,9 @@ pub(crate) fn replay(
         let reads = READS.with(|reads| reads.borrow_mut().take().unwrap());
         if position != record.after.position
             || after != *record.after.context
+            || current_map.stories.get(record.stories.clone())? != output.stories.as_slice()
             || reads.hidden_fields
+            || !local.replay_preserves_state(&replay_local)
             || output
                 .spans
                 .iter()
@@ -854,6 +999,7 @@ pub(crate) fn replay(
             map: output.map,
             revealable: revealed.unwrap_or_default(),
             ids: reads.ids,
+            local: replay_local,
         });
     }
     Some(replays)
@@ -865,6 +1011,7 @@ pub(crate) fn splice(
     map: &mut LoweringMap,
     revealable: &mut Vec<LayoutBlock>,
     units: &mut PreviewUnits,
+    local: &mut local::LocalLowering,
 ) {
     let mut block_shift = 0_isize;
     let mut revealable_shift = 0_isize;
@@ -887,6 +1034,7 @@ pub(crate) fn splice(
         revealable_shift += replay.revealable.len() as isize - record.revealable.len() as isize;
         let block_end = record.blocks.start + replay.blocks.len();
         let revealable_end = record.revealable.start + replay.revealable.len();
+        local.replace_seeds(&record.pm, replay.local);
         blocks.splice(
             record.blocks.clone(),
             replay.blocks.into_iter().map(Rc::new),
@@ -914,5 +1062,158 @@ pub(crate) fn splice(
         record.blocks.end = block_end;
         record.revealable.end = revealable_end;
         record.ids = Rc::new(replay.ids);
+    }
+    local.refresh_seeds(blocks, map);
+}
+
+#[cfg(test)]
+#[test]
+fn local_certification_refresh_matches_fresh_recording() {
+    for previous_enabled in [false, true] {
+        for (enabled, legacy) in [(false, false), (true, false), (true, true)] {
+            let doc = EditingDoc::new(75272);
+            crate::seed_from_docx(&doc, &crate::engine::preview_fixture::nested()).unwrap();
+            let env = RenderEnv::default();
+            let (blocks, map, _, previous) = lower_recorded(
+                &doc,
+                "body",
+                &env,
+                &mut local::LocalLowering::new(previous_enabled),
+                true,
+            )
+            .unwrap();
+            let previous = Rc::new(previous.unwrap());
+            if !previous_enabled {
+                for record in &previous.records {
+                    assert_eq!(record.local_stateful, None);
+                }
+                let changed = BTreeSet::from(["unused".to_owned()]);
+                assert!(!targets(
+                    &previous,
+                    &changed,
+                    &local::LocalLowering::new(false)
+                ));
+                let local = local::LocalLowering::new(true);
+                assert!(targets(&previous, &changed, &local));
+                let current: Vec<_> = blocks.into_iter().map(Rc::new).collect();
+                assert!(replay(&doc, &env, &previous, &changed, &current, &map, &local).is_none());
+            }
+            let record = previous.records.last().unwrap();
+            let raw = record.seed.as_ref().unwrap().position.story_index + 1;
+            doc.insert_text(
+                &crate::EditCtx::local("", ""),
+                crate::Position::new("body", raw),
+                "x",
+                crate::FormatPolicy::Inherit,
+            )
+            .unwrap();
+            let units = refresh(
+                &previous,
+                &TextEdit {
+                    range: raw..raw,
+                    inserted: 1,
+                    epochs: (0, 1),
+                },
+                &[],
+            )
+            .unwrap();
+            let lowering = || {
+                if legacy {
+                    local::LocalLowering::fallback(enabled)
+                } else {
+                    local::LocalLowering::new(enabled)
+                }
+            };
+            crate::engine::TYPING_EXTRA_WORK.with(|work| work.set(Default::default()));
+            let (_, _, _, refreshed) =
+                lower_refreshed(&doc, "body", &env, &mut lowering(), units).unwrap();
+            if !enabled || legacy {
+                crate::engine::TYPING_EXTRA_WORK.with(|work| {
+                    assert_eq!(work.get().preview_certifications, 0);
+                });
+            }
+            let (_, _, _, fresh) =
+                lower_recorded(&doc, "body", &env, &mut lowering(), true).unwrap();
+            let (refreshed, fresh) = (refreshed.unwrap(), fresh.unwrap());
+            assert_eq!(refreshed.snapshot(&doc), fresh.snapshot(&doc));
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn paragraph_positions_preserve_intermediate_overflow_and_underflow_refusals() {
+    fn boundary(raw: u32, pm: u64) -> Rc<BoundaryState> {
+        let mut position = WalkPosition::new(0, pm, &LoweringOutput::default());
+        position.story_index = raw;
+        position.paragraph_start = raw;
+        position.paragraph_pm_start = pm;
+        Rc::new(BoundaryState::capture(
+            position,
+            &ListState::default(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        ))
+    }
+
+    for state in 0..5 {
+        let mut units = PreviewUnits {
+            records: vec![UnitRecord {
+                ids: Rc::new(BTreeSet::new()),
+                chunk_range: 0..0,
+                chunks: Rc::new(Vec::new()),
+                blocks: 0..0,
+                revealable: 0..0,
+                stories: 0..0,
+                paragraphs: 0..0,
+                pm: 30..35,
+                seed: Some(boundary(30, 30)),
+                after: boundary(35, 35),
+                capture_raw: Some(33),
+                local_stateful: Some(false),
+            }],
+            ..PreviewUnits::default()
+        };
+        let record = &mut units.records[0];
+        let delta = match state {
+            0 => {
+                Rc::make_mut(record.seed.as_mut().unwrap())
+                    .position
+                    .paragraph_start = 0;
+                -1
+            }
+            1 => {
+                Rc::make_mut(record.seed.as_mut().unwrap())
+                    .position
+                    .pm_cursor = 0;
+                -1
+            }
+            2 => {
+                Rc::make_mut(&mut record.after).position.paragraph_pm_start = u64::MAX;
+                1
+            }
+            3 => {
+                record.capture_raw = Some(u32::MAX);
+                1
+            }
+            _ => {
+                Rc::make_mut(&mut record.after).position.story_index = u32::MAX;
+                1
+            }
+        };
+        let edits = [delta, -delta].map(|delta| ParagraphEdit {
+            raw: 0..4,
+            pm: 0..4,
+            delta,
+        });
+        if state >= 3 {
+            let edit = TextEdit {
+                range: 0..0,
+                inserted: 0,
+                epochs: (0, 1),
+            };
+            assert!(refresh(&Rc::new(units.clone()), &edit, &edits).is_none());
+        }
+        assert_eq!(shift_paragraph_edits(&mut units, &edits), None);
     }
 }
