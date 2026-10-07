@@ -62,6 +62,7 @@ edits), `collaboration`, `i18n`, and `className`.
 
 - Cell editing with formula recalculation of dependents on every edit
 - Editing toolbar: number formats, fonts, colors, borders, alignment, merges
+- Row/column header menus: insert before/after, delete, unhide adjacent zero-size tracks, and set sizes; selection ranges, keyboard navigation, undo/redo, and command search
 - Agent proposals: in-cell tracked-change ghosts plus an accept/reject panel
 - TSV clipboard copy/paste
 - Accessible grid mirroring the painted canvas for screen readers

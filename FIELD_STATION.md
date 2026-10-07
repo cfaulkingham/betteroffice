@@ -4,7 +4,9 @@ This repository maintains the BetterOffice changes used by [Field Station](https
 
 The initial import preserves the Field Station host patch previously based on upstream `80341ac5c4f52c4884b6c9f319414c47410ece88`. This fork also includes upstream's `0ba58e5a726a352b492c5778102bdc580272bcff` fix for TEXT date formatting with the workbook epoch.
 
-The maintained changes cover spreadsheet dirty/error/save/print/clipboard callbacks, selection navigation, row and column sizing, worksheet management and its undoable Rust operations, command search, PNG export handoff, DOCX immediate dirty notifications and full-document printing, and VSDX host saving and draft-aware serialization. Field Station owns native dialogs, storage, recovery, and application UI. This fork owns editor and engine behavior.
+The maintained changes cover spreadsheet dirty/error/save/print/clipboard callbacks, selection navigation, row and column sizing, insertion, deletion and unhiding, worksheet management and its undoable Rust operations, command search, PNG export handoff, DOCX immediate dirty notifications and full-document printing, and VSDX host saving and draft-aware serialization. Field Station owns native dialogs, storage, recovery, and application UI. This fork owns editor and engine behavior.
+
+Right-click a row number or column letter for insert, delete, unhide and sizing actions. A selected range applies to all its rows or columns; Shift-click headings extends that range. Unhide restores zero-size tracks in or immediately beside the range. Insert/delete commands are also available in Search menus. Shift+F10 opens the focused heading's menu; arrows navigate and Escape closes it. Mutations commit pending drafts first, update formula references, support undo/redo and persist through saving.
 
 ## Building application packages
 

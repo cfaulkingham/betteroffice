@@ -58,6 +58,7 @@ import { LocaleProvider, useTranslation } from './i18n';
 import { EditorToolbar } from './components/EditorToolbar';
 import { MenuSearch, type MenuCommand } from './components/MenuSearch';
 import { SheetTabs, type SheetAction } from './components/SheetTabs';
+import { trackActionLabel, trackLimit, type TrackAction } from './components/TrackMenu';
 import {
   SheetHeaders,
   HEADER_WIDTH,
@@ -1940,6 +1941,52 @@ function XlsxEditorContent({
     }
   };
 
+  const selectTrack = (axis: TrackAxis, index: number, extend: boolean) => {
+    if (!settlePendingEditsRef.current()) return;
+    const key = axis === 'row' ? 'row' : 'col';
+    const cell = { ...(selection?.focus ?? { row: 0, col: 0 }), [key]: index };
+    setSelection(extend && selection ? { anchor: selection.anchor, focus: cell } : selectionAt(cell));
+    setSelectedChart(null);
+    focusContainer();
+  };
+  const manageTracks = (action: TrackAction): boolean => {
+    const handle = handleRef.current;
+    if (!handle || readOnly || !settlePendingEditsRef.current()) return false;
+    const { axis, count, type } = action;
+    const at = action.at + (type === 'insertAfter' ? count : 0);
+    const key = axis === 'row' ? 'row' : 'col';
+    try {
+      const ops = type === 'unhide'
+        ? Array.from({ length: count }, (_, offset) => action.at + offset)
+          .filter((index) => getTrackSize(axis, index) === 0)
+          .map((index) => axis === 'row'
+            ? { type: 'setRowHeight', sheet: activeSheet, row: index, height: null }
+            : { type: 'setColWidth', sheet: activeSheet, col: index, width: null })
+        : [{
+        type: type === 'delete' ? axis === 'row' ? 'deleteRows' : 'deleteCols'
+          : axis === 'row' ? 'insertRows' : 'insertCols',
+        sheet: activeSheet, at, count,
+      }];
+      if (!ops.length) return true;
+      const result = handle.applyOps(ops);
+      applyResult(result);
+      if (!result.applied) return false;
+      setSelection(selectionAt({
+        ...(selection?.focus ?? { row: 0, col: 0 }),
+        [key]: Math.min(at, trackLimit(axis) - 1),
+      }));
+      setSelectedChart(null);
+      setCapturedFormat(null);
+      paintSourceRef.current = null;
+      setError(null);
+      focusContainer();
+      return true;
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  };
+
   // switch sheets: retarget the core, reset scroll + selection, reread info.
   const switchSheet = (index: number) => {
     const handle = handleRef.current;
@@ -2006,6 +2053,15 @@ function XlsxEditorContent({
     { label: t('toolbar.print'), run: print, disabled: !sheetInfo },
     { label: t('toolbar.undo'), run: undo, disabled: !historyState.canUndo },
     { label: t('toolbar.redo'), run: redo, disabled: !historyState.canRedo },
+    ...(['row', 'column'] as const).flatMap((axis) => {
+      const at = axis === 'row' ? normalizedSelection?.top ?? 0 : normalizedSelection?.left ?? 0;
+      const count = axis === 'row' ? selectionRows : selectionColumns;
+      return (['insertBefore', 'insertAfter', 'delete'] as const).map((type) => {
+        const action = { axis, at, count, type };
+        return { label: trackActionLabel(action), run: () => { manageTracks(action); },
+          disabled: !selection || (type === 'insertAfter' && at + count >= trackLimit(axis)) };
+      });
+    }),
     ...(['bold', 'italic', 'strikethrough', 'currency', 'percent', 'increaseDecimal', 'decreaseDecimal', 'paintFormat'] as const).map((action) => ({
       label: t(`toolbar.${action}`), run: () => formatSelection(action), disabled: !selection,
     })),
@@ -2340,6 +2396,8 @@ function XlsxEditorContent({
           getPixelsPerUnit={getPixelsPerUnit}
           onBegin={() => settlePendingEditsRef.current()}
           onResize={resizeTracks}
+          onSelect={selectTrack}
+          onAction={manageTracks}
           onFocusGrid={focusContainer}
         />
       )}
