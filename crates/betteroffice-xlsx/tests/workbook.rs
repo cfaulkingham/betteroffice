@@ -11748,3 +11748,4 @@ fn move_sheet_batches_use_the_new_order_and_reject_invalid_indices_atomically() 
         collaborative.apply_ops(vec![Op::MoveSheet { from: 0, to: 1 }], calc()),
         Err(Error::CollaborativeStructureOperation)
     ));
+}

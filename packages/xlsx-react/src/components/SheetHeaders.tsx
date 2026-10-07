@@ -7,6 +7,7 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import type { GridMeta, Selection } from '@betteroffice/xlsx';
+import { TrackMenu, trackLimit, type TrackAction, type TrackTarget } from './TrackMenu';
 
 export type TrackAxis = 'row' | 'column';
 export type TrackSize = {
@@ -63,6 +64,8 @@ type Props = {
   getPixelsPerUnit: (axis: TrackAxis, index: number) => number;
   onBegin: () => boolean;
   onResize: (sizes: TrackSize[]) => boolean;
+  onSelect: (axis: TrackAxis, index: number, extend: boolean) => void;
+  onAction: (action: TrackAction) => boolean;
   onFocusGrid: () => void;
 };
 type Drag = {
@@ -94,11 +97,34 @@ export function SheetHeaders({
   getPixelsPerUnit,
   onBegin,
   onResize,
+  onSelect,
+  onAction,
   onFocusGrid,
 }: Props) {
   const [drag, setDrag] = useState<Drag | null>(null);
   const dragRef = useRef<Drag | null>(null);
   const [targets, setTargets] = useState<SizeTarget[] | null>(null);
+  const [menu, setMenu] = useState<(TrackTarget & { left: number; top: number; label: string; hidden: TrackTarget | null }) | null>(null);
+  const closeMenu = () => { setMenu(null); onFocusGrid(); };
+  const openMenu = (axis: TrackAxis, index: number, left: number, top: number) => {
+    if (readOnly || !onBegin()) return;
+    const key = axis === 'row' ? 'row' : 'col';
+    const first = selection ? Math.min(selection.anchor[key], selection.focus[key]) : index;
+    const last = selection ? Math.max(selection.anchor[key], selection.focus[key]) : index;
+    const at = index >= first && index <= last ? first : index;
+    const count = index >= first && index <= last ? last - first + 1 : 1;
+    const from = Math.max(0, at - 1);
+    const to = Math.min(trackLimit(axis), at + count + 1);
+    let hidden: TrackTarget | null = null;
+    for (let track = from; track < to; track++) {
+      if (getSize(axis, track) === 0) {
+        hidden = { axis, at: from, count: to - from };
+        break;
+      }
+    }
+    updateDrag(null);
+    setMenu({ axis, at, count, left, top, label: trackLabel(axis, index), hidden });
+  };
   const updateDrag = (next: Drag | null) => {
     dragRef.current = next;
     setDrag(next);
@@ -208,17 +234,35 @@ export function SheetHeaders({
               key={index}
               data-testid={`xlsx-${axis}-header-${index}`}
               data-track-index={index}
+              tabIndex={!readOnly && selection?.focus[isRow ? 'row' : 'col'] === index ? 0 : -1}
+              aria-label={`${label} options`}
+              aria-haspopup={readOnly ? undefined : 'menu'}
+              onClick={(event) => {
+                if (!(event.target as HTMLElement).closest('button')) onSelect(axis, index, event.shiftKey);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10') ||
+                    (event.key === 'Enter' && event.target === event.currentTarget)) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  openMenu(axis, index, rect.left, rect.bottom);
+                } else if (event.key === ' ' && event.target === event.currentTarget) {
+                  event.preventDefault();
+                  onSelect(axis, index, event.shiftKey);
+                }
+              }}
               onDoubleClick={() => openSizes([{ axis, index }])}
               onContextMenu={(event) => {
                 if (!readOnly) {
                   event.preventDefault();
-                  openSizes([{ axis, index }]);
+                  openMenu(axis, index, event.clientX, event.clientY);
                 }
               }}
               title={
                 readOnly
                   ? label
-                  : `${label} — drag its edge to resize; double-click to set a size`
+                  : `${label} — right-click for row or column actions; drag its edge to resize`
               }
               style={{
                 position: 'absolute',
@@ -351,6 +395,14 @@ export function SheetHeaders({
       </button>
       {renderAxis('column')}
       {renderAxis('row')}
+      {menu && !readOnly && createPortal(
+        <TrackMenu target={menu} hidden={menu.hidden} label={menu.label} left={menu.left} top={menu.top}
+          onAction={onAction} onClose={closeMenu} onResize={() => {
+            setMenu(null);
+            openSizes(Array.from({ length: menu.count }, (_, offset) => ({ axis: menu.axis, index: menu.at + offset })));
+          }} />,
+        document.body
+      )}
       {drag && (
         <div
           aria-hidden="true"
