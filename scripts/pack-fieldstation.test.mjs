@@ -16,7 +16,7 @@ test('packages preserve licensing and pin internal dependencies to the source co
   const revision = 'a'.repeat(40);
   const result = packageMetadata(original, 'xlsx-react', revision);
   assert.equal(result.gitHead, revision);
-  assert.equal(result.version, '0.2.1-fieldstation.gaaaaaaaaaaaa');
+  assert.equal(result.version, '0.4.3-fieldstation.gaaaaaaaaaaaa');
   assert.equal(result.dependencies['@betteroffice/xlsx'], result.version);
   assert.equal(result.dependencies['@betteroffice/xlsx-i18n'], result.version);
   assert.equal(result.peerDependencies.react, original.peerDependencies.react);

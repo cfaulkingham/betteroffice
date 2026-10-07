@@ -10,7 +10,7 @@ Right-click a row number or column letter for insert, delete, unhide and sizing 
 
 ## Building application packages
 
-Install Node.js, Bun 1.3.14, Rust with `wasm32-unknown-unknown`, `wasm-pack` 0.15.0, and Binaryen (`wasm-opt` on PATH). The CI workflow records the same build process. It does not require npm, crates.io, or PyPI publishing credentials.
+Install Node.js, Bun 1.4.2, Rust with `wasm32-unknown-unknown`, `wasm-pack` 0.15.0, and Binaryen (`wasm-opt` on PATH). The CI workflow records the same build process. It does not require npm, crates.io, or PyPI publishing credentials.
 
 ```sh
 bun install --frozen-lockfile --ignore-scripts --filter betteroffice --filter './packages/*'
@@ -18,7 +18,7 @@ node --test scripts/pack-fieldstation.test.mjs
 node scripts/pack-fieldstation.mjs
 ```
 
-Commit source changes before packaging. The builder refuses dirty or untracked source changes, rebuilds all twelve engine/editor/i18n packages, and writes `dist/fieldstation/<full-commit>/`. Each archive contains upstream licenses/notices, the fork repository, and `gitHead`. A version such as `0.2.1-fieldstation.g0123456789ab` identifies its source commit. The manifest records archive SHA-256 values, lockfile digests, and compiler/tool versions. Upstream package manifests and workspace dependencies remain intact in source; the packager rewrites the staged distribution metadata.
+Commit source changes before packaging. The builder refuses dirty or untracked source changes, rebuilds all twelve engine/editor/i18n packages, and writes `dist/fieldstation/<full-commit>/`. Each archive contains upstream licenses/notices, the fork repository, and `gitHead`. A version such as `0.4.3-fieldstation.g0123456789ab` identifies its source commit. The manifest records archive SHA-256 values, lockfile digests, and compiler/tool versions. Upstream package manifests and workspace dependencies remain intact in source; the packager rewrites the staged distribution metadata.
 
 The `Field Station packages` workflow builds and tests the fork on pushes to main or manual dispatch, then uploads the archives and manifest as one GitHub Actions artifact. Public registry publishing and upstream website deployment are restricted to the upstream repository.
 
