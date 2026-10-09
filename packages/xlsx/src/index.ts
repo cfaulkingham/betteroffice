@@ -123,6 +123,8 @@ export {
   openWorkbook,
   wasmVersion,
   StaleProposalError,
+  DisplayTooLargeError,
+  getDisplayListCellLimit,
   exportXlsxMarkdown,
   exportXlsxStructured,
   renderXlsxMarkdown,
