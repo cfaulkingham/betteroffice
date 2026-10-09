@@ -184,7 +184,7 @@ export function DocxEditorPagedArea({
   onYrsContentChange: () => void;
   onYrsEdit?: () => void;
   onYrsHistoryChange?: (canUndo: boolean, canRedo: boolean) => void;
-  onPagedSelectionChange: () => void;
+  onPagedSelectionChange: NonNullable<PagedEditorProps['onSelectionChange']>;
   onYrsSelectionChange: (selection: YrsToolbarSelection) => void;
   onViewerSelectionChange?: (selection: ViewerSelectionChange) => void;
   onRenderedDomContextReady:
