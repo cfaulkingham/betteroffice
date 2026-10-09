@@ -2,7 +2,6 @@ import {
   initWasm,
   openPresentation,
   paintSlide,
-  decodePresentationImage,
   presentationImageBlob,
   PRESENCE_LABEL_DURATION_MS,
   sizeCanvasForSlide,
@@ -141,7 +140,7 @@ import { PptxWorkerEditor, type PptxWorkerEditorProps } from './worker/PptxWorke
 import { createWorkerEditorApi, type PptxWorkerEditorApi } from './worker/createWorkerEditorApi';
 import type { EditablePresentation } from './worker/useEditableSessionPresentation';
 import { createWorkerInputCoordinator, type WorkerInputCoordinator } from './commands/workerInputCoordinator';
-import { currentContext } from './viewer/sessionPaint';
+import { currentContext, frameImages } from './viewer/sessionPaint';
 
 const THUMBNAIL_SLICE_MS = 12;
 
@@ -655,7 +654,7 @@ export function PptxEditorContent({
   const [resizeDelta, setResizeDelta] = useState<SlidePoint | null>(null);
   const pointerGestureRef = useRef<PointerGesture | null>(null);
   const recentClickRef = useRef<RecentCanvasClick | null>(null);
-  const imageCacheRef = useRef(new Map<string, Promise<CanvasImageSource | null>>());
+  const imageCacheRef = useRef(frameImages());
   const stableFonts = useStableFontFaces(fonts);
   const [model, setModel] = useState<EditorModel | null>(null);
   const [thumbnailStore] = useState(() => new SlideThumbnailStore());
@@ -692,9 +691,16 @@ export function PptxEditorContent({
     model?.slideIndex ?? 0
   );
   const [paintedReview, setPaintedReview] = useState<ProposalDiffSlide | null>(null);
-  const resolveSlideImage = useCallback((assetId: string) =>
-    backend ? workerRef.current?.resolveImage(assetId) ?? Promise.resolve(null) :
-      resolveImage(assetId, handleRef, imageCacheRef, decodeImageError), [backend, decodeImageError]);
+  const resolveSlideImage = useMemo<CanvasImageResolver>(() => {
+    if (!backend) return resolveImages(handleRef, imageCacheRef, decodeImageError);
+    return Object.assign((assetId: string) => workerRef.current?.resolveImage(assetId) ?? Promise.resolve(null), {
+      acquire: () => {
+        const worker = workerRef.current;
+        const frame = worker?.frame(worker.active);
+        return worker && frame ? worker.images.resolve(frame) : () => null;
+      },
+    });
+  }, [backend, decodeImageError]);
 
   useEffect(() => {
     if (!canvasReview.reviewing) return;
@@ -1222,6 +1228,7 @@ export function PptxEditorContent({
       else handle?.dispose();
       if (workerRef.current === worker) workerRef.current = null;
       if (handleRef.current === handle) handleRef.current = null;
+      imageCacheRef.current.clear();
       removeBrowserFonts(browserFaces);
     };
   }, [
@@ -1308,7 +1315,7 @@ export function PptxEditorContent({
     const images = worker && workerFrame ? worker.images.resolve(workerFrame) : null;
     const current = () => !cancelled && (!worker || !!workerFrame && worker.currentPaint(workerFrame, workerNavigation!));
     const painting = paintSlide(backend ? currentContext(ctx, current) : currentOnly(ctx, current), frame, dpr, scale, {
-      resolveImage: images ?? ((assetId) => resolveImage(assetId, handleRef, imageCacheRef, decodeImageError)),
+      resolveImage: images ?? resolveSlideImage,
     }).then(
       () => {
         if (!current()) return;
@@ -1325,7 +1332,7 @@ export function PptxEditorContent({
       cancelled = true;
     };
   }, [backend, worker, workerFrame, workerNavigation, workerSequence, decodeImageError, model?.frame,
-    model?.snapshot, model?.slideIndex, model?.version, presentFrame, reportError, scale]);
+    model?.snapshot, model?.slideIndex, model?.version, presentFrame, reportError, resolveSlideImage, scale]);
 
   useEffect(() => {
     if (backend) return;
@@ -2663,11 +2670,11 @@ export function PptxEditorContent({
     // than reading whichever deck `handleRef` holds by the time an asset
     // resolves.
     const pinned = { current: handle };
-    const cache = { current: new Map<string, Promise<CanvasImageSource | null>>() };
+    const cache = { current: frameImages() };
     try {
       const blob = await slideToPng(frame, {
         scale: window.devicePixelRatio || 1,
-        resolveImage: (assetId) => resolveImage(assetId, pinned, cache, decodeImageError),
+        resolveImage: resolveImages(pinned, cache, decodeImageError),
       });
       const bytes = new Uint8Array(await blob.arrayBuffer());
       if (handleRef.current !== handle) return 'replaced';
@@ -2677,6 +2684,8 @@ export function PptxEditorContent({
       if (handleRef.current !== handle) return 'replaced';
       reportError(value);
       return 'failed';
+    } finally {
+      cache.current.dispose();
     }
   };
   const shapeDragDelta =
@@ -3108,7 +3117,7 @@ export function PptxEditorContent({
         {!readOnly && proposalsOpen && model && handleRef.current && (
           <ProposalsPanel handle={handleRef.current} proposals={proposals} snapshot={model.snapshot}
             visualDisabledReason={backend ? t('worker.disabled') : undefined}
-            resolveImage={(assetId) => resolveImage(assetId, handleRef, imageCacheRef, decodeImageError)}
+            resolveImage={resolveSlideImage}
             onNavigate={navigateProposalTarget}
             onClose={() => proposalButtonRef.current?.focus()} />
         )}
@@ -3139,9 +3148,7 @@ export function PptxEditorContent({
           handle={handleRef.current}
           slideCount={slideCount}
           startIndex={currentSlide}
-          resolveImage={(assetId) =>
-            resolveImage(assetId, handleRef, imageCacheRef, decodeImageError)
-          }
+          resolveImage={resolveSlideImage}
           counterLabel={(current, total) => t('presentation.slideCounter', { current, total })}
           label={t('presentation.label')}
           exitLabel={t('presentation.exit')}
@@ -3552,25 +3559,12 @@ function removeBrowserFonts(fonts: FontFace[]): void {
   for (const font of fonts) document.fonts.delete(font);
 }
 
-function resolveImage(
-  assetId: string,
+function resolveImages(
   handleRef: { current: PresentationHandle | null },
-  cacheRef: { current: Map<string, Promise<CanvasImageSource | null>> },
+  cacheRef: { current: ReturnType<typeof frameImages> },
   errorMessage: string
-): Promise<CanvasImageSource | null> {
-  const cached = cacheRef.current.get(assetId);
-  if (cached) return cached;
-  const pending = decodeImage(handleRef.current?.mediaBytes(assetId), errorMessage);
-  cacheRef.current.set(assetId, pending);
-  return pending;
-}
-
-function decodeImage(
-  bytes: Uint8Array | undefined,
-  errorMessage: string
-): Promise<CanvasImageSource | null> {
-  if (!bytes) return Promise.resolve(null);
-  return decodePresentationImage(bytes, errorMessage);
+): CanvasImageResolver {
+  return cacheRef.current.resolver((id) => handleRef.current?.mediaBytes(id), errorMessage);
 }
 
 function caretLinesFor(
