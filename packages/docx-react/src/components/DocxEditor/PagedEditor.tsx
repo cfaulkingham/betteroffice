@@ -664,7 +664,7 @@ const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
       showHiddenText,
       proposalPreview,
     ]);
-    const activeYrsRootStory = partEditStory(partEdit);
+    const activeYrsRootStory = partEditStory(partEdit, yrsCore.session);
     const yrsInputPositionMap = useCallback(
       (storyId = activeYrsRootStory) => yrsCore.inputPositionMap(storyId),
       [activeYrsRootStory, yrsCore.inputPositionMap]
@@ -2026,7 +2026,7 @@ const PagedEditorComponent = forwardRef<PagedEditorRef, PagedEditorProps>(
     });
 
     const displayPositionToYrsLoc = (position: number | PointPosition): YrsLoc | null => {
-      const target = projectYrsDisplayPosition(position, getYrsPositionProjection);
+      const target = projectYrsDisplayPosition(position, getYrsPositionProjection, yrsCore.session);
       return target ? yrsCore.displayPositionToLoc(target.displayPosition, target.story) : null;
     };
 

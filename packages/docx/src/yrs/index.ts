@@ -72,6 +72,29 @@ import type {
 import { preparedDigests, randomClientId, wrapSession } from './yrsSessionFacade';
 export { decodeDocxHostJson } from './yrsSessionFacade';
 
+/** @internal */
+export type {
+  DocxCommandEchoContext,
+  DocxCommandFrame,
+  DocxCommandPageIdentity,
+  DocxCommandPayloads,
+  DocxCommandSelection,
+  DocxEditState,
+  DocxEchoRect,
+  DocxEchoTransform,
+  DocxNavigationIntent,
+  DocxSelectionPointIntent,
+  DocxWorkerEditSession,
+  ResidentCommandConnection,
+  ResidentCommandInitReply,
+} from './residentCommandProtocol';
+/** @internal */
+export type {
+  ResidentEngineWorkerHostModule,
+  ResidentEngineWorkerRequest,
+  ResidentEngineWorkerResponse,
+} from './residentEngineWorkerProtocol';
+
 export * from './layoutMeta';
 export * from './edits';
 export * from './contentControls';
@@ -83,7 +106,8 @@ export * from './pagedExport';
 export * from './inputPositionMap';
 export * from './storyPlainText';
 export type { DocxResolvedPointPosition } from './pointPosition';
-export type { ResidentDocumentRead } from './residentEngineWorkerProtocol';
+export type { ResidentRangeHighlights } from './residentRangeHighlights';
+export type { ResidentDocumentRead, ResidentDocumentReadValues } from './residentEngineWorkerProtocol';
 export type {
   DocxDisplayRange,
   DocxDisplaySelectionInfo,
@@ -112,6 +136,8 @@ export {
   type ResidentProposalReply,
   type ResidentEngineOffscreenPage,
 } from './residentEngineWorkerClient';
+export type { ResidentSourceOpenRequest, ResidentSourcePreviewOptions } from './residentSource';
+export type { ResidentFontFace, ResidentFontEnvironment, ResidentFontEnvironmentEvent, ResidentFontEnvironmentSnapshot } from './residentFontEnvironment';
 export { preloadDocxEngine } from './preloadDocxEngine';
 export {
   residentCaretSnapshotForFrame,
@@ -125,6 +151,12 @@ export {
   type WasmModuleMemory,
 } from '../wasm/loadWasmAsset';
 export { documentToYrs } from './documentToYrs';
+export {
+  OPAQUE_SEED_BUDGET_BYTES,
+  OpaqueSeedBudgetError,
+  assertOpaqueSeedBudget,
+  normalizeSeedError,
+} from './documentToYrs';
 export { ownProjectedParagraphs, yrsToDocument } from './yrsToDocument';
 export * from './paragraphIdentity';
 export {
@@ -149,7 +181,7 @@ export {
   type DocxSavedParagraph,
   type DocxSessionSave,
 } from './saveYrsDocx';
-export { sessionSourcePackage } from './sessionInternals';
+export { headerFooterStory, sessionSourcePackage } from './sessionInternals';
 export { PeerMetadataError, peerMetadataTags } from './peerMetadata';
 export {
   DirtyProjectionStories,
@@ -1541,9 +1573,9 @@ export interface CreateYrsSessionOptions {
 }
 
 /**
- * Creates a yrs editing replica. The first call dynamically imports and
- * initializes the embedded docx-edit wasm (~440KB base64) — callers must
- * load it lazily so non-editor consumers avoid the wasm startup cost.
+ * Creates a yrs editing replica. The first call dynamically imports the edit
+ * loader and preloads the external docx-edit wasm asset — callers must load
+ * it lazily so non-editor consumers avoid the wasm startup cost.
  */
 export async function createYrsSession(options?: CreateYrsSessionOptions): Promise<YrsSession> {
   const clientId = options?.clientId ?? randomClientId();
@@ -1551,3 +1583,4 @@ export async function createYrsSession(options?: CreateYrsSessionOptions): Promi
   await wasm.preloadEditWasm();
   return wrapSession(wasm.createEditSession(clientId), clientId);
 }
+export type { ResidentEngineWorkerSourceOpened } from './residentSourceWorkerClient';

@@ -468,6 +468,108 @@ fn text_functions() {
 }
 
 #[test]
+fn search_offsets_use_original_unicode_positions() {
+    check(&[
+        ("SEARCH(\"b\", \"İb\")", n(2.0)),
+        ("SEARCH(\"i\", \"İ\")", n(1.0)),
+        ("SEARCH(\"b\", \"aİb\", 2)", n(3.0)),
+        ("SEARCH(\"B\", \"İİb\")", n(3.0)),
+        ("SEARCH(\"İB\", \"xİİb\")", n(3.0)),
+        ("SEARCH(\"b\", \"bİb\", 2)", n(3.0)),
+        ("SEARCH(\"b\", \"İİb\", 3)", n(3.0)),
+        ("SEARCH(\"B\", \"éİb\")", n(3.0)),
+        ("SEARCH(\"B\", \"😀İb\", 2)", n(3.0)),
+        ("SEARCH(\"B\", \"i̇İb\")", n(4.0)),
+        ("FIND(\"b\", \"İİb\")", n(3.0)),
+        ("FIND(\"b\", \"aİb\", 2)", n(3.0)),
+        ("FIND(\"i\", \"İ\")", e(ErrorValue::Value)),
+        ("FIND(\"B\", \"İb\")", e(ErrorValue::Value)),
+    ]);
+}
+
+#[test]
+fn search_preserves_contextual_lowercasing() {
+    check(&[
+        ("SEARCH(\"ΟΣ\", \"ΟΣ\")", n(1.0)),
+        ("SEARCH(\"ος\", \"ΟΣ\")", n(1.0)),
+        ("SEARCH(\"ΟΣ\", \"ος\")", n(1.0)),
+        ("SEARCH(\"ΟΣ\", \"İ ΟΣ\")", n(3.0)),
+        ("SEARCH(\"ΟΣ\", \"İ ΟΣ\", 2)", n(3.0)),
+    ]);
+}
+
+#[test]
+fn search_handles_empty_text_and_invalid_starts() {
+    check(&[
+        ("SEARCH(\"\", \"İb\")", n(1.0)),
+        ("SEARCH(\"\", \"İb\", 2)", n(2.0)),
+        ("SEARCH(\"\", \"\")", n(1.0)),
+        ("SEARCH(\"b\", \"\")", e(ErrorValue::Value)),
+        ("SEARCH(\"z\", \"İb\")", e(ErrorValue::Value)),
+        ("SEARCH(\"b\", \"İb\", 0)", e(ErrorValue::Value)),
+        ("SEARCH(\"b\", \"İb\", -1)", e(ErrorValue::Value)),
+        ("SEARCH(\"\", \"İb\", 4)", e(ErrorValue::Value)),
+        ("SEARCH(\"b\", \"İb\", 1E100)", e(ErrorValue::Value)),
+    ]);
+}
+
+#[test]
+fn tilde_criteria_match_literal_text_across_if_functions() {
+    let mut wb = Workbook::default();
+    let mut sheet = Sheet::new("Sheet1");
+    for (row, (criterion, value)) in [
+        ("~a", 10.0),
+        ("~a", 20.0),
+        ("~a", 30.0),
+        ("a", 40.0),
+        ("~", 50.0),
+        ("~x", 60.0),
+        ("~~", 70.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let row = row + 1;
+        for (column, value) in [("A", t(criterion)), ("B", n(value))] {
+            let address = format!("{column}{row}");
+            sheet.set_cell(
+                CellRef::parse_a1(&address).unwrap(),
+                Cell {
+                    value,
+                    ..Cell::default()
+                },
+            );
+        }
+    }
+    wb.sheets.push(sheet);
+
+    for (formula, expected) in [
+        ("COUNTIF(A1:A7,\"~a\")", n(3.0)),
+        ("COUNTIF(A1:A7,\"~\")", n(1.0)),
+        ("SUMIF(A1:A7,\"~a\",B1:B7)", n(60.0)),
+        ("SUMIF(A1:A7,\"~\",B1:B7)", n(50.0)),
+        ("AVERAGEIF(A1:A7,\"~a\",B1:B7)", n(20.0)),
+        ("AVERAGEIF(A1:A7,\"~\",B1:B7)", n(50.0)),
+        ("MAXIFS(B1:B7,A1:A7,\"~a\")", n(30.0)),
+        ("MAXIFS(B1:B7,A1:A7,\"~\")", n(50.0)),
+        ("MINIFS(B1:B7,A1:A7,\"~a\")", n(10.0)),
+        ("MINIFS(B1:B7,A1:A7,\"~\")", n(50.0)),
+        ("COUNTIF(A1:A7,\"~~\")", n(1.0)),
+        ("COUNTIF(A1:A7,\"=~A\")", n(3.0)),
+        ("COUNTIF(A1:A7,\"<>~a\")", n(4.0)),
+        ("COUNTIF(A1:A7,\"~~*\")", n(6.0)),
+        ("COUNTIF(A1:A7,\"*~\")", n(2.0)),
+        ("COUNTIFS(A1:A7,\"~a\",B1:B7,\">10\")", n(2.0)),
+        ("SUMIFS(B1:B7,A1:A7,\"~a\",B1:B7,\">10\")", n(50.0)),
+        ("AVERAGEIFS(B1:B7,A1:A7,\"~a\",B1:B7,\">10\")", n(25.0)),
+    ] {
+        let expr = parse_formula(formula).expect("parse");
+        let ctx = EvalContext::new(&wb, SheetId(0));
+        assert_eq!(evaluate(&expr, &ctx), expected, "{formula}");
+    }
+}
+
+#[test]
 fn datetime_functions() {
     check(&[
         ("DATE(2020, 1, 1)", n(43831.0)),

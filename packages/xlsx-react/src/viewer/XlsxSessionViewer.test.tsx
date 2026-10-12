@@ -9,6 +9,7 @@ import type { XlsxEditorProps, XlsxWorkerViewerApi } from '../XlsxEditor';
 import { EditorToolbar } from '../components/EditorToolbar';
 import { ToolbarCommandButton } from '../components/toolbar/ToolbarCommand';
 import { workbookSessionOpener } from './useSessionWorkbook';
+import { testSessionCommands } from '../commands/testing';
 
 const ownsDom = !GlobalRegistrator.isRegistered;
 if (ownsDom) GlobalRegistrator.register();
@@ -60,6 +61,8 @@ function session() {
   const sheets = [{ id: 'sheet:0', index: 0, name: 'First' }, { id: 'sheet:1', index: 1, name: 'Second' }];
   let failure: Parameters<WorkbookSession['onFailure']>[0] | undefined;
   const call = {
+    command: mock<WorkbookSession['call']['command']>(async () => { throw new Error('Unexpected command'); }),
+    captureFormat: mock<WorkbookSession['call']['captureFormat']>(async () => { throw new Error('Unexpected format capture'); }),
     frame: mock(async (viewport: Viewport, options?: { sheet?: number }) => frame(options?.sheet ?? 0, viewport)),
     sheetView: mock(async (sheet: number) => sheetView(sheet)),
     cellGeometry: mock(async (sheet: number, row: number, col: number): Promise<xlsx.WorkbookCellGeometry> => ({
@@ -70,6 +73,8 @@ function session() {
       sheet, version: 'v1', cells: [[{ a1: range, input: '=SUM(B1:C1)', isFormula: true }]],
     })),
     version: mock(async () => 'v1'),
+    collaborationStateVector: mock<WorkbookSession['call']['collaborationStateVector']>(async () => new Uint8Array()),
+    collaborationStateAsUpdate: mock<WorkbookSession['call']['collaborationStateAsUpdate']>(async () => new Uint8Array()),
     readCells: mock(async (_request: xlsx.XlsxReadRequest): Promise<xlsx.XlsxReadResult> => ({
       ok: true, version: 'v1', sheets: [], ranges: [],
       calculation: { cycleCells: [], limitedCells: [], truncated: false },
@@ -79,10 +84,16 @@ function session() {
     })),
     validateEdits: mock(async (): Promise<xlsx.XlsxValidationResult> => { throw new Error('Unexpected mutation'); }),
     applyEdits: mock(async (): Promise<xlsx.XlsxEditResult> => { throw new Error('Unexpected mutation'); }),
+    renderPng: mock<WorkbookSession['call']['renderPng']>(async () => { throw new Error('Unexpected export'); }),
+    renderRangePng: mock<WorkbookSession['call']['renderRangePng']>(async () => { throw new Error('Unexpected export'); }),
+    exportStructured: mock<WorkbookSession['call']['exportStructured']>(async () => { throw new Error('Unexpected export'); }),
+    exportMarkdown: mock<WorkbookSession['call']['exportMarkdown']>(async () => { throw new Error('Unexpected export'); }),
+    printDisplayList: mock<WorkbookSession['call']['printDisplayList']>(async () => { throw new Error('Unexpected export'); }),
     sheets: async () => sheets, calculationStatus: async () => ({ limitedCells: [] }),
     save: async () => new Uint8Array([8, 9]).buffer,
   };
   const viewer: WorkbookSession = {
+    ...testSessionCommands(),
     state: { format: 'xlsx', stage: 'ready', version: 0, dirty: false, sheets, activeSheet: 0 },
     call, save: mock(async () => new Uint8Array([8, 9])), on: () => () => {},
     onFailure: (listener) => { failure = listener; return () => { failure = undefined; }; },
@@ -166,6 +177,29 @@ afterEach(() => {
 afterAll(async () => { if (ownsDom) await GlobalRegistrator.unregister(); });
 
 describe('workbook session viewer', () => {
+  it('intercepts viewer saving and exposes painted pointer queries with stale guards', async () => {
+    const { viewer } = session();
+    open(viewer);
+    let api!: XlsxWorkerViewerApi;
+    const onSaveRequest = mock(async () => { await api.flushPendingInput(); return false; });
+    const saved = mock((_bytes: Uint8Array) => {});
+    const props = { readOnly: true as const, experimentalWorkerOpen: true as const,
+      onReady: (ready: XlsxWorkerViewerApi) => { api = ready; }, onSaveRequest, onSave: saved };
+    const view = render(<XlsxEditor {...props} file={file} />);
+    await opened();
+    const stale = api;
+    const canvas = view.container.querySelector('canvas')!;
+    canvas.getBoundingClientRect = () => new DOMRect(40, 60, 800, 600);
+    expect(api.getPositionAtPoint(184, 96)).toEqual({ sheet: 0, row: 1, col: 1 });
+    await act(async () => { expect(await api.commands.execute('save', null)).toEqual({ ok: true, status: 'noop' }); });
+    expect(onSaveRequest).toHaveBeenCalledTimes(1);
+    expect(viewer.save).not.toHaveBeenCalled();
+    expect(saved).not.toHaveBeenCalled();
+    await act(async () => { view.rerender(<XlsxEditor {...props} file={file.slice()} />); });
+    expect(stale.getPositionAtPoint(184, 96)).toBeNull();
+    await expect(stale.flushPendingInput()).rejects.toThrow('replaced');
+  });
+
   it('opens and publishes onReady once after the first paint without local wasm', async () => {
     const { viewer, call } = session();
     const opener = open(viewer);

@@ -1,10 +1,29 @@
+import type { ResidentRangeHighlights } from './residentRangeHighlights';
+import type { ResidentPartGeometry, ResidentPartMetadata } from './residentParts';
+import type { ResidentControlSnapshot } from './residentControls';
+import type { ResidentPropertyTarget, ResidentPropertySnapshot } from './residentProperties';
+import type { ResidentSectionSnapshot } from './residentSections';
+import type { YrsStoryRange } from './index';
 import type { LayoutMetaV1 } from './layoutMeta';
+import type { Checkpoint } from '../../../../shared/office-session/commands/types';
+import type { ReplyError } from '../../../../shared/office-session/protocol';
+import type { SessionFailureCode } from '../../../../shared/office-session/types';
+import type {
+  DocxCommandAck,
+  DocxCommandEnvelope,
+  DocxCommandFrame,
+  DocxCommandSelection,
+  ResidentCommandInitReply,
+  ResidentCommandInitRequest,
+  ResidentCommandViewportRequest,
+} from './residentCommandProtocol';
 import type {
   YrsEngineApplyProfile,
   YrsLoc,
   YrsResidentCaretSnapshot,
   YrsResidentWorkerSnapshot,
   YrsSelection,
+  YrsSelectionText,
   YrsStickyPosition,
 } from './index';
 import type { PointPosition } from '../plugin-api';
@@ -37,10 +56,17 @@ import type {
   DocxParagraphAnchorResult,
   DocxParagraphIdentitySnapshot,
 } from './paragraphIdentity';
-import type { DocxFindTextRequest, DocxFindTextResult, DocxReadParagraphsRequest, DocxReadParagraphsResult } from './edits';
-import type { ProposalGeometryMirror, resolveNavigationTarget } from './proposalGeometry';
+import type { DocxEditRequest, DocxValidationResult, DocxFindTextRequest, DocxFindTextResult, DocxReadParagraphsRequest, DocxReadParagraphsResult } from './edits';
+import type {
+  AnchorGeometryTarget,
+  ProposalGeometryMirror,
+  ProposalGeometryTarget,
+  resolveNavigationTarget,
+} from './proposalGeometry';
 import type { DocxPageExportOptions } from './pagedExport';
 import type { DocxContentControlQuery, DocxContentControlsOptions, DocxContentControlsResult } from './contentControls';
+import type { ResidentSourceOpenRequest } from './residentSource';
+import type { ResidentFontEnvironmentEvent, ResidentFontEnvironmentSnapshot } from './residentFontEnvironment';
 
 /** @internal */
 export interface ResidentEngineWorkerFontSync {
@@ -70,18 +96,26 @@ export interface ResidentProposalResponse {
 
 /** @internal */
 export type ResidentDocumentRead =
+  | { kind: 'validateEdits'; request: DocxEditRequest }
+  | { kind: 'contentControlHandles' }
+  | { kind: 'partSnapshot' }
+  | { kind: 'properties'; target: ResidentPropertyTarget }
+  | { kind: 'sectionProperties' }
   | { kind: 'exportStructuredWithPages'; options: DocxPageExportOptions; currentRequest: string }
   | { kind: 'listContentControls'; options: DocxContentControlsOptions }
   | { kind: 'findContentControls'; query: DocxContentControlQuery; options: DocxContentControlsOptions }
+  | { kind: 'rangeHighlights'; ranges: YrsStoryRange[]; expectVersion: string; expectFrameEpoch?: number; expectLayoutRevision?: number }
   | { kind: 'paragraphIdentities' }
   | { kind: 'resolveParagraphAnchors'; anchors: DocxParagraphAnchor[] }
   | { kind: 'readParagraphs'; request: DocxReadParagraphsRequest }
+  | { kind: 'rawSelectionInfo'; selection: DocxCommandSelection }
   | { kind: 'findText'; request: DocxFindTextRequest }
   | { kind: 'findMatches'; searchText: string; options: FindOptions; expectVersion: string }
   | { kind: 'searchText'; query: string; caseSensitive: boolean; carry?: YrsStickyPosition | null }
   | ({ kind: 'findParagraphs'; query: string } & DocxFindParagraphsOptions)
   | { kind: 'stickyAnchors'; locs: YrsLoc[]; version: string }
   | { kind: 'navigationTarget'; story: string; paraId: string }
+  | { kind: 'anchorTargets'; targets: Exclude<AnchorGeometryTarget, { kind: 'proposal' }>[] }
   | { kind: 'pointPosition'; hit: PointPosition; expectVersion: string }
   | {
       kind: 'selectionUnit';
@@ -101,15 +135,23 @@ export type ResidentDocumentRead =
 
 /** @internal */
 export interface ResidentDocumentReadValues {
+  validateEdits: DocxValidationResult;
+  contentControlHandles: ResidentControlSnapshot;
+  partSnapshot: { metadata: ResidentPartMetadata; geometry: ResidentPartGeometry[]; frameEpoch: number | null; layoutRevision: number };
+  properties: ResidentPropertySnapshot | null;
+  sectionProperties: ResidentSectionSnapshot;
   exportStructuredWithPages: string;
   listContentControls: DocxContentControlsResult;
   findContentControls: DocxContentControlsResult;
+  rangeHighlights: ResidentRangeHighlights | null;
   paragraphIdentities: DocxParagraphIdentitySnapshot;
   resolveParagraphAnchors: { results: DocxParagraphAnchorResult[] };
   readParagraphs: DocxReadParagraphsResult;
+  rawSelectionInfo: YrsSelectionText;
   findText: DocxFindTextResult;
   findMatches: DocxFindDisplayMatch[] | null;
   navigationTarget: ReturnType<typeof resolveNavigationTarget>;
+  anchorTargets: ProposalGeometryTarget[];
   searchText: ResidentSearchResult;
   findParagraphs: DocxParagraphMatch[];
   stickyAnchors: Array<YrsStickyPosition | null>;
@@ -136,6 +178,13 @@ export type ResidentEngineWorkerHostModule = {
 
 export type ResidentEngineWorkerRequest =
   | { id: number; type: 'warm'; hostModule?: true }
+  | { id: number; type: 'openSource'; source: ResidentSourceOpenRequest }
+  | { id: number; type: 'commandInit'; request: ResidentCommandInitRequest }
+  | { id: number; type: 'edit'; command: DocxCommandEnvelope }
+  | { id: number; type: 'checkpoint' }
+  | { id: number; type: 'requestFullFrame' }
+  | { id: number; type: 'commandUpdate'; update: Uint8Array }
+  | { id: number; type: 'commandViewport'; request: ResidentCommandViewportRequest }
   | {
       id: number;
       type: 'bootstrap';
@@ -308,6 +357,12 @@ export type ResidentEngineWorkerResponse = (
   | {
       id: number;
       ok: true;
+      commandInitial?: ResidentCommandInitReply;
+      commandAck?: DocxCommandAck;
+      commandFrame?: { session: string; incarnation: number; epoch: number; frame: DocxCommandFrame };
+      fontEnvironmentEvent?: ResidentFontEnvironmentEvent & { session: string; incarnation: number; epoch: number };
+      fontEnvironment?: ResidentFontEnvironmentSnapshot;
+      checkpoint?: Checkpoint;
       frame?: ArrayBuffer;
       pageFrames?: ArrayBuffer[];
       pageBuildSuperseded?: boolean;
@@ -343,6 +398,7 @@ export type ResidentEngineWorkerResponse = (
       layoutProvisional?: boolean;
       /** An `open` reply: the opened package's host metadata JSON. */
       hostJson?: string;
+      sourceDocument?: Document;
       /** An `open` reply: the package cannot open as a preview; nothing was opened. */
       previewRefused?: boolean;
       /** A `fontRequirements` reply. */
@@ -368,6 +424,8 @@ export type ResidentEngineWorkerResponse = (
       id: number;
       ok: false;
       error: string;
+      commandError?: ReplyError;
+      failureCode?: SessionFailureCode;
       /** @internal */
       code?: 'save-unavailable';
       residentUnavailable?: boolean;

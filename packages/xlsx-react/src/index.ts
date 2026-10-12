@@ -7,16 +7,23 @@ export { XlsxEditor, XlsxSaveRefusedError } from './XlsxEditor';
 export type {
   XlsxEditorProps,
   XlsxEditorApi,
+  XlsxPointPosition,
   XlsxEditorCollaborationOptions,
   XlsxWorkerViewerApi,
   XlsxWorkerViewerProps,
 } from './XlsxEditor';
 /** @experimental */
-export type { XlsxWorkerEditorProps } from './XlsxEditor';
+export type { XlsxAsyncEditorProps, XlsxWorkerEditorProps } from './XlsxEditor';
+/** @experimental */
+export { XlsxAsyncApiSyncAccessError } from './worker/asyncApiErrors';
+export type { XlsxAsyncEditorApi } from './worker/createAsyncEditorApi';
 /** @experimental */
 export type { XlsxWorkerEditorApi } from './worker/createWorkerEditorApi';
 /** @experimental */
-export { XlsxPeerNotReadyError, XlsxWorkerEditorCollaborationError } from './worker/createWorkerEditorApi';
+export { XlsxAsyncApiUnavailableError, XlsxPeerNotReadyError, XlsxWorkerEditorCollaborationError } from './worker/createWorkerEditorApi';
+/** @experimental */
+export { XlsxWorkerSessionFailedError } from './worker/useEditableSessionWorkbook';
+export { XlsxWorkerEditorChunkLoadError } from './worker/XlsxWorkerEditor';
 export { EditorToolbar } from './components/EditorToolbar';
 export {
   Toolbar,
