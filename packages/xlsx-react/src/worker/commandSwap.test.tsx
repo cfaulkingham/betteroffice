@@ -33,7 +33,14 @@ function deferred<T>() {
 
 async function harness(maxPatches = 8) {
   const pair = createInProcessPair();
-  createWorkbookSessionHost(pair.host);
+  let disposeHost = () => {};
+  createWorkbookSessionHost({
+    ...pair.host,
+    listen(listener) {
+      disposeHost = () => listener({ protocol: 1, kind: 'dispose' });
+      return pair.host.listen(listener);
+    },
+  });
   const requests: string[] = [];
   const sequences = new Map<number, number>();
   const replies = new Map<number, () => void>();
@@ -78,6 +85,7 @@ async function harness(maxPatches = 8) {
     save() {}, restore() {}, setTransform() {}, beginPath() {}, clip() {}, clearRect() {}, rect() {},
     moveTo() {}, lineTo() {}, stroke() {}, setLineDash() {},
     fillRect() {}, fillText(value: string) { text.push(value); },
+    measureText(value: string) { return { width: value.length * 6 }; },
   } as unknown as CanvasRenderingContext2D;
   let source: WorkerPaintSource | undefined;
   const paintFailure = new Error('Canvas installation failed');
@@ -151,7 +159,10 @@ async function harness(maxPatches = 8) {
     requests, context, paintFailure, submit, held, deliver, installCurrent,
     bind: () => paintSource.installInitial(session.initialPaint?.frame),
     crash: (failure: SessionFailure) => crash!(failure),
-    dispose: async () => { off(); await run.dispose(); },
+    dispose: async () => {
+      off();
+      try { await run.dispose(); } finally { disposeHost(); }
+    },
   };
 }
 

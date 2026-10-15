@@ -8,10 +8,24 @@ export type PeerlessTextIntent = {
 }['insertText' | 'replaceSelection' | 'deleteBackward' | 'deleteForward' | 'paragraphBreak'];
 
 /** @internal */
-type PeerlessPropertyKind = 'setHyperlink' | 'setSectionProperties' | 'setWatermark';
+export type PeerlessPartIntent = { [K in 'openPart' | 'ensurePart' | 'removePart']: { kind: K; payload: DocxCommandPayloads[K] } }['openPart' | 'ensurePart' | 'removePart'];
+
+type PeerlessRulerKind = 'setSectionMargins' | 'setParagraphAttrs' | 'setTabStops' | 'removeTabStop';
+type PeerlessRulerIntent = { [K in PeerlessRulerKind]: { kind: K; payload: DocxCommandPayloads[K] } }[PeerlessRulerKind];
+
+type PeerlessPropertyKind = 'setHyperlink' | 'setObjectProperties' | 'setSectionProperties' | 'setNoteProperties' | 'setWatermark' | 'resizeObject' | 'moveObject';
 export type PeerlessPropertyIntent = { [K in PeerlessPropertyKind]: { kind: K; payload: DocxCommandPayloads[K] } }[PeerlessPropertyKind];
 
-export type PeerlessInputIntent = PeerlessPropertyIntent | PeerlessSelectionIntent | PeerlessTextIntent | { kind: 'undo' | 'redo'; payload: Record<string, never> } | { kind: 'replaceMatches'; payload: DocxCommandPayloads['replaceMatches'] } | { [K in 'setRenderEnvironment' | 'setFontEnvironment']: { kind: K; payload: DocxCommandPayloads[K] } }['setRenderEnvironment' | 'setFontEnvironment'];
+type PeerlessControlKind = 'setContentControlValue' | 'addRepeatingItem' | 'removeRepeatingItem';
+export type PeerlessControlIntent = { [K in PeerlessControlKind]: { kind: K; payload: DocxCommandPayloads[K] } }[PeerlessControlKind];
+
+type PeerlessTableKind = 'insertTableRow' | 'insertTableColumn' | 'deleteTableRow' | 'deleteTableColumn' | 'deleteTable' | 'mergeTableCells' | 'splitTableCell' | 'setTableCellShading';
+export type PeerlessTableIntent = { [K in PeerlessTableKind]: { kind: K; payload: Omit<DocxCommandPayloads[K], 'selection'> } }[PeerlessTableKind];
+
+export type PeerlessInputIntent = PeerlessProposalIntent | { [K in 'applyEdits' | 'addComment']: { kind: K; payload: DocxCommandPayloads[K] } }['applyEdits' | 'addComment'] | PeerlessControlIntent | PeerlessRulerIntent | PeerlessPropertyIntent | PeerlessPartIntent | PeerlessSelectionIntent | PeerlessTextIntent | PeerlessTableIntent | { kind: 'undo' | 'redo'; payload: Record<string, never> } | { kind: 'replaceMatches'; payload: DocxCommandPayloads['replaceMatches'] } | { [K in 'setRenderEnvironment' | 'setFontEnvironment']: { kind: K; payload: DocxCommandPayloads[K] } }['setRenderEnvironment' | 'setFontEnvironment'] | { [K in 'insertImage' | 'insertTable' | 'insertPageBreak' | 'insertSectionBreak' | 'pasteFragment']: { kind: K; payload: Omit<DocxCommandPayloads[K], 'selection'> } }['insertImage' | 'insertTable' | 'insertPageBreak' | 'insertSectionBreak' | 'pasteFragment'];
+
+type PeerlessProposalKind = 'propose' | 'setProposalStates' | 'withdrawProposals';
+export type PeerlessProposalIntent = { [K in PeerlessProposalKind]: { kind: K; payload: DocxCommandPayloads[K] } }[PeerlessProposalKind];
 
 const implicitVerticalGoals = new WeakSet<PeerlessInputIntent>();
 

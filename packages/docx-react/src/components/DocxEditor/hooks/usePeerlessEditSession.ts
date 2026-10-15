@@ -6,6 +6,7 @@ import type {
   DocxWorkerEditSession,
   DocxWorkerEditSessionOptions,
   ResidentCommandConnection,
+  ResidentCommandViewportRequest,
 } from '@betteroffice/docx/peerless';
 import { createPeerlessCommandBinding, type PeerlessCommandBinding } from '../peerless/commandBinding';
 import { createEchoPainter } from '../peerless/echoPainter';
@@ -21,12 +22,14 @@ export type PeerlessDocumentSource = Uint8Array | Document;
 
 export interface UsePeerlessEditSessionOptions {
   source: PeerlessDocumentSource;
-  openConnection(source: PeerlessDocumentSource, signal: AbortSignal): Promise<ResidentCommandConnection>;
+  rasterScale?: number;
+  openConnection(source: PeerlessDocumentSource, signal: AbortSignal, getRasterScale?: () => number): Promise<ResidentCommandConnection>;
   recovery?: DocxWorkerEditSessionOptions<PeerlessDocumentSource, PeerlessEchoIntent>['recovery'];
   canvasForPage(page: DocxCommandPageIdentity): HTMLCanvasElement | null;
   prepareGeometry(frame: DocxCommandFrame): PeerlessFrameGeometry | undefined;
-  canEchoFont?(family: string): boolean;
   onError?(error: Error): void;
+  /** Failures the editor survives, such as pages that cannot be painted until the viewport or zoom changes. */
+  onRecoverableError?(error: Error): void;
 }
 
 /** @internal */
@@ -38,6 +41,7 @@ export interface PeerlessEditSessionBinding {
   echoPainter: PeerlessEchoPainter;
   presentation: PeerlessFramePresentation;
   setDisplayWindow?(start: number, end: number): void;
+  setRasterScale?(scale: number): void;
 }
 
 /** @internal */
@@ -53,7 +57,8 @@ export function usePeerlessEditSession(
   const [result, setResult] = useState<UsePeerlessEditSessionResult>({ status: 'opening', binding: null, error: null });
   const callbacks = useRef(options);
   callbacks.current = options;
-  const { source } = options;
+  const { source, rasterScale = 1 } = options;
+  const appliedRasterScale = useRef(rasterScale);
   useEffect(() => {
     const controller = new AbortController();
     let binding: PeerlessEditSessionBinding | undefined;
@@ -97,7 +102,12 @@ export function usePeerlessEditSession(
     setResult({ status: 'opening', binding: null, error: null });
     void (async () => {
       try {
-        connection = await callbacks.current.openConnection(source, controller.signal);
+        const getRasterScale = () => {
+          appliedRasterScale.current = callbacks.current.rasterScale ?? 1;
+          return appliedRasterScale.current;
+        };
+        getRasterScale();
+        connection = await callbacks.current.openConnection(source, controller.signal, getRasterScale);
         if (controller.signal.aborted) {
           close();
           return;
@@ -111,21 +121,25 @@ export function usePeerlessEditSession(
         });
         cleanups.push(() => viewStore.dispose());
         const canvasForPage = (page: DocxCommandPageIdentity) => callbacks.current.canvasForPage(page);
-        const echoPainter = createEchoPainter({ canvasForPage, canEchoFont: family => callbacks.current.canEchoFont?.(family) ?? true });
+        const requestFullFrame = (settled: () => void = () => {}) => {
+          if (!connection || controller.signal.aborted) { settled(); return; }
+          const resident = connection;
+          void resident.requestFullFrame().then((ack) => {
+            settled();
+            if (!ack.frame) return;
+            if (!controller.signal.aborted && resident === connection && receiveRequestedFrame) receiveRequestedFrame(ack.frame);
+            else discardCommandPresentation(ack.frame);
+          }).catch((error: unknown) => {
+            settled();
+            if (!controller.signal.aborted) callbacks.current.onError?.(error instanceof Error ? error : new Error(String(error)));
+          });
+        };
+        const echoPainter = createEchoPainter({ canvasForPage, requestFullFrame });
         cleanups.push(() => echoPainter.dispose());
         const presentation = createFramePresentation({
           viewStore, echoPainter, canvasForPage, prepareGeometry: (frame) => callbacks.current.prepareGeometry(frame),
-          requestFullFrame: () => {
-            if (!connection || controller.signal.aborted) return;
-            const resident = connection;
-            void resident.requestFullFrame().then((ack) => {
-              if (!ack.frame) return;
-              if (!controller.signal.aborted && resident === connection && receiveRequestedFrame) receiveRequestedFrame(ack.frame);
-              else discardCommandPresentation(ack.frame);
-            }).catch((error: unknown) => {
-              if (!controller.signal.aborted) callbacks.current.onError?.(error instanceof Error ? error : new Error(String(error)));
-            });
-          },
+          requestFullFrame,
+          onError: (error) => { if (!controller.signal.aborted) callbacks.current.onRecoverableError?.(error); },
         });
         cleanups.push(() => presentation.dispose());
         const session = createDocxWorkerEditSession<PeerlessDocumentSource, PeerlessEchoIntent>({
@@ -167,7 +181,8 @@ export function usePeerlessEditSession(
         }
         const admission = createInputAdmission({ session, viewStore, echoPainter });
         cleanups.push(() => admission.dispose());
-        let viewport: { start: number; end: number } | undefined;
+        let displayWindow = { start: 0, end: 3 };
+        let viewport: Omit<ResidentCommandViewportRequest, 'frameEpoch'> | undefined;
         let viewportPending = false;
         const requestViewport = async () => {
           if (viewportPending || !connection?.requestViewport || controller.signal.aborted) return;
@@ -184,8 +199,15 @@ export function usePeerlessEditSession(
         };
         binding = { session, viewStore, admission, commands: createPeerlessCommandBinding(admission), echoPainter, presentation,
           setDisplayWindow(start, end) {
-            viewport = { start, end };
+            displayWindow = { start, end };
+            viewport = { ...viewport, ...displayWindow };
             void requestViewport();
+            presentation.invalidate();
+          },
+          setRasterScale(scale) {
+            viewport = { ...displayWindow, ...viewport, rasterScale: scale };
+            void requestViewport();
+            presentation.invalidate();
           },
         };
         unsubscribe = session.subscribe((state) => viewStore.acceptWorkerState({ session: initial.session, incarnation, epoch: state.epoch }, state));
@@ -200,5 +222,13 @@ export function usePeerlessEditSession(
       close();
     };
   }, [source]);
+  useEffect(() => {
+    if (result.status !== 'ready' || rasterScale === appliedRasterScale.current) return;
+    const timer = setTimeout(() => {
+      appliedRasterScale.current = rasterScale;
+      result.binding.setRasterScale?.(rasterScale);
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [result.binding, rasterScale]);
   return result;
 }

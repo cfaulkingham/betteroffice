@@ -89,6 +89,8 @@ mod inline_content;
 mod list_marker;
 pub mod media;
 mod resident_font;
+#[cfg_attr(not(feature = "wasm"), allow(dead_code))]
+mod resident_geometry;
 pub use resident_font::{ResidentFontError, decode_resident_font};
 mod op;
 mod ops;
@@ -107,6 +109,7 @@ mod section_margins;
 mod seed;
 mod segment_json;
 mod segments;
+mod stories;
 pub mod structured;
 mod target;
 mod undo;
@@ -144,7 +147,9 @@ pub use ops::paragraph::{
     STYLE_CONTROLLED_MARKS, STYLE_CONTROLLED_PARA_ATTRS, TabStop,
 };
 pub use ops::resolve::ChangeTarget;
-pub use ops::table::{CellLoc, TableLocator, TableRange, TableReceipt};
+pub use ops::table::{
+    CellLoc, FragmentCaret, TableFragmentReceipt, TableLocator, TableRange, TableReceipt,
+};
 pub use ops::text::RichRun;
 pub use peer_bootstrap::{PeerBootstrap, PeerBootstrapSource, PeerMetadataError};
 pub use queries::{
@@ -159,10 +164,11 @@ pub use seed::{
     seed_docx_preview, seed_from_docx, seed_from_docx_with_generation,
 };
 use segments::{ParagraphIndex, SegmentIndex, build_indexes};
+pub use stories::{AllStories, ListStoriesResponse, StoryInfo, StoryInfoKind, StorySelection};
 pub use target::{
     AtomKind, EditTextView, FindTextRequest, FindTextResponse, ParagraphTarget, ParagraphText,
-    ReadParagraphsRequest, ReadParagraphsResponse, SearchScope, TextAtom, TextMatch, TextPosition,
-    TextRange, TextTarget,
+    ReadParagraphsRequest, ReadParagraphsResponse, ReadStoriesRequest, ReadStoriesResponse,
+    SearchScope, StoryText, TextAtom, TextMatch, TextPosition, TextRange, TextTarget,
 };
 pub use undo::{DocUndoManager, UNDO_CAPTURE_TIMEOUT_MS, UNDO_DEPTH, UndoCaptureMode, UndoSession};
 
@@ -186,6 +192,7 @@ const PPR_DEL: &str = "pPrDel";
 const PPR_CHANGE: &str = "pPrChange";
 /// `_kind` of a hard-break embed.
 const BREAK_KIND: &str = "break";
+pub const MAX_UPDATE_BYTES: usize = 64 * 1024 * 1024;
 
 pub type EditResult<T> = Result<T, EditError>;
 pub type StoryId = String;
@@ -492,12 +499,44 @@ impl<T> Default for EpochCache<T> {
 struct StoryRevisions {
     current: u64,
     structure: u64,
+    geometry: u64,
+    sections: u64,
     stamped: HashMap<Arc<str>, u64>,
 }
 
 impl StoryRevisions {
     fn stamp(&mut self, txn: &yrs::TransactionMut, events: &yrs::types::Events) {
         self.current += 1;
+        if events.iter().any(|event| matches!(event, yrs::types::Event::Map(event)
+            if event.keys(txn).keys().any(|key| matches!(key.as_ref(), "sectPr" | "_sectionProperties" | "sectionBreakType")))) {
+            self.sections += 1;
+        }
+        if events.iter().any(|event| match event {
+            yrs::types::Event::Text(event) => event
+                .delta(txn)
+                .iter()
+                .any(|delta| !matches!(delta, Delta::Retain(_, _))),
+            yrs::types::Event::Map(event) => {
+                event.path().is_empty()
+                    || event.keys(txn).keys().any(|key| {
+                        matches!(
+                            key.as_ref(),
+                            KIND_KEY
+                                | PARA_ID
+                                | "rows"
+                                | "cells"
+                                | "story"
+                                | "tcPr"
+                                | "rowspan"
+                                | "colspan"
+                                | "content"
+                        )
+                    })
+            }
+            _ => true,
+        }) {
+            self.geometry += 1;
+        }
         if events.iter().any(|event| match event {
             yrs::types::Event::Text(event) => event.delta(txn).iter().any(|delta| match delta {
                 Delta::Inserted(Out::Any(Any::String(_)), _) | Delta::Retain(_, _) => false,
@@ -596,6 +635,7 @@ pub struct EditingDoc {
     paragraph_indexes: Mutex<EpochCache<ParagraphIndex>>,
     chunk_snapshots: Mutex<EpochCache<Vec<ops::Chunk>>>,
     table_membership: Mutex<Option<TableMembership>>,
+    resident_geometry: Mutex<HashMap<String, resident_geometry::ResidentGeometryIndex>>,
     shared_read_depth: AtomicU32,
     /// Story projections held only inside a shared-read scope.
     story_views: Mutex<EpochCache<target::StoryView>>,
@@ -660,6 +700,7 @@ impl EditingDoc {
             paragraph_indexes: Mutex::default(),
             chunk_snapshots: Mutex::default(),
             table_membership: Mutex::default(),
+            resident_geometry: Mutex::default(),
             shared_read_depth: AtomicU32::new(0),
             story_views: Mutex::default(),
             source: Mutex::new(None),
@@ -827,6 +868,25 @@ impl EditingDoc {
         if before.checked_add(1) != Some(after) {
             return;
         }
+        let at = self
+            .paragraph_indexes
+            .lock()
+            .unwrap()
+            .get(story_id, before)
+            .and_then(|paragraphs| {
+                paragraphs
+                    .para_at(index)
+                    .filter(|para| index >= para.node_start)
+                    .map(|para| (para.para_id.to_string(), index - para.node_start))
+            });
+        self.advance_resident_geometry(
+            story_id,
+            before,
+            after,
+            at.as_ref().map(|(id, offset)| (id.as_str(), *offset)),
+            text.encode_utf16().count() as i64,
+            true,
+        );
         {
             let mut indexes = self.paragraph_indexes.lock().unwrap();
             if let Some(mut paragraphs) = indexes.take(story_id, before) {
@@ -865,6 +925,25 @@ impl EditingDoc {
         if before.checked_add(1) != Some(after) {
             return;
         }
+        let at = self
+            .paragraph_indexes
+            .lock()
+            .unwrap()
+            .get(story_id, before)
+            .and_then(|paragraphs| {
+                paragraphs
+                    .para_at(start)
+                    .filter(|para| start <= end && start >= para.node_start && end <= para.pilcrow)
+                    .map(|para| (para.para_id.to_string(), end - para.node_start))
+            });
+        self.advance_resident_geometry(
+            story_id,
+            before,
+            after,
+            at.as_ref().map(|(id, offset)| (id.as_str(), *offset)),
+            -i64::from(end.saturating_sub(start)),
+            false,
+        );
         {
             let mut indexes = self.paragraph_indexes.lock().unwrap();
             if let Some(mut paragraphs) = indexes.take(story_id, before) {
@@ -1370,6 +1449,37 @@ impl EditingDoc {
         Ok(())
     }
 
+    pub fn update_comment_metadata(
+        &self,
+        comment_id: &str,
+        patch: BTreeMap<String, Any>,
+    ) -> EditResult<()> {
+        for (key, value) in &patch {
+            let valid = match key.as_str() {
+                "body" => true,
+                "author" | "date" => matches!(value, Any::String(_)),
+                "done" => matches!(value, Any::Bool(_)),
+                "parentId" => matches!(value, Any::String(_) | Any::Null),
+                _ => false,
+            };
+            if !valid {
+                return Err(EditError::InvalidComment(format!(
+                    "invalid metadata field {key}"
+                )));
+            }
+        }
+        let mut txn = self.doc.transact_mut_with(self.client_id);
+        let comments = txn.get_map(COMMENTS).expect("comments root is declared");
+        let comment = comments
+            .get(&txn, comment_id)
+            .and_then(|value| value.cast::<MapRef>().ok())
+            .ok_or_else(|| EditError::CommentNotFound(comment_id.to_owned()))?;
+        for (key, value) in patch {
+            comment.insert(&mut txn, key, value);
+        }
+        Ok(())
+    }
+
     pub fn comment_anchors(&self, comment_id: &str) -> EditResult<Vec<CommentAnchor>> {
         let txn = self.doc.transact();
         let comments = txn
@@ -1536,7 +1646,13 @@ impl EditingDoc {
         ))
     }
 
+    /// Applies a peer's update, refusing one over [`MAX_UPDATE_BYTES`].
     pub fn apply_update_v1(&self, bytes: &[u8]) -> EditResult<()> {
+        self.integrate_update(decode_peer_update_v1(bytes)?, UpdateOrigin::Remote)
+    }
+
+    /// Loads a whole document state, which the peer update cap does not cover.
+    pub(crate) fn load_state_v1(&self, bytes: &[u8]) -> EditResult<()> {
         let update = Update::decode_v1(bytes)
             .map_err(|error| EditError::InvalidUpdate(error.to_string()))?;
         self.integrate_update(update, UpdateOrigin::Remote)
@@ -1625,6 +1741,15 @@ impl EditingDoc {
         let counter = self.id_counter.fetch_add(1, Ordering::Relaxed);
         format!("{}:{counter}", self.client_id)
     }
+}
+
+pub(crate) fn decode_peer_update_v1(bytes: &[u8]) -> EditResult<Update> {
+    if bytes.len() > MAX_UPDATE_BYTES {
+        return Err(EditError::InvalidUpdate(format!(
+            "update exceeds {MAX_UPDATE_BYTES} bytes"
+        )));
+    }
+    Update::decode_v1(bytes).map_err(|error| EditError::InvalidUpdate(error.to_string()))
 }
 
 fn story_ref<T: ReadTxn>(txn: &T, story_id: &str) -> EditResult<TextRef> {
@@ -1896,6 +2021,37 @@ mod tests {
     }
 
     #[test]
+    fn peer_updates_over_the_size_cap_are_refused() {
+        let (a, b) = peers("one two", 1, 2);
+        a.insert_text(
+            &local("A"),
+            Position::new("body", 3),
+            "!",
+            FormatPolicy::Plain,
+        )
+        .unwrap();
+        let update = a.encode_state_as_update_v1();
+        let mut oversized = update.clone();
+        oversized.resize(MAX_UPDATE_BYTES + 1, 0);
+        let before = b.encode_state_as_update_v1();
+
+        let error = b.apply_update_v1(&oversized).unwrap_err();
+        assert_eq!(
+            error,
+            EditError::InvalidUpdate(format!("update exceeds {MAX_UPDATE_BYTES} bytes"))
+        );
+        assert!(presence::apply_update_with_typing_inference(&b, &oversized).is_err());
+        assert_eq!(b.encode_state_as_update_v1(), before);
+
+        b.apply_update_v1(&update).unwrap();
+        assert_eq!(b.encode_state_vector_v1(), a.encode_state_vector_v1());
+
+        let loaded = EditingDoc::new(3);
+        loaded.load_state_v1(&oversized).unwrap();
+        assert_eq!(loaded.encode_state_vector_v1(), a.encode_state_vector_v1());
+    }
+
+    #[test]
     fn story_revisions_name_the_stories_each_change_touched() {
         let (a, b) = peers("one two", 1, 2);
         let (since, stories) = b.stories_changed_since(0);
@@ -2012,6 +2168,58 @@ mod tests {
             p_style: "Normal".to_owned(),
             alignment: "left".to_owned(),
         }
+    }
+
+    #[test]
+    fn comment_metadata_preserves_anchors_and_history() {
+        let doc = seed("Alpha beta");
+        let id = doc
+            .add_comment(
+                &[StoryRange::new("body", 0, 5)],
+                "Ada",
+                DATE,
+                Any::from("Before"),
+            )
+            .unwrap();
+        let before = doc.resolve_comment(&id).unwrap();
+        let mut undo = doc.undo_manager();
+        doc.update_comment_metadata(
+            &id,
+            BTreeMap::from([
+                ("body".into(), Any::from("After")),
+                ("done".into(), Any::Bool(true)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(doc.resolve_comment(&id).unwrap(), before);
+        let read = || {
+            doc.list_comments()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.id == id)
+                .unwrap()
+        };
+        assert_eq!(read().body, Any::from("After"));
+        assert!(read().done);
+        assert!(undo.undo());
+        assert_eq!(read().body, Any::from("Before"));
+        assert!(undo.redo());
+        assert!(read().done);
+        assert!(
+            doc.update_comment_metadata(
+                &id,
+                BTreeMap::from([
+                    ("body".into(), Any::from("Invalid")),
+                    ("anchors".into(), Any::Null),
+                ])
+            )
+            .is_err()
+        );
+        assert_eq!(read().body, Any::from("After"));
+        assert!(
+            doc.update_comment_metadata("missing", BTreeMap::new())
+                .is_err()
+        );
     }
 
     #[test]

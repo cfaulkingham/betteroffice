@@ -82,8 +82,8 @@ use ooxml_drawingml::GeometryPathCommand;
 use ooxml_drawingml::chart::{
     PlotAxis, PlotAxisKind, PlotAxisRange, PlotAxisTitles, PlotChart, PlotChartText,
     PlotDataLabels, PlotGroup, PlotLegend, PlotLine, PlotMarker, PlotMarkerSymbol, PlotOp,
-    PlotPoint, PlotRect, PlotSeries, PlotSink, PlotTextAlign, PlotTextStyle, chart_aria_label,
-    fallback_label_width, plot_chart_into,
+    PlotPoint, PlotRect, PlotSeries, PlotSink, PlotTextAlign, PlotTextStyle, blank_numbers,
+    chart_aria_label, fallback_label_width, plot_chart_into,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -146,6 +146,19 @@ pub struct DisplayPage {
     /// places, so a host can find the page a position is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position_span: Option<[i64; 2]>,
+    /// For an unbuilt page, the header and footer parts its build paints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hf_parts: Option<HfParts>,
+}
+
+/// Relationship ids of the header and footer parts a page paints.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HfParts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -788,6 +801,8 @@ pub struct GlyphRunPrimitive {
     /// glyph `cluster`s index into it. REQUIRED.
     pub text: String,
     pub glyphs: Vec<PlacedGlyph>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub echo: Option<EchoRunFacts>,
     /// Guessed horizontal paint slot. Missing y/h leaves ink vertically unbounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paint_clip: Option<ClipRect>,
@@ -821,6 +836,57 @@ pub struct GlyphRunPrimitive {
     pub text_effect: Option<String>,
     #[serde(flatten)]
     pub attrs: DocAttrs,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EchoRunFacts {
+    #[serde(serialize_with = "echo_coordinate")]
+    pub x: f64,
+    #[serde(serialize_with = "echo_coordinate")]
+    pub right: f64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub kern: bool,
+    #[serde(default, skip_serializing_if = "echo_zero")]
+    pub kerning: f64,
+    #[serde(default = "echo_primary", skip_serializing_if = "echo_is_primary")]
+    pub primary_font: bool,
+    #[serde(default, skip_serializing_if = "echo_zero")]
+    pub letter_spacing: f64,
+    #[serde(default, skip_serializing_if = "echo_zero")]
+    pub position: f64,
+    #[serde(default = "echo_scale", skip_serializing_if = "echo_default_scale")]
+    pub scale: f64,
+    #[serde(default)]
+    pub can_empty: bool,
+}
+
+fn echo_coordinate<S: serde::Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+    if value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_991.0 {
+        serializer.serialize_i64(*value as i64)
+    } else {
+        serializer.serialize_f64(*value)
+    }
+}
+
+fn echo_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
+fn echo_primary() -> bool {
+    true
+}
+
+fn echo_is_primary(value: &bool) -> bool {
+    *value
+}
+
+fn echo_scale() -> f64 {
+    100.0
+}
+
+fn echo_default_scale(value: &f64) -> bool {
+    *value == echo_scale()
 }
 
 /// One positioned glyph inside a [`GlyphRunPrimitive`].
@@ -1178,6 +1244,50 @@ pub struct BuildInput {
     resolved_comment_ids: Vec<i64>,
     comment_authors: Vec<CommentAuthorIn>,
     comment_threads: Vec<CommentThreadIn>,
+    unreadable: Vec<UnreadableDisplayInput>,
+}
+
+/// Display input the compiler could not read and left unpainted instead of
+/// failing the document: a measured block, whose fragments then paint
+/// nothing, or one fragment of a layout page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableDisplayInput {
+    /// Canonical key of the block.
+    pub block: String,
+    /// Layout page of an unreadable fragment; `None` for a measured block.
+    pub page: Option<usize>,
+    pub reason: String,
+}
+
+/// Records `entry` and reports it once per thread, so a block that stays
+/// unreadable across rebuilds warns once; the set restarts when it fills.
+fn record_unreadable(unreadable: &mut Vec<UnreadableDisplayInput>, entry: UnreadableDisplayInput) {
+    std::thread_local! {
+        static REPORTED: std::cell::RefCell<HashSet<u64>> = std::cell::RefCell::new(HashSet::new());
+    }
+    let fingerprint = {
+        let mut hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(&(&entry.block, entry.page, &entry.reason), &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    };
+    if REPORTED.with(|reported| {
+        let mut reported = reported.borrow_mut();
+        if reported.len() >= 1024 {
+            reported.clear();
+        }
+        reported.insert(fingerprint)
+    }) {
+        let place = entry.page.map_or_else(
+            || "measured block".to_owned(),
+            |page| format!("page {page} fragment of block"),
+        );
+        crate::warn_degraded(&format!(
+            "display list left {place} {:?} unpainted: {}",
+            entry.block, entry.reason
+        ));
+    }
+    unreadable.retain(|known| known.block != entry.block || known.page != entry.page);
+    unreadable.push(entry);
 }
 
 /// Parsed display input retained by the editing engine across edits. Its fields
@@ -1196,6 +1306,11 @@ impl ResidentDisplayInput {
     pub fn font_chains(&self) -> &HashMap<String, Vec<u32>> {
         &self.input.font_chains
     }
+
+    /// What the retained input left unpainted because it could not be read.
+    pub fn unreadable(&self) -> &[UnreadableDisplayInput] {
+        &self.input.unreadable
+    }
 }
 
 impl std::fmt::Debug for ResidentDisplayInput {
@@ -1203,7 +1318,8 @@ impl std::fmt::Debug for ResidentDisplayInput {
         let mut debug = formatter.debug_struct("ResidentDisplayInput");
         debug
             .field("measured_blocks", &self.input.measured.len())
-            .field("pages", &self.input.layout.pages.len());
+            .field("pages", &self.input.layout.pages.len())
+            .field("unreadable", &self.input.unreadable);
         #[cfg(any(test, feature = "test-support"))]
         debug.field(
             "stale_block_pruning_passes",
@@ -1285,6 +1401,7 @@ impl<'de> Deserialize<'de> for BuildInput {
             resolved_comment_ids: wire.resolved_comment_ids,
             comment_authors: wire.comment_authors,
             comment_threads: wire.comment_threads,
+            unreadable: Vec::new(),
         })
     }
 }
@@ -1548,6 +1665,10 @@ enum RunIn {
 #[derive(Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 struct RunFormattingIn {
+    #[serde(default)]
+    font_slots: Option<crate::types::RunFontSlots>,
+    #[serde(default)]
+    complex_script: Option<bool>,
     #[serde(default)]
     bold: Option<bool>,
     #[serde(default)]
@@ -2350,7 +2471,7 @@ struct ChartSeriesIn {
     name: Option<String>,
     #[serde(default)]
     categories: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "blank_numbers::deserialize")]
     values: Vec<f64>,
     #[serde(default)]
     color: Option<String>,
@@ -2360,9 +2481,9 @@ struct ChartSeriesIn {
     grouping: Option<String>,
     #[serde(default)]
     marker: Option<Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "blank_numbers::deserialize")]
     x_values: Vec<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "blank_numbers::deserialize")]
     bubble_sizes: Vec<f64>,
     #[serde(default)]
     smooth: bool,
@@ -3876,6 +3997,8 @@ fn slice_utf16_with_total(text: &str, total: usize, start: usize, end: usize) ->
 }
 
 fn resolve_line_segments<'a>(runs: &'a [RunIn], line: &LineIn) -> Vec<ResolvedSegment<'a>> {
+    #[cfg(any(test, feature = "test-support"))]
+    crate::work_counters::resolved_line();
     let mut out = Vec::new();
     for run_index in line.head_run..=line.tail_run {
         let Some(run) = runs.get(run_index) else {
@@ -5343,6 +5466,7 @@ fn build_display_list_selected(
             note_areas,
             unbuilt: false,
             position_span: None,
+            hf_parts: None,
         });
     }
 
@@ -5992,6 +6116,7 @@ fn emit_line(
     block_ref: &BlockRef,
     ctx: &RenderCtx<'_>,
 ) -> Option<LinePaintMetrics> {
+    let echo_start = prims.len();
     let segments = resolve_line_segments(&block.runs, line);
     let attrs = block.attrs.as_ref();
     let auto_space = ooxml_text::AutoSpace::from_options(
@@ -6122,7 +6247,8 @@ fn emit_line(
         align_shift
     };
 
-    let mut pen_x = geom.frag_x + pad_left + text_indent + left_offset + align_shift;
+    let echo_x = geom.frag_x + pad_left + text_indent + left_offset;
+    let mut pen_x = echo_x + align_shift;
     let line_bottom = geom.line_top + line.line_height;
     // Word hangs the baseline off the box top: whatever the spacing rule adds
     // beyond ascent + descent is leading below the descent, never centered.
@@ -6643,6 +6769,16 @@ fn emit_line(
         }
     }
 
+    for primitive in &mut prims[echo_start..] {
+        if let Primitive::GlyphRun(run) = primitive {
+            if geom.is_rtl || !matches!(geom.alignment, None | Some("left")) {
+                run.echo = None;
+            } else if let Some(echo) = &mut run.echo {
+                echo.x = echo_x;
+                echo.right = echo_x + usable_width;
+            }
+        }
+    }
     Some(LinePaintMetrics {
         end_x: pen_x,
         baseline,
@@ -7152,6 +7288,16 @@ fn try_emit_glyph_runs(
     if chain.is_empty() {
         return false;
     }
+    let echo_font_route = fmt.complex_script != Some(true)
+        && fmt.font_slots.as_ref().is_none_or(|slots| {
+            slots.ascii == slots.h_ansi
+                && slots.ascii_theme == slots.h_ansi_theme
+                && slots
+                    .ascii
+                    .as_deref()
+                    .is_none_or(|name| name.eq_ignore_ascii_case(family))
+                && slots.hint.as_deref().is_none_or(|hint| hint == "default")
+        });
 
     let size_px = effective_font_px_of(fmt);
     let features = kern_features_of(fmt, size_px);
@@ -7357,6 +7503,17 @@ fn try_emit_glyph_runs(
             color: color.to_string(),
             text: sub_text,
             glyphs: placed,
+            echo: Some(EchoRunFacts {
+                x: 0.0,
+                right: 0.0,
+                kern: features.is_empty(),
+                kerning: fmt.kerning_min_pt.unwrap_or(0.0),
+                primary_font: echo_font_route && chain.first() == Some(&font),
+                letter_spacing: fmt.letter_spacing.unwrap_or(0.0),
+                position: fmt.position_px.unwrap_or(0.0),
+                scale: fmt.horizontal_scale.unwrap_or(100.0),
+                can_empty: false,
+            }),
             paint_clip: paint_clip.clone(),
             word_spacing: word_spacing.clone(),
             rtl,
@@ -10975,6 +11132,7 @@ pub fn build_resident_display_list_partial_with_fonts_observed(
                 page,
                 index,
                 layout_page_position_span(&layout.pages[index], &blocks)?,
+                input.headers_footers.as_ref(),
             )),
         })
         .collect::<Result<_, String>>()?;
@@ -11055,12 +11213,19 @@ pub fn release_resident_display_pages(
     let replacements = wanted
         .iter()
         .map(|&index| {
-            let page = convert_resident_page(&mut transcoder, &layout.pages[index], false)
-                .map_err(|error| format!("parse resident display layout page: {error}"))?;
+            let page = convert_resident_page(
+                &mut transcoder,
+                &layout.pages[index],
+                index,
+                false,
+                &mut Vec::new(),
+            )
+            .map_err(|error| format!("parse resident display layout page: {error}"))?;
             let placeholder = unbuilt_page_with_span(
                 &page,
                 index,
                 layout_page_position_span(&layout.pages[index], &blocks)?,
+                resident.input.headers_footers.as_ref(),
             );
             Ok((index, page, placeholder))
         })
@@ -11069,6 +11234,10 @@ pub fn release_resident_display_pages(
         resident.input.layout.pages[index] = page;
         list.pages[index] = placeholder;
     }
+    resident
+        .input
+        .unreadable
+        .retain(|known| known.page.is_none_or(|page| !wanted.contains(&page)));
     prune_resident_display_measured(resident, list);
     Ok(wanted)
 }
@@ -11084,6 +11253,7 @@ fn prune_resident_display_measured(resident: &mut ResidentDisplayInput, list: &D
     resident.input.measured.retain(|measured| {
         measured_block_key(measured).is_some_and(|key| keys.contains(key.as_ref()))
     });
+    prune_unreadable_blocks(&mut resident.input);
 }
 
 /// The affected pages' source blocks by canonical key, first occurrence winning.
@@ -11114,6 +11284,7 @@ fn unbuilt_page_with_span(
     page: &PageIn,
     page_index: usize,
     position_span: Option<[i64; 2]>,
+    headers_footers: Option<&crate::hf_bands::HeadersFootersIn>,
 ) -> DisplayPage {
     let (content_bounds, column_bounds) = page_content_geometry(page);
     DisplayPage {
@@ -11136,6 +11307,9 @@ fn unbuilt_page_with_span(
         note_areas: Vec::new(),
         unbuilt: true,
         position_span,
+        hf_parts: headers_footers
+            .map(|hf| crate::hf_bands::page_parts(hf, page, page_index))
+            .filter(|parts| parts.header.is_some() || parts.footer.is_some()),
     }
 }
 
@@ -11233,7 +11407,8 @@ fn resident_build_input_for(
         .and_then(|s| serde_json::from_str(&s))
         .map_err(|e| format!("parse resident display input: {e}"))?;
     let mut transcoder = crate::transcode::Transcoder::default();
-    let layout = convert_resident_layout(&mut transcoder, layout, pages)
+    let mut unreadable = Vec::new();
+    let layout = convert_resident_layout(&mut transcoder, layout, pages, &mut unreadable)
         .map_err(|e| format!("parse resident display input: {e}"))?;
     let placed: Option<HashSet<Cow<'_, str>>> = pages.map(|pages| {
         pages
@@ -11250,9 +11425,8 @@ fn resident_build_input_for(
                 resident_block_key(&measured.block).is_some_and(|key| keys.contains(key.as_ref()))
             })
         })
-        .map(|measured| transcoder.convert(measured))
-        .collect::<Result<Vec<MeasuredBlockIn>, _>>()
-        .map_err(|e| format!("parse resident display input: {e}"))?;
+        .filter_map(|measured| convert_measured_block(&mut transcoder, measured, &mut unreadable))
+        .collect();
     drop(placed);
     let options = transcoder
         .convert(&pagination.options)
@@ -11282,7 +11456,50 @@ fn resident_build_input_for(
         resolved_comment_ids: extras.resolved_comment_ids,
         comment_authors: extras.comment_authors,
         comment_threads: extras.comment_threads,
+        unreadable,
     })
+}
+
+/// Drops the measured-block entries of blocks no retained page places.
+fn prune_unreadable_blocks(input: &mut BuildInput) {
+    let placed: HashSet<Cow<'_, str>> = input
+        .layout
+        .pages
+        .iter()
+        .flat_map(|page| page.fragments.iter().filter_map(fragment_block_key_ref))
+        .collect();
+    input
+        .unreadable
+        .retain(|known| known.page.is_some() || placed.contains(known.block.as_str()));
+}
+
+/// Converts one measured block, or records it as unreadable and leaves it out
+/// so that only its own fragments go unpainted.
+fn convert_measured_block(
+    transcoder: &mut crate::transcode::Transcoder,
+    measured: &crate::types::MeasuredBlock,
+    unreadable: &mut Vec<UnreadableDisplayInput>,
+) -> Option<MeasuredBlockIn> {
+    let key = resident_block_key(&measured.block).map(Cow::into_owned);
+    match transcoder.convert(measured) {
+        Ok(block) => {
+            if let Some(key) = key {
+                unreadable.retain(|known| known.page.is_some() || known.block != key);
+            }
+            Some(block)
+        }
+        Err(reason) => {
+            record_unreadable(
+                unreadable,
+                UnreadableDisplayInput {
+                    block: key.unwrap_or_default(),
+                    page: None,
+                    reason,
+                },
+            );
+            None
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -11299,19 +11516,46 @@ struct ResidentPageMetadata<'a> {
     section_page_index: Option<u64>,
     section_page_number: Option<u64>,
     page_label: &'a Option<String>,
+    number: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    header_footer_refs: &'a Option<crate::types::HeaderFooterRefs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parity_filler: Option<bool>,
 }
 
 fn convert_resident_page(
     transcoder: &mut crate::transcode::Transcoder,
     page: &crate::types::Page,
+    index: usize,
     build: bool,
+    unreadable: &mut Vec<UnreadableDisplayInput>,
 ) -> Result<PageIn, String> {
     #[cfg(any(test, feature = "test-support"))]
     let build = build || resident_conversion_test_support::force_full();
     if build {
         #[cfg(any(test, feature = "test-support"))]
         resident_conversion_test_support::count_pages(1);
-        return transcoder.convert(page);
+        return transcoder.convert(page).or_else(|error| {
+            let mut readable = page.clone();
+            readable.fragments.retain(|fragment| {
+                let Err(reason) = transcoder.convert::<_, FragmentIn>(fragment) else {
+                    return true;
+                };
+                record_unreadable(
+                    unreadable,
+                    UnreadableDisplayInput {
+                        block: resident_fragment_block_key(fragment).into_owned(),
+                        page: Some(index),
+                        reason,
+                    },
+                );
+                false
+            });
+            if readable.fragments.len() == page.fragments.len() {
+                return Err(error);
+            }
+            transcoder.convert(&readable)
+        });
     }
     transcoder.convert(&ResidentPageMetadata {
         size: &page.size,
@@ -11323,6 +11567,9 @@ fn convert_resident_page(
         section_page_index: page.section_page_index,
         section_page_number: page.section_page_number,
         page_label: &page.page_label,
+        number: page.number,
+        header_footer_refs: &page.header_footer_refs,
+        parity_filler: page.parity_filler,
     })
 }
 
@@ -11330,23 +11577,17 @@ fn convert_resident_layout(
     transcoder: &mut crate::transcode::Transcoder,
     layout: &crate::types::Layout,
     pages: Option<&HashSet<usize>>,
+    unreadable: &mut Vec<UnreadableDisplayInput>,
 ) -> Result<LayoutIn, String> {
-    #[cfg(any(test, feature = "test-support"))]
-    let force_full = resident_conversion_test_support::force_full();
-    #[cfg(not(any(test, feature = "test-support")))]
-    let force_full = false;
-    if pages.is_none() || force_full {
-        #[cfg(any(test, feature = "test-support"))]
-        resident_conversion_test_support::count_pages(layout.pages.len());
-        return transcoder.convert(layout);
-    }
-    let pages = pages.unwrap();
     Ok(LayoutIn {
         pages: layout
             .pages
             .iter()
             .enumerate()
-            .map(|(index, page)| convert_resident_page(transcoder, page, pages.contains(&index)))
+            .map(|(index, page)| {
+                let build = pages.is_none_or(|pages| pages.contains(&index));
+                convert_resident_page(transcoder, page, index, build, unreadable)
+            })
             .collect::<Result<_, _>>()?,
         partial: layout.partial,
         cached_page_totals: layout.cached_page_totals,
@@ -11678,6 +11919,7 @@ pub fn update_resident_display_list_incremental_partial_with_fonts_shifts(
                 &resident.input.layout.pages[page_index],
                 page_index,
                 layout_page_position_span(&layout.pages[page_index], &blocks)?,
+                resident.input.headers_footers.as_ref(),
             );
         }
     }
@@ -11720,12 +11962,19 @@ fn refresh_resident_display_pages_reading(
     let mut selected_blocks = HashSet::new();
     let mut transcoder = crate::transcode::Transcoder::default();
     for page_index in rebuilt_pages {
+        let mut recorded = Vec::new();
         let page = convert_resident_page(
             &mut transcoder,
             &layout.pages[page_index],
+            page_index,
             reading.contains(&page_index),
+            &mut recorded,
         )
         .map_err(|error| format!("parse resident display layout page: {error}"))?;
+        input
+            .unreadable
+            .retain(|known| known.page != Some(page_index));
+        input.unreadable.extend(recorded);
         if reading.contains(&page_index) {
             for fragment in &layout.pages[page_index].fragments {
                 selected_blocks.insert(resident_fragment_block_key(fragment));
@@ -11735,6 +11984,7 @@ fn refresh_resident_display_pages_reading(
     }
 
     if selected_blocks.is_empty() {
+        prune_unreadable_blocks(input);
         return Ok(());
     }
     let mut current_indices = HashMap::new();
@@ -11745,6 +11995,7 @@ fn refresh_resident_display_pages_reading(
     }
     let mut pending_blocks = selected_blocks;
     let mut added_blocks = false;
+    let mut unreadable_indices = Vec::new();
     for measured in &pagination.measured {
         if pending_blocks.is_empty() {
             break;
@@ -11755,7 +12006,11 @@ fn refresh_resident_display_pages_reading(
         if !pending_blocks.remove(key.as_ref()) {
             continue;
         }
-        let block = convert_resident_value(measured, "resident display measured block")?;
+        let Some(block) = convert_measured_block(&mut transcoder, measured, &mut input.unreadable)
+        else {
+            unreadable_indices.extend(current_indices.get(key.as_ref()).copied());
+            continue;
+        };
         match current_indices.get(key.as_ref()) {
             Some(&index) => input.measured[index] = block,
             None => {
@@ -11768,6 +12023,10 @@ fn refresh_resident_display_pages_reading(
         return Err(format!(
             "resident pagination measured block {key:?} is missing"
         ));
+    }
+    unreadable_indices.sort_unstable();
+    for index in unreadable_indices.into_iter().rev() {
+        input.measured.remove(index);
     }
     if added_blocks && !input.defer_stale_block_pruning {
         #[cfg(any(test, feature = "test-support"))]
@@ -11783,9 +12042,11 @@ fn refresh_resident_display_pages_reading(
             measured_block_key(measured).is_none_or(|key| keys.contains(key.as_ref()))
         });
     }
+    prune_unreadable_blocks(input);
     Ok(())
 }
 
+#[cfg(test)]
 fn convert_resident_value<T: Serialize, U: DeserializeOwned>(
     input: &T,
     label: &str,
@@ -12266,6 +12527,165 @@ mod tests {
         );
     }
 
+    /// Every page's header and footer parts, built and as unbuilt placeholders of a partial
+    /// build of page 0 and of a full build releasing every other page.
+    fn placeholder_and_built_parts(
+        pagination: &crate::types::Input,
+        layout: &crate::types::Layout,
+        extras: &str,
+    ) -> (Vec<HfParts>, Vec<HfParts>, Vec<HfParts>) {
+        let fonts = ooxml_text::FontStore::default();
+        let painted = |page: &DisplayPage| HfParts {
+            header: page.header.as_ref().map(|region| region.r_id.clone()),
+            footer: page.footer.as_ref().map(|region| region.r_id.clone()),
+        };
+        let placeholder = |page: &DisplayPage| {
+            assert!(page.unbuilt);
+            page.hf_parts.clone().unwrap_or_default()
+        };
+        let full = build_display_list(
+            &resident_build_input(pagination, layout, extras).unwrap(),
+            &fonts,
+        );
+        let (_, partial) = build_resident_display_list_partial_with_fonts_observed(
+            pagination,
+            layout,
+            extras,
+            &fonts,
+            &|index| index == 0,
+            &mut || {},
+        )
+        .unwrap();
+        let (mut resident, mut released) = build_resident_display_list_partial_with_fonts_observed(
+            pagination,
+            layout,
+            extras,
+            &fonts,
+            &|_| true,
+            &mut || {},
+        )
+        .unwrap();
+        let rest: Vec<usize> = (1..layout.pages.len()).collect();
+        release_resident_display_pages(pagination, layout, &mut resident, &mut released, &rest)
+            .unwrap();
+        (
+            full.pages.iter().skip(1).map(painted).collect(),
+            partial.pages.iter().skip(1).map(placeholder).collect(),
+            released.pages.iter().skip(1).map(placeholder).collect(),
+        )
+    }
+
+    #[test]
+    fn unbuilt_placeholders_name_the_header_and_footer_parts_their_build_paints() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut names: Vec<String> = std::fs::read_dir(&fixtures)
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                name.strip_suffix(".input.json").map(str::to_owned)
+            })
+            .collect();
+        names.sort();
+        let extras = r#"{"contractVersion":2,"fontChains":{"arial|0|0":[]},"headersFooters":{
+            "titlePg":true,"evenAndOddHeaders":true,"variants":[
+            {"rId":"rIdH1","kind":"header","type":"default"},
+            {"rId":"rIdH2","kind":"header","type":"even"},
+            {"rId":"rIdF1","kind":"footer","type":"first"}]}}"#;
+        let mut headers = std::collections::BTreeSet::new();
+        for name in names {
+            let text =
+                std::fs::read_to_string(fixtures.join(format!("{name}.input.json"))).unwrap();
+            let mut pagination = serde_json::from_str::<crate::types::Input>(&text)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let layout = crate::compute_layout_input(&mut pagination)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let (painted, partial, released) =
+                placeholder_and_built_parts(&pagination, &layout, extras);
+            assert_eq!(partial, painted, "{name}");
+            assert_eq!(released, painted, "{name}");
+            headers.extend(painted.into_iter().filter_map(|parts| parts.header));
+        }
+        assert_eq!(headers.into_iter().collect::<Vec<_>>(), ["rIdH1", "rIdH2"]);
+    }
+
+    #[test]
+    fn placeholders_follow_section_refs_page_numbers_and_parity_fillers() {
+        let paragraph = |id: u64, text: &str| {
+            serde_json::json!({
+                "block": {"kind": "paragraph", "id": id, "runs": [{"kind": "text", "text": text}], "attrs": {}},
+                "measure": {"kind": "paragraph", "totalHeight": 24, "lines": [{
+                    "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": text.len(),
+                    "width": 120, "ascent": 19.2, "descent": 4.8, "lineHeight": 24
+                }]}
+            })
+        };
+        let page_break = |id: u64| serde_json::json!({"block": {"kind": "pageBreak", "id": id}, "measure": {"kind": "pageBreak"}});
+        let geometry = serde_json::json!({"pageSize": {"w": 800, "h": 1000}, "margins": {"top": 80, "right": 80, "bottom": 80, "left": 80}});
+        let mut section_break =
+            serde_json::json!({"kind": "sectionBreak", "id": 5, "type": "oddPage"});
+        section_break["pageSize"] = geometry["pageSize"].clone();
+        section_break["margins"] = geometry["margins"].clone();
+        let mut pagination: crate::types::Input = serde_json::from_value(serde_json::json!({
+            "measured": [
+                paragraph(0, "One"), page_break(1), paragraph(2, "Two"), page_break(3),
+                paragraph(4, "Three"),
+                {"block": section_break, "measure": {"kind": "sectionBreak"}},
+                paragraph(6, "Four"), page_break(7), paragraph(8, "Five"), page_break(9),
+                paragraph(10, "Six"),
+            ],
+            "options": {"pageSize": geometry["pageSize"], "margins": geometry["margins"], "pageGap": 20, "bodyBreakType": "oddPage"},
+        }))
+        .unwrap();
+        let mut layout = crate::compute_layout_input(&mut pagination).unwrap();
+        let regions: crate::regions::DocumentRegions = serde_json::from_value(serde_json::json!({
+            "evenAndOddHeaders": true,
+            "sections": [
+                {"headerFooterRefs": {"headerDefault": "rIdA", "headerEven": "rIdE", "footerDefault": "rIdF"}},
+                {"titlePg": true, "headerFooterRefs": {"headerFirst": "rIdB", "headerEven": "rIdC"}}
+            ]
+        }))
+        .unwrap();
+        crate::regions::apply_document_regions(&mut layout, &regions);
+        assert!(
+            layout
+                .pages
+                .iter()
+                .any(|page| page.parity_filler == Some(true))
+        );
+        assert!(
+            layout
+                .pages
+                .iter()
+                .all(|page| page.header_footer_refs.is_some())
+        );
+        let extras = r#"{"contractVersion":2,"fontChains":{"arial|0|0":[]},"headersFooters":{
+            "evenAndOddHeaders":true,"titlePageSections":[1],"variants":[
+            {"rId":"rIdA","kind":"header","type":"default"},
+            {"rId":"rIdE","kind":"header","type":"even","sectionIndex":0},
+            {"rId":"rIdZ","kind":"header","type":"default","sectionIndex":1},
+            {"rId":"rIdB","kind":"header","type":"first","sectionIndex":1},
+            {"rId":"rIdC","kind":"header","type":"even","sectionIndex":1},
+            {"rId":"rIdF","kind":"footer","type":"default"}]}}"#;
+        let (painted, partial, released) =
+            placeholder_and_built_parts(&pagination, &layout, extras);
+        assert_eq!(partial, painted);
+        assert_eq!(released, painted);
+        let filler = layout
+            .pages
+            .iter()
+            .position(|page| page.parity_filler == Some(true))
+            .unwrap();
+        assert_eq!(painted[filler - 1], HfParts::default());
+        let headers: std::collections::BTreeSet<_> = painted
+            .iter()
+            .filter_map(|parts| parts.header.as_deref())
+            .collect();
+        assert_eq!(
+            headers.into_iter().collect::<Vec<_>>(),
+            ["rIdA", "rIdB", "rIdC", "rIdE"]
+        );
+    }
+
     fn table_split_fixture() -> crate::types::Input {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/table-splits-with-repeated-header.input.json");
@@ -12579,11 +12999,13 @@ mod tests {
             let metadata = convert_resident_page(
                 &mut crate::transcode::Transcoder::default(),
                 &layout.pages[0],
+                0,
                 false,
+                &mut Vec::new(),
             )
             .unwrap();
             assert!(metadata.fragments.is_empty());
-            let mut page = unbuilt_page_with_span(&metadata, 0, Some([10, 20]));
+            let mut page = unbuilt_page_with_span(&metadata, 0, Some([10, 20]), None);
             shift_unbuilt_span(
                 &mut page,
                 Some(&layout.pages[0]),
@@ -14599,5 +15021,224 @@ mod tests {
             .expect("child shape with original id");
         assert!(child.get("docStart").is_none());
         assert!(child.get("docEnd").is_none());
+    }
+
+    /// A body paragraph followed by a three-category column chart.
+    fn charted_page(values: Value) -> (crate::types::Input, crate::types::Layout) {
+        let mut pagination: crate::types::Input = serde_json::from_value(serde_json::json!({
+            "options": {
+                "pageSize": {"w": 816, "h": 1056},
+                "margins": {"top": 96, "right": 96, "bottom": 96, "left": 96}
+            },
+            "measured": [
+                {
+                    "block": {"kind": "paragraph", "id": "intro", "attrs": {}, "pmStart": 1, "pmEnd": 7,
+                              "runs": [{"kind": "text", "text": "Intro", "pmStart": 1, "pmEnd": 6}]},
+                    "measure": {"kind": "paragraph", "totalHeight": 24, "lines": [{
+                        "headRun": 0, "headChar": 0, "tailRun": 0, "tailChar": 5,
+                        "width": 40, "ascent": 19, "descent": 5, "lineHeight": 24
+                    }]}
+                },
+                {
+                    "block": {"kind": "chart", "id": "sales", "width": 300, "height": 200, "chart": {
+                        "chartType": "column",
+                        "series": [{"name": "Sales", "categories": ["A", "B", "C"],
+                                    "values": values, "color": "#4472C4"}]
+                    }},
+                    "measure": {"kind": "chart", "width": 300, "height": 200}
+                }
+            ]
+        }))
+        .unwrap();
+        let layout = crate::compute_layout_input(&mut pagination).unwrap();
+        (pagination, layout)
+    }
+
+    /// The chart rects in the series colour: its bars and its legend key.
+    fn series_rects(page: &DisplayPage) -> usize {
+        page.primitives
+            .iter()
+            .filter(|primitive| {
+                matches!(primitive, Primitive::Rect(rect)
+                    if rect.attrs.chart.is_some() && rect.fill.eq_ignore_ascii_case("#4472c4"))
+            })
+            .count()
+    }
+
+    fn paints_block(page: &DisplayPage, key: &str) -> bool {
+        serde_json::to_value(&page.primitives)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|primitive| primitive["blockKey"] == key)
+    }
+
+    #[test]
+    fn a_blank_chart_point_leaves_a_gap_in_both_display_input_paths() {
+        let fonts = ooxml_text::FontStore::default();
+        let (pagination, layout) = charted_page(serde_json::json!([2, 1, 3]));
+        let complete =
+            build_display_list_value_from_resident_with_fonts(&pagination, &layout, "{}", &fonts)
+                .unwrap();
+        let rects = series_rects(&complete.pages[0]);
+        assert!(rects >= 3);
+
+        let (pagination, layout) = charted_page(serde_json::json!([2, null, 3]));
+        let (resident, list) = build_resident_display_list_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &mut || {},
+        )
+        .expect("a blank chart point must not fail the document");
+        assert!(resident.unreadable().is_empty());
+        assert_eq!(series_rects(&list.pages[0]), rects - 1);
+        assert!(paints_block(&list.pages[0], "intro"));
+        let json = build_display_list(
+            &resident_build_input_via_json(&pagination, &layout, "{}"),
+            &fonts,
+        );
+        assert_eq!(json, list);
+    }
+
+    #[test]
+    fn an_unreadable_measured_block_leaves_only_its_own_fragments_unpainted() {
+        let fonts = ooxml_text::FontStore::default();
+        let (mut pagination, layout) = charted_page(serde_json::json!([2, 1, 3]));
+        let clean =
+            build_display_list_value_from_resident_with_fonts(&pagination, &layout, "{}", &fonts)
+                .unwrap();
+        assert!(paints_block(&clean.pages[0], "intro"));
+        let rects = series_rects(&clean.pages[0]);
+        let crate::types::BlockExtent::Paragraph(extent) = &mut pagination.measured[0].measure
+        else {
+            unreachable!()
+        };
+        extent.lines[0].width = f64::NAN;
+        let unreadable = |resident: &ResidentDisplayInput| {
+            resident
+                .unreadable()
+                .iter()
+                .map(|entry| (entry.block.clone(), entry.page))
+                .collect::<Vec<_>>()
+        };
+        let (resident, list) = build_resident_display_list_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &mut || {},
+        )
+        .expect("one unreadable block must not fail the document");
+        assert!(!paints_block(&list.pages[0], "intro"));
+        assert_eq!(series_rects(&list.pages[0]), rects);
+        assert_eq!(unreadable(&resident), [("intro".to_owned(), None)]);
+
+        let (mut resident, mut list) = build_resident_display_list_partial_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &|_| false,
+            &mut || {},
+        )
+        .unwrap();
+        build_resident_display_pages_with_fonts(
+            &pagination,
+            &layout,
+            &fonts,
+            &mut resident,
+            &mut list,
+            &[0],
+        )
+        .expect("one unreadable block must not fail the page");
+        assert!(!paints_block(&list.pages[0], "intro"));
+        assert_eq!(series_rects(&list.pages[0]), rects);
+        assert_eq!(unreadable(&resident), [("intro".to_owned(), None)]);
+    }
+
+    #[test]
+    fn a_refresh_tracks_a_block_turning_unreadable_and_readable_again() {
+        let fonts = ooxml_text::FontStore::default();
+        let (clean, layout) = charted_page(serde_json::json!([2, 1, 3]));
+        let (mut resident, mut list) = build_resident_display_list_with_fonts_observed(
+            &clean,
+            &layout,
+            "{}",
+            &fonts,
+            &mut || {},
+        )
+        .unwrap();
+        let mut broken = clean.clone();
+        let crate::types::BlockExtent::Paragraph(extent) = &mut broken.measured[0].measure else {
+            unreachable!()
+        };
+        extent.lines[0].width = f64::NAN;
+        let mut refresh = |pagination: &crate::types::Input| {
+            assert!(
+                update_resident_display_list_incremental_with_fonts_observed(
+                    pagination,
+                    &layout,
+                    &fonts,
+                    &mut resident,
+                    &mut list,
+                    0,
+                    1,
+                    &[],
+                    &HashMap::new(),
+                    &mut || {},
+                )
+                .unwrap()
+            );
+            (
+                paints_block(&list.pages[0], "intro"),
+                resident
+                    .unreadable()
+                    .iter()
+                    .map(|entry| entry.block.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(refresh(&broken), (false, vec!["intro".to_owned()]));
+        assert_eq!(refresh(&clean), (true, Vec::new()));
+    }
+
+    #[test]
+    fn an_unreadable_layout_fragment_leaves_the_rest_of_its_page_painted() {
+        let fonts = ooxml_text::FontStore::default();
+        let (pagination, mut layout) = charted_page(serde_json::json!([2, 1, 3]));
+        let clean =
+            build_display_list_value_from_resident_with_fonts(&pagination, &layout, "{}", &fonts)
+                .unwrap();
+        assert!(paints_block(&clean.pages[0], "intro"));
+        let rects = series_rects(&clean.pages[0]);
+        let Some(crate::types::Fragment::Paragraph(fragment)) = layout.pages[0]
+            .fragments
+            .iter_mut()
+            .find(|fragment| matches!(fragment, crate::types::Fragment::Paragraph(_)))
+        else {
+            unreachable!()
+        };
+        fragment.x = f64::INFINITY;
+        let (resident, list) = build_resident_display_list_with_fonts_observed(
+            &pagination,
+            &layout,
+            "{}",
+            &fonts,
+            &mut || {},
+        )
+        .expect("one unreadable fragment must not fail the document");
+        assert!(!paints_block(&list.pages[0], "intro"));
+        assert_eq!(series_rects(&list.pages[0]), rects);
+        assert_eq!(
+            resident
+                .unreadable()
+                .iter()
+                .map(|entry| (entry.block.as_str(), entry.page))
+                .collect::<Vec<_>>(),
+            [("intro", Some(0))]
+        );
     }
 }

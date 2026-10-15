@@ -4,6 +4,8 @@ import type { DisplayPage } from '../layout/render/displayList';
 import { createDisplayListQueries } from '../layout/render/displayListQueries';
 import { loadRustDisplayListQueryEngine, type RustDisplayListQueryEngine } from '../layout/render/rustDisplayList';
 import type { DocxCommandFrame, ResidentCommandHooks, ResidentCommandInitRequest } from './residentCommandProtocol';
+import { readCellSelection } from './residentCommandTableSelection';
+import { readResidentCellSelectionRects } from './residentObjectGeometry';
 
 function commandFrames(options: { cell?: boolean; range?: boolean; splitEnd?: boolean; queryEngine?: RustDisplayListQueryEngine } = {}) {
   const source = readFileSync(`${import.meta.dir}/residentEngineWorker.ts`, 'utf8');
@@ -56,7 +58,7 @@ function commandFrames(options: { cell?: boolean; range?: boolean; splitEnd?: bo
   const nativeBuilds: number[] = [];
   const focus = () => ({ story, paraId: 'paragraph', offset: (options.splitEnd ? 20 : caretPage * 100 + 1) + offsetDelta });
   const engine = {
-    proposalEngine: { version: () => String(version) }, retainedHeadersFootersJson: () => null,
+    proposalEngine: { version: () => String(version) }, retainedHeadersFootersJson: () => null, partGeometry: () => [],
     geometryReader: { locateParagraph: () => ({ start: 7, end: 7 + (options.splitEnd ? 20 : 2000) }) },
     setDisplayWindow: (...window: number[]) => { windows.push(window); },
     setDisplayRetainBuiltPages(retain: boolean) { retainBuilt = retain; }, applyUpdate() {},
@@ -80,12 +82,14 @@ function commandFrames(options: { cell?: boolean; range?: boolean; splitEnd?: bo
       for (const index of indices) { pages[index]!.page.unbuilt = true; pages[index]!.page.primitives = []; }
       return advance(expected, indices);
     },
+    cellSelection: () => null,
     residentCaretSnapshot: () => ({ frameEpoch: revision, caretRect: options.cell || pages[caretPage]!.page.unbuilt ? null
       : { pageId: String(caretPage + 1), pageIndex: caretPage, x: 0, y: 0, height: 20 } }),
   };
   const init: ResidentCommandInitRequest = { session: 'viewport', incarnation: 1, epoch: 1, readOnly: false,
     fonts: [], layoutInput: '{}', layoutWithRegions: true, layoutRevision: 1, extras: '{}', displayWindow: [0, 3] };
   const dependencies = { engine: { ...engine, partGeometry: () => [] }, fonts: { snapshot: null }, init, layoutRevision: 1, revision: 0, relayout() {},
+    layoutPreviewVersion: 0, readResidentFrameGeometry: async () => undefined,
     hooks: { selection: () => ({ anchor: { ...focus(), offset: focus().offset - (options.range ? 1 : 0) }, focus: focus() }),
       editState: () => ({ storedMarks: null }) },
     displayPositionIndex: () => ({ positionOf: (at: { offset: number }) => {
@@ -108,7 +112,9 @@ function commandFrames(options: { cell?: boolean; range?: boolean; splitEnd?: bo
       state.retainedFrame.frameEpoch = revision;
       return { bytes, delta, caret: engine.residentCaretSnapshot() };
     },
+    readCellSelection, readResidentCellSelectionRects,
     projectCommandEchoContext: () => undefined,
+    commandEchoGlyphs: () => ({ provider: () => undefined, unsent: () => [], sent() {} }),
     readResidentRangeHighlights: async () => ({ rects: [[]] }),
     retainedPageByKey: (_frame: unknown, id: string) => pages[Number(id) - 1],
     offscreenDpr: 1, offscreenZoom: 1,

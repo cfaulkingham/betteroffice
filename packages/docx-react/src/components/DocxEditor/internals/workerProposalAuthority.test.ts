@@ -460,6 +460,22 @@ test('mirrored proposal navigation uses no worker reads and unknown targets use 
   expect(main).not.toHaveBeenCalled();
 });
 
+test('story reads take one worker read each', async () => {
+  const h = harness();
+  await h.authority.initialize();
+  const listed = { ok: true as const, version: 'worker-1', stories: [{ story: 'body', kind: 'body' as const, root: 'body' }] };
+  h.worker.documentRead.mockResolvedValueOnce({ version: 'worker-1', value: listed } as never);
+  expect(await h.authority.listStories(unusedMain)).toEqual(listed);
+  const request = { stories: ['header'], byRoot: true, view: 'accepted' } as const;
+  const value = { ok: true as const, version: 'worker-1', view: 'accepted' as const, stories: [], truncated: false };
+  h.worker.documentRead.mockResolvedValueOnce({ version: 'worker-1', value } as never);
+  expect(await h.authority.readStories(request, unusedMain)).toEqual(value);
+  expect(h.worker.documentRead.mock.calls.map(([read]): unknown => read)).toEqual([
+    { kind: 'listStories' },
+    { kind: 'readStories', request },
+  ]);
+});
+
 test('mirrored navigation waits for preceding mutations and reads their new geometry', async () => {
   const h = harness();
   h.worker.proposal.mockResolvedValueOnce(navigationReply());
@@ -1340,6 +1356,24 @@ function editorRoundHarness(laidOut = async () => {}) {
   });
   return { session, worker, authority, peerUpdated, events };
 }
+
+test('unchanged editor reinitialization notifies readiness subscribers', async () => {
+  const h = editorRoundHarness();
+  const readiness: boolean[] = [];
+  h.authority.subscribe(() => { readiness.push(h.authority.initialized); });
+  await h.authority.initialize();
+  expect(readiness).toEqual([true]);
+  const geometry = h.authority.geometry();
+  const snapshot = h.authority.snapshot();
+  h.authority.restart();
+  expect(readiness).toEqual([true, false]);
+  await h.authority.initialize();
+  expect(h.authority.initialized).toBe(true);
+  expect(h.authority.geometry()).toBe(geometry);
+  expect(h.authority.snapshot()).toEqual(snapshot);
+  expect(h.events).toEqual(['snapshot', 'snapshot']);
+  expect(readiness).toEqual([true, false, true]);
+});
 
 test('integrated proposal updates notify peerUpdated only for changed stories', async () => {
   const h = editorRoundHarness();

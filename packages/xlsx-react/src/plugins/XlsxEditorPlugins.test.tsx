@@ -39,7 +39,7 @@ import {
   type XlsxCommandResult,
   type XlsxCommandStore,
   type XlsxEditorApi,
-  type XlsxEditorProps,
+  type XlsxInThreadEditorProps,
   type XlsxAsyncEditorProps,
   type XlsxPlugin,
   type XlsxPluginCommandResult,
@@ -169,10 +169,10 @@ function recorder(id = 'acme.review', extra: Partial<XlsxPluginDefinition<State>
   return { plugin, log, events, contexts };
 }
 
-async function mount(props: Partial<XlsxEditorProps> = {}, strict = false) {
+async function mount(props: Partial<XlsxInThreadEditorProps> = {}, strict = false) {
   const ready: XlsxEditorApi[] = [];
-  const element = (next: Partial<XlsxEditorProps>) => {
-    const editor = <XlsxEditor file={fixture} onReady={(api) => void ready.push(api)} {...next} />;
+  const element = (next: Partial<XlsxInThreadEditorProps>) => {
+    const editor = <XlsxEditor legacySyncApi experimentalWorkerOpen={false} file={fixture} onReady={(api) => void ready.push(api)} {...next} />;
     return strict ? <StrictMode>{editor}</StrictMode> : editor;
   };
   const view = render(element(props));
@@ -181,7 +181,7 @@ async function mount(props: Partial<XlsxEditorProps> = {}, strict = false) {
     api: () => last(ready),
     ready,
     view,
-    rerender: (next: Partial<XlsxEditorProps>) => view.rerender(element(next)),
+    rerender: (next: Partial<XlsxInThreadEditorProps>) => view.rerender(element(next)),
   };
 }
 
@@ -1342,7 +1342,7 @@ describe('XlsxEditor plugins', () => {
     function Host() {
       const [file, setFile] = useState(fixture);
       return (
-        <XlsxEditor
+        <XlsxEditor legacySyncApi experimentalWorkerOpen={false}
           file={file}
           plugins={plugins}
           onReady={(api) => {
@@ -2246,7 +2246,7 @@ describe('XlsxEditor plugin adapters', () => {
       panel: { title: 'Review', placement: 'right', render: () => <p>panel</p> },
     });
     const view = render(
-      <XlsxEditor
+      <XlsxEditor legacySyncApi experimentalWorkerOpen={false}
         file={fixture}
         plugins={[plugin]}
         onReady={() => {
@@ -2393,7 +2393,14 @@ describe('XlsxEditor plugin adapters', () => {
   });
 
   test('plugin reads wait for a chart nudge and refuse during a chart drag', async () => {
-    const [chart] = openWorkbook(charted.slice()).displayList({ x: 0, y: 0, ...VIEWPORT }).charts!;
+    const [chart] = (() => {
+      const workbook = openWorkbook(charted.slice());
+      try {
+        return workbook.displayList({ x: 0, y: 0, ...VIEWPORT }).charts!;
+      } finally {
+        workbook.dispose();
+      }
+    })();
     const center = {
       clientX: chart.clip.x + chart.clip.w / 2,
       clientY: chart.clip.y + chart.clip.h / 2,

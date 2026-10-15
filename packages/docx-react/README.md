@@ -70,6 +70,12 @@ of a document's first pages before the whole document opens, then hands them
 over to it; the editor stays read-only until then. It is ignored with
 collaboration.
 
+`pageMirror="text"` keeps only readable text, links and tables in the
+worker-only editor's accessible page DOM instead of a positioned copy of every
+line. Long documents scroll with less work, but assistive tech can no longer
+locate text on the page and plugin DOM range queries find no elements. The
+default is `"full"`.
+
 `onFirstPagePainted` is called once per document when its first pages are painted
 on screen, from the preview or the full document, so a host can drop its loading
 state before the whole document is open.
@@ -462,6 +468,23 @@ const review = defineDocxPlugin<State>({
   `preferredSize` is clamped to 40% of the editor. In a narrow editor side docks
   show their tabs, and a tab opens its panel as a drawer over the document that
   Escape closes. Collapsing a panel keeps the plugin running.
+- **Story reads.** `read.listStories()` lists every story in id order with its
+  kind (`body`, `tableCell`, `contentControl`, `header`, `footer`, `footnote`,
+  `endnote` or `other`; comment bodies are not session stories), its `root`, the
+  story a cell or block control sits in, and a header's or footer's `part` and
+  `uses`: the sections whose properties reference the part, inheritance applied,
+  whether or not a page shows it (anchor geometry tells where it is painted).
+  `read.readStories({ stories, byRoot, view, expectVersion })` reads `'all'`
+  stories, or listed kinds and story ids in their order without repeats, in one
+  call. An entry naming a kind is a kind, matching each story's own kind unless
+  `byRoot` matches its root's: `['header']` with `byRoot` includes header table
+  cells, and `['body']` with `byRoot` selects everything under the body. Worker viewers, the
+  default for read-only editors without `collaboration`, answer each with one
+  worker read. A story that cannot be read reports its own failure, the read
+  limits stop the read with `truncated`, a story larger than the limits on its
+  own reports `limit-exceeded` (page it with `readParagraphs` and `paraIds`),
+  and `expectVersion` refuses a changed
+  document with `stale-version`.
 - **Geometry.** `context.geometry` is null until a rendered layout shows the
   current version, and whenever it falls behind. `geometry.dom` answers in
   pages-container units divided by zoom; `geometry.toOverlayRect(rect)` converts
@@ -478,6 +501,9 @@ const review = defineDocxPlugin<State>({
   stale or unpainted layout, and `layout-change` repeats once the pages have painted
   a layout that arrived before its pixels; `layout.previewVersion` is the proposal
   preview the pixels show.
+  A target in a header or footer has fragments on every built page that paints it
+  and its anchor on the first; one that no laid-out page paints, built or not, is
+  `missing-target` once the layout is complete.
   The layer ignores the
   pointer; interactive overlay elements set `pointer-events: auto`.
   `snapshot.selection.displayRange` belongs to one layout and is never an edit

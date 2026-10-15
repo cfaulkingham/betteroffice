@@ -31,9 +31,7 @@ This fork maintains the editor and engine changes used by [Field Station](https:
 
 - **Real-time collaboration.** People and agents edit the same file together,
   with live cursors and selections. Concurrent changes merge automatically,
-  and offline edits sync when peers reconnect. The reference relay checkpoints
-  stored updates and rehydrates rooms after restarts, preserving CRDT identities.
-  Its 24-hour idle expiration still applies.
+  and offline edits sync when peers reconnect.
 
 - **Undo and redo.** Navigate editing history and undo accepted agent
   proposals as a single step.
@@ -41,9 +39,6 @@ This fork maintains the editor and engine changes used by [Field Station](https:
 - **Embed or automate.** Drop React editors into your app, build on the
   framework-free JavaScript cores, or use Rust and Python APIs for headless
   processing and agent workflows.
-
-- **Host-controlled XLSX editing.** XLSX hosts can intercept saving, flush drafts and accepted clipboard input,
-  and query the cell under a pointer without moving the selection.
 
 - **Open source and self-hostable.** Apache-2.0 licensed, with control over
   your document storage, deployment, and collaboration infrastructure.
@@ -53,25 +48,14 @@ This fork maintains the editor and engine changes used by [Field Station](https:
 
 ## Packages
 
-### Agent tools
-
-[`@betteroffice/agents`](packages/agents) provides grep-style discovery, bounded reads,
-and reviewable edits for DOCX, with initial XLSX cell/formula and PPTX slide-text
-prototypes. DOCX also supports rendered previews and tracked changes.
-Use its TypeScript SDK with an existing document session or connect the local
-`betteroffice-mcp` server to an agent. All three formats support proposed export
-and save/reopen checks; live-session attachment and PNG previews are DOCX-only.
-
 ### Documents — `.docx`
 
 | package | registry | what it does |
 |---|---|---|
 | [`betteroffice-docx`](https://crates.io/crates/betteroffice-docx) | crates.io | typed Rust API for opening, editing, laying out, and saving DOCX documents |
-| [`@betteroffice/docx`](https://www.npmjs.com/package/@betteroffice/docx) | npm | framework-free .docx editor core — parsing, CRDT editing, and page layout in Rust through WebAssembly |
+| [`@betteroffice/docx`](https://www.npmjs.com/package/@betteroffice/docx) | npm | framework-free .docx editor core: parsing, CRDT editing, and page layout in Rust through WebAssembly |
 | [`@betteroffice/docx-react`](https://www.npmjs.com/package/@betteroffice/docx-react) | npm | drop-in React .docx editor |
 | [`betteroffice-docx`](https://pypi.org/project/betteroffice-docx/) | PyPI | Python API for reading, editing, laying out, and rasterizing DOCX documents |
-
-Unrecognized drawing markup inside DOCX runs survives editor saves.
 
 ### Spreadsheets — `.xlsx`
 
@@ -87,7 +71,7 @@ Unrecognized drawing markup inside DOCX runs survives editor saves.
 | package | registry | what it does |
 |---|---|---|
 | [`betteroffice-pptx`](https://crates.io/crates/betteroffice-pptx) | crates.io | typed Rust API for opening, editing, rendering, and saving PPTX presentations |
-| [`@betteroffice/pptx`](https://www.npmjs.com/package/@betteroffice/pptx) | npm | framework-free .pptx editor core — slide model, masters, image insertion, shape ordering, and rendering in Rust through WebAssembly |
+| [`@betteroffice/pptx`](https://www.npmjs.com/package/@betteroffice/pptx) | npm | framework-free .pptx editor core: slide model, masters, editing, and rendering in Rust through WebAssembly |
 | [`@betteroffice/pptx-react`](https://www.npmjs.com/package/@betteroffice/pptx-react) | npm | drop-in React .pptx editor |
 | [`betteroffice-pptx`](https://pypi.org/project/betteroffice-pptx/) | PyPI | Python API for reading, editing, saving, and laying out PPTX presentations |
 
@@ -95,10 +79,27 @@ Unrecognized drawing markup inside DOCX runs survives editor saves.
 
 VSDX packages build from this repository; see the [VSDX guide](https://docs.betteroffice.dev/docs/vsdx).
 
+### Agent tools
+
+[`@betteroffice/agents`](packages/agents) lets agents search, read, edit and preview DOCX, XLSX
+and PPTX files through a TypeScript SDK or the `betteroffice-mcp` server.
+
 What to install for which language, with a first example each:
 [npm](https://docs.betteroffice.dev/docs/javascript),
 [crates.io](https://docs.betteroffice.dev/docs/rust),
 [PyPI](https://docs.betteroffice.dev/docs/python).
+
+## Evals
+
+`gpt-6-luna` via `codex exec`, one run per task, on the [format eval suite](eval/README.md): 10 DOCX, 10 XLSX and 10 PPTX edits. A task passes only if the edit is correct and the rest of the file is untouched.
+
+| | Generic file tools | BetterOffice MCP |
+|---|---|---|
+| DOCX | 6/10 | **10/10** |
+| XLSX | 0/10 | **10/10** |
+| PPTX | 8/10 | **10/10** |
+
+Generic: shell and Python with python-docx, openpyxl and python-pptx, no network. BetterOffice: only the `@betteroffice/agents` MCP server.
 
 <!-- BEGIN GENERATED VISUAL FIDELITY -->
 ## Benchmarks
@@ -110,35 +111,35 @@ What to install for which language, with a first example each:
 Page agreement is reported separately from SSIM.
 
 <table>
-<tr><th width="180"></th><th width="230" align="right">BetterOffice (<a href="https://www.npmjs.com/package/@betteroffice/docx/v/0.3.0">0.3.0</a>)</th><th width="230" align="right">BetterOffice (<a href="https://github.com/openooxml/betteroffice/commit/a0204b228b301eb5f284dbabec1ab0a490cc6856">a0204b22</a>)</th><th width="230" align="right">LibreOffice (26.2.3.2)</th></tr>
-<tr><td>Exact page counts</td><td align="right">63/63</td><td align="right">63/63</td><td align="right">44/63</td></tr>
-<tr><td>Absolute page error</td><td align="right">0</td><td align="right">0</td><td align="right">57</td></tr>
-<tr><td>SSIM</td><td align="right">0.8381</td><td align="right">0.8381</td><td align="right">0.7694</td></tr>
-<tr><td>Scored/total</td><td align="right">63/63</td><td align="right">63/63</td><td align="right">63/63</td></tr>
-<tr><td>Render time (avg)</td><td align="right">485 ms</td><td align="right">484 ms</td><td align="right">758 ms</td></tr>
-<tr><td>Parse success</td><td align="right">100.00%</td><td align="right">100.00%</td><td align="right">100.00%</td></tr>
+<tr><th width="180"></th><th width="230" align="right">BetterOffice (<a href="https://github.com/openooxml/betteroffice/commit/3a49caad7db3114258669913e6eda9a066c50dd8">3a49caad</a>)</th><th width="230" align="right">LibreOffice (26.2.3.2)</th></tr>
+<tr><td>Exact page counts</td><td align="right">63/63</td><td align="right">44/63</td></tr>
+<tr><td>Absolute page error</td><td align="right">0</td><td align="right">57</td></tr>
+<tr><td>SSIM</td><td align="right">0.8519</td><td align="right">0.7694</td></tr>
+<tr><td>Scored/total</td><td align="right">63/63</td><td align="right">63/63</td></tr>
+<tr><td>Render time (avg)</td><td align="right">430 ms</td><td align="right">773 ms</td></tr>
+<tr><td>Parse success</td><td align="right">100.00%</td><td align="right">100.00%</td></tr>
 </table>
 
 
 ### PPTX
 
 <table>
-<tr><th width="180"></th><th width="230" align="right">BetterOffice (<a href="https://www.npmjs.com/package/@betteroffice/pptx/v/0.2.0">0.2.0</a>)</th><th width="230" align="right">BetterOffice (<a href="https://github.com/openooxml/betteroffice/commit/a0204b228b301eb5f284dbabec1ab0a490cc6856">a0204b22</a>)</th><th width="230" align="right">LibreOffice (26.2.3.2)</th></tr>
-<tr><td>SSIM</td><td align="right">0.9169</td><td align="right">0.9169</td><td align="right">0.9030</td></tr>
-<tr><td>Scored/total</td><td align="right">103/103</td><td align="right">103/103</td><td align="right">103/103</td></tr>
-<tr><td>Render time (avg)</td><td align="right">157 ms</td><td align="right">157 ms</td><td align="right">1324 ms</td></tr>
-<tr><td>Parse success</td><td align="right">100.00%</td><td align="right">100.00%</td><td align="right">100.00%</td></tr>
+<tr><th width="180"></th><th width="230" align="right">BetterOffice (<a href="https://github.com/openooxml/betteroffice/commit/3a49caad7db3114258669913e6eda9a066c50dd8">3a49caad</a>)</th><th width="230" align="right">LibreOffice (26.2.3.2)</th></tr>
+<tr><td>SSIM</td><td align="right">0.9170</td><td align="right">0.9030</td></tr>
+<tr><td>Scored/total</td><td align="right">103/103</td><td align="right">103/103</td></tr>
+<tr><td>Render time (avg)</td><td align="right">159 ms</td><td align="right">1351 ms</td></tr>
+<tr><td>Parse success</td><td align="right">100.00%</td><td align="right">100.00%</td></tr>
 </table>
 
 ### XLSX
 
 <table>
-<tr><th width="180"></th><th width="230" align="right">BetterOffice (<a href="https://www.npmjs.com/package/@betteroffice/xlsx/v/0.3.0">0.3.0</a>)</th><th width="230" align="right">BetterOffice (<a href="https://github.com/openooxml/betteroffice/commit/a0204b228b301eb5f284dbabec1ab0a490cc6856">a0204b22</a>)</th><th width="230" align="right">LibreOffice (26.2.3.2)</th></tr>
-<tr><td>SSIM</td><td align="right">0.7661</td><td align="right">0.7661</td><td align="right">0.6892</td></tr>
-<tr><td>Scored/total</td><td align="right">207/208</td><td align="right">207/208</td><td align="right">195/208</td></tr>
-<tr><td>Recalc accuracy</td><td align="right">99.60%</td><td align="right">99.60%</td><td align="right">85.87%</td></tr>
-<tr><td>Recalc time (avg)</td><td align="right">95 ms</td><td align="right">95 ms</td><td align="right">448 ms</td></tr>
-<tr><td>Parse success</td><td align="right">100.00%</td><td align="right">100.00%</td><td align="right">100.00%</td></tr>
+<tr><th width="180"></th><th width="230" align="right">BetterOffice (<a href="https://github.com/openooxml/betteroffice/commit/3a49caad7db3114258669913e6eda9a066c50dd8">3a49caad</a>)</th><th width="230" align="right">LibreOffice (26.2.3.2)</th></tr>
+<tr><td>SSIM</td><td align="right">0.7661</td><td align="right">0.6892</td></tr>
+<tr><td>Scored/total</td><td align="right">207/208</td><td align="right">195/208</td></tr>
+<tr><td>Recalc accuracy</td><td align="right">99.60%</td><td align="right">85.87%</td></tr>
+<tr><td>Recalc time (avg)</td><td align="right">64 ms</td><td align="right">405 ms</td></tr>
+<tr><td>Parse success</td><td align="right">100.00%</td><td align="right">100.00%</td></tr>
 </table>
 
 For how scores, timings and coverage are measured, see the [benchmark methodology](scripts/office-quality/README.md).
@@ -167,8 +168,7 @@ bun run rust:check   # fmt + clippy + tests for the engines
 
 Run `bun run test:e2e:browser` for headless browser tests of all three editors.
 The [E2E guide](e2e/README.md) also covers pinned corpus scenarios,
-cross-SDK checks, and operation profiles. The XLSX and PPTX JavaScript cores expose
-opt-in operation timings; the native XLSX facade also reports edit stage timings.
+cross-SDK checks, and operation profiles.
 
 Use the [Office visual quality harness](scripts/office-quality/README.md) to export Word, PowerPoint, and Excel references, compare local renders, or refresh the fidelity scores with the manual action.
 

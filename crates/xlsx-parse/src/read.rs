@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use quick_xml::events::Event;
 use xlsx_model::addr::{MAX_COLS, MAX_ROWS};
+use xlsx_model::workbook::ColumnRuns;
 use xlsx_model::{
     Cell, CellRange, CellRef, CellValue, ColStyle, DateSystem, DefinedName, ErrorValue, FreezePane,
     Hyperlink, Sheet, SheetFormat, SheetId, Stylesheet, Table, Workbook,
@@ -17,12 +18,14 @@ use crate::xml::{
     resolve_part_path, xml_err,
 };
 use crate::{
-    MAX_CELLS, MAX_COL_STYLES, MAX_DEFINED_NAMES, MAX_HYPERLINKS, MAX_SHARED_STRINGS,
-    MAX_TABLE_COLUMNS, MAX_TABLES, ParseError,
+    MAX_CELLS, MAX_COL_STYLES, MAX_DEFINED_NAMES, MAX_HYPERLINKS, MAX_ROW_STYLES,
+    MAX_SHARED_STRINGS, MAX_TABLE_COLUMNS, MAX_TABLES, ParseError,
 };
 
 /// excel's row-height ceiling in points.
 const MAX_ROW_HEIGHT_PT: f64 = 409.5;
+/// excel's column-width ceiling in characters.
+const MAX_COL_WIDTH_CHARS: f64 = 255.0;
 
 /// parse a full workbook from opc parts, resolving sheets through the
 /// workbook relationships.
@@ -79,7 +82,7 @@ pub(crate) fn parse_workbook_indexed(
         };
     let styles_bytes = typed_part(parts, wb_rels, "styles", "xl/styles.xml")?;
     let theme_bytes = typed_part(parts, wb_rels, "theme", "xl/theme/theme1.xml")?;
-    let (styles, legacy_styles) = parse_stylesheet(styles_bytes, theme_bytes)?;
+    let (mut styles, legacy_styles) = parse_stylesheet(styles_bytes, theme_bytes)?;
 
     let mut sheets = Vec::with_capacity(meta.sheets.len());
     let mut shared_string_cells = Vec::with_capacity(meta.sheets.len());
@@ -129,6 +132,15 @@ pub(crate) fn parse_workbook_indexed(
         legacy_dimensions.push(legacy);
     }
 
+    if styles.cell_xfs.is_empty()
+        && sheets.iter().any(|sheet| {
+            sheet.row_styles.values().any(|&style| style == 0)
+                || sheet.col_styles.iter().any(|run| run.xf == 0)
+                || sheet.iter_cells().any(|(_, cell)| cell.style == Some(0))
+        })
+    {
+        styles.cell_xfs.push(xlsx_model::Xf::default());
+    }
     Ok(IndexedWorkbook {
         workbook: Workbook {
             sheets,
@@ -209,12 +221,15 @@ fn parse_workbook_xml(data: &[u8]) -> Result<WorkbookMeta, ParseError> {
     let mut depth = 0;
     let mut date_system = DateSystem::V1900;
     let mut active_sheet = None;
+    let mut sheets_depth = None;
     let mut sheets = Vec::new();
     let mut defined_names = Vec::new();
 
     loop {
         match next_event(&mut reader, &mut buf, &mut depth)? {
             Event::Start(e) => match local_name(&e).as_slice() {
+                // the save rewrites the root's `sheets` child, so only it lists sheets
+                b"sheets" if depth == 2 => sheets_depth = Some(depth),
                 b"workbookPr" => {
                     if let Some(v) = attr(&e, b"date1904")?
                         && is_truthy(&v)
@@ -230,7 +245,7 @@ fn parse_workbook_xml(data: &[u8]) -> Result<WorkbookMeta, ParseError> {
                             .unwrap_or(SheetId(0)),
                     );
                 }
-                b"sheet" => {
+                b"sheet" if sheets_depth.is_some_and(|sheets| depth == sheets + 1) => {
                     let name = attr(&e, b"name")?.unwrap_or_default();
                     let rid = attr(&e, b"id")?;
                     sheets.push(SheetEntry { name, rid });
@@ -254,6 +269,12 @@ fn parse_workbook_xml(data: &[u8]) -> Result<WorkbookMeta, ParseError> {
                 }
                 _ => {}
             },
+            Event::End(e)
+                if e.name().local_name().as_ref() == b"sheets"
+                    && sheets_depth.is_some_and(|sheets| depth < sheets) =>
+            {
+                sheets_depth = None;
+            }
             Event::Eof => break,
             _ => {}
         }
@@ -552,6 +573,8 @@ fn parse_worksheet(
     let mut cur: Option<CellBuild> = None;
     let mut cell_count: u64 = 0;
     let mut hyperlink_count: usize = 0;
+    let mut row_style_count: usize = 0;
+    let mut columns = ColumnRuns::default();
     let mut shared_formulas = SharedFormulas::default();
 
     loop {
@@ -564,7 +587,19 @@ fn parse_worksheet(
                     };
                     cur_row = Some(row);
                     col_cursor = 0;
-                    let height = attr(&e, b"ht")?.and_then(|v| v.parse::<f64>().ok());
+                    if attr(&e, b"customFormat")?.is_some_and(|value| is_truthy(&value)) {
+                        let style = attr(&e, b"s")?
+                            .and_then(|value| value.parse::<u32>().ok())
+                            .unwrap_or(0);
+                        row_style_count += 1;
+                        if row_style_count > MAX_ROW_STYLES {
+                            return Err(ParseError::TooManyRowStyles);
+                        }
+                        sheet.row_styles.insert(row, style);
+                    }
+                    let height = attr(&e, b"ht")?
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .map(|h| h.min(MAX_ROW_HEIGHT_PT));
                     if let Some(height) = height {
                         legacy.row_heights.insert(row, height);
                     }
@@ -640,7 +675,7 @@ fn parse_worksheet(
                         sheet.hyperlinks.push(link);
                     }
                 }
-                b"col" => parse_col(&e, &mut sheet, legacy)?,
+                b"col" => parse_col(&e, &mut sheet, &mut columns, legacy)?,
                 b"sheetFormatPr" => {
                     sheet.format = SheetFormat {
                         default_row_height_pt: attr(&e, b"defaultRowHeight")?
@@ -659,7 +694,14 @@ fn parse_worksheet(
                 match name.local_name().as_ref() {
                     b"c" => {
                         if let Some(c) = cur.take() {
-                            finalize_cell(c, shared, &mut sheet, shared_string_cells, facts)?;
+                            finalize_cell(
+                                c,
+                                shared,
+                                &mut sheet,
+                                &columns,
+                                shared_string_cells,
+                                facts,
+                            )?;
                         }
                         col_cursor += 1;
                     }
@@ -784,11 +826,13 @@ fn ranges_intersect(left: CellRange, right: CellRange) -> bool {
 /// sheet bounds). widths are stored per-column since the model has no
 /// column-range concept; the style keeps its run, which a whole-sheet `<col>`
 /// spans 16,384 columns wide. a negative authored width has no extent to
-/// render, so it narrows to zero the way a hidden column does; the authored
-/// value stays in `legacy` and the source span is reused verbatim on save.
+/// render, so it narrows to zero the way a hidden column does, and one past
+/// excel's ceiling opens at the ceiling; the authored value stays in `legacy`
+/// and the source span is reused verbatim on save.
 fn parse_col(
     e: &quick_xml::events::BytesStart,
     sheet: &mut Sheet,
+    columns: &mut ColumnRuns,
     legacy: &mut LegacySheetDimensions,
 ) -> Result<(), ParseError> {
     let hidden = attr(e, b"hidden")?.is_some_and(|value| is_truthy(&value));
@@ -809,15 +853,17 @@ fn parse_col(
         if sheet.col_styles.len() >= MAX_COL_STYLES {
             return Err(ParseError::TooManyColumnStyles);
         }
-        sheet.col_styles.push(ColStyle {
+        let run = ColStyle {
             first: min - 1,
             last: max - 1,
             xf,
-        });
+        };
+        sheet.col_styles.push(run);
+        columns.push(run);
     }
     let width = match authored {
         _ if hidden => 0.0,
-        Some(w) => w.max(0.0),
+        Some(w) => w.clamp(0.0, MAX_COL_WIDTH_CHARS),
         None => return Ok(()),
     };
     for col in min..=max {
@@ -835,6 +881,7 @@ fn finalize_cell(
     c: CellBuild,
     shared: &[String],
     sheet: &mut Sheet,
+    columns: &ColumnRuns,
     shared_string_cells: &mut SharedStringCells,
     facts: &mut SourceCellFacts,
 ) -> Result<(), ParseError> {
@@ -894,11 +941,18 @@ fn finalize_cell(
         },
     };
 
-    let cell = Cell {
+    let mut cell = Cell {
         value,
         formula: c.formula,
         style: c.style,
     };
+    if cell == Cell::default()
+        && sheet
+            .inherited_style_in(addr, columns)
+            .is_some_and(|style| style != 0)
+    {
+        cell.style = Some(0);
+    }
     if cell != Cell::default() {
         sheet.set_cell(addr, cell);
     }
@@ -920,7 +974,7 @@ fn error_from_str(s: &str) -> Option<ErrorValue> {
     })
 }
 
-fn is_truthy(v: &str) -> bool {
+pub(crate) fn is_truthy(v: &str) -> bool {
     matches!(v, "1" | "true" | "on")
 }
 

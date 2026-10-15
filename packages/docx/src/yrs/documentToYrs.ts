@@ -36,8 +36,8 @@ import type {
   TrackedChangeInfo,
 } from '../types/document';
 import { ensureHexPrefix, resolveColorToHex } from '../utils/colorResolver';
-import { mergeTextFormatting } from '../utils/textFormattingMerge';
-import { tableCellParagraphFormatting, tableColumnCount } from './tableParagraphFormatting';
+import { mergeStyleRunFormatting, mergeTextFormatting } from '../utils/textFormattingMerge';
+import { tableCellParagraphFormatting, tableCellRunFormatting, tableColumnCount } from './tableParagraphFormatting';
 import type { Style } from '../types/styles';
 import type { YrsOpeningOptions, YrsRawOp, YrsSession } from './index';
 import { noteYrsStoriesDirty } from './yrsToDocument';
@@ -396,7 +396,7 @@ function runMarks(
     ? styleResolver?.getRunStyleOwnProperties(run.formatting.styleId)
     : undefined;
   const marks = formattingToMarks(
-    mergeTextFormatting(mergeTextFormatting(styleFormatting, runStyleFormatting), run.formatting)
+    mergeTextFormatting(mergeStyleRunFormatting(styleFormatting, runStyleFormatting), run.formatting)
   );
   const styleId = run.formatting?.styleId;
   const styleName = styleId ? styleResolver?.getStyle(styleId)?.name : undefined;
@@ -760,6 +760,12 @@ function trackedMarks(marks: readonly MarkDescriptor[]): MarkDescriptor[] {
   return marks.filter((mark) => mark.name === 'insertion' || mark.name === 'deletion' || mark.name === 'hyperlink');
 }
 
+function drawingMarks(marks: readonly MarkDescriptor[]): MarkDescriptor[] {
+  return marks.filter((mark) =>
+    mark.name === 'hidden' || mark.name === 'insertion' || mark.name === 'deletion' || mark.name === 'hyperlink'
+  );
+}
+
 function runContentToUnits(
   content: RunContent,
   marks: readonly MarkDescriptor[],
@@ -828,7 +834,11 @@ function runContentToUnits(
     case 'chart':
       return [embedUnit('chart', chartPayload(content.chart), trackedMarks(marks))];
     case 'opaqueDrawing':
-      return [embedUnit('opaqueDrawing', { kind: content.kind, xml: content.xml }, trackedMarks(marks))];
+      return [embedUnit('opaqueDrawing', {
+        kind: content.kind,
+        xml: content.xml,
+        ...(content.preview ? { preview: imagePayload(content.preview) } : {}),
+      }, drawingMarks(marks))];
     case 'footnoteRef':
       return [noteRefUnit(content.id, 'footnote', marks)];
     case 'endnoteRef':
@@ -1018,9 +1028,9 @@ function paragraphStyleFormatting(
   extraRunFormatting?: TextFormatting
 ): TextFormatting | undefined {
   const styleFormatting = styleResolver
-    ? styleResolver.resolveParagraphStyle(paragraph.formatting?.styleId).runFormatting
+    ? styleResolver.resolveParagraphStyle(paragraph.formatting?.styleId, undefined, extraRunFormatting).runFormatting
     : undefined;
-  return mergeTextFormatting(styleFormatting, extraRunFormatting);
+  return styleResolver ? styleFormatting : extraRunFormatting;
 }
 
 /**
@@ -1101,7 +1111,8 @@ function paragraphAttrs(
   styleResolver: StyleResolver | null,
   units: readonly InlineUnit[],
   runBoundaries: Attrs[] | undefined,
-  tableParagraphFormatting?: ParagraphFormatting
+  tableParagraphFormatting?: ParagraphFormatting,
+  tableRunFormatting?: TextFormatting
 ): Attrs {
   const formatting = paragraph.formatting;
   const styleId = formatting?.styleId;
@@ -1133,7 +1144,7 @@ function paragraphAttrs(
   };
 
   if (styleResolver) {
-    const resolved = styleResolver.resolveParagraphStyle(styleId, tableParagraphFormatting);
+    const resolved = styleResolver.resolveParagraphStyle(styleId, tableParagraphFormatting, tableRunFormatting);
     const stylePpr = resolved.paragraphFormatting;
     attrs.alignment = formatting?.alignment ?? stylePpr?.alignment ?? null;
     attrs.spaceBefore = formatting?.spaceBefore ?? stylePpr?.spaceBefore ?? null;
@@ -1178,7 +1189,7 @@ function paragraphAttrs(
 
     const defaultChar = styleResolver.getDefaultCharacterStyle()?.rPr;
     const styleRpr = defaultChar
-      ? mergeTextFormatting(resolved.runFormatting, defaultChar)
+      ? mergeStyleRunFormatting(resolved.runFormatting, defaultChar)
       : resolved.runFormatting;
     attrs.defaultTextFormatting =
       mergeTextFormatting(
@@ -1337,7 +1348,7 @@ function paragraphUnits(
     }
     paragraphContentUnitCounts.set(content as object, units.length - start);
   }
-  const attrs = paragraphAttrs(paragraph, styleResolver, units, boundaries, tableParagraphFormatting);
+  const attrs = paragraphAttrs(paragraph, styleResolver, units, boundaries, tableParagraphFormatting, extraRunFormatting);
   return { units, commentMarks, ppr: paraAttrsToPpr(attrs), opaqueSequences };
 }
 
@@ -1593,6 +1604,7 @@ function projectRow(
     column += colspan;
     if (rowSpan?.skip) return;
     cells.push({
+      extraRunFormatting: tableCellRunFormatting(table, tableStyle, rowIndex, startColumn, column, styleColumns),
       paragraphFormatting: tableCellParagraphFormatting(
         table,
         tableStyle,
@@ -1618,6 +1630,7 @@ function projectRow(
   });
   if (cells.length === 0) {
     cells.push({
+      extraRunFormatting: tableCellRunFormatting(table, tableStyle, rowIndex, 0, totalColumns, styleColumns),
       paragraphFormatting: tableCellParagraphFormatting(
         table,
         tableStyle,

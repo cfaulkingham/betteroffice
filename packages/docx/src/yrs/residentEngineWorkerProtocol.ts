@@ -4,6 +4,9 @@ import type { ResidentControlSnapshot } from './residentControls';
 import type { ResidentPropertyTarget, ResidentPropertySnapshot } from './residentProperties';
 import type { ResidentSectionSnapshot } from './residentSections';
 import type { YrsStoryRange } from './index';
+import type { ResidentReviewSnapshot } from './residentReview';
+import type { ResidentCommentInsertionRange } from './residentCommentProjection';
+import type { ResidentToolbarMetadata } from './residentToolbarMetadata';
 import type { LayoutMetaV1 } from './layoutMeta';
 import type { Checkpoint } from '../../../../shared/office-session/commands/types';
 import type { ReplyError } from '../../../../shared/office-session/protocol';
@@ -13,6 +16,7 @@ import type {
   DocxCommandEnvelope,
   DocxCommandFrame,
   DocxCommandSelection,
+  DocxSelectionPointIntent,
   ResidentCommandInitReply,
   ResidentCommandInitRequest,
   ResidentCommandViewportRequest,
@@ -26,6 +30,7 @@ import type {
   YrsSelectionText,
   YrsStickyPosition,
 } from './index';
+import type { DocxClipboardSlice } from './clipboardFragment';
 import type { PointPosition } from '../plugin-api';
 import type { DocxResolvedPointPosition } from './pointPosition';
 import type {
@@ -56,7 +61,17 @@ import type {
   DocxParagraphAnchorResult,
   DocxParagraphIdentitySnapshot,
 } from './paragraphIdentity';
-import type { DocxEditRequest, DocxValidationResult, DocxFindTextRequest, DocxFindTextResult, DocxReadParagraphsRequest, DocxReadParagraphsResult } from './edits';
+import type {
+  DocxEditRequest,
+  DocxValidationResult,
+  DocxFindTextRequest,
+  DocxFindTextResult,
+  DocxReadParagraphsRequest,
+  DocxReadParagraphsResult,
+  DocxReadStoriesRequest,
+  DocxReadStoriesResult,
+} from './edits';
+import type { DocxListStoriesResult } from './stories';
 import type {
   AnchorGeometryTarget,
   ProposalGeometryMirror,
@@ -105,10 +120,16 @@ export type ResidentDocumentRead =
   | { kind: 'listContentControls'; options: DocxContentControlsOptions }
   | { kind: 'findContentControls'; query: DocxContentControlQuery; options: DocxContentControlsOptions }
   | { kind: 'rangeHighlights'; ranges: YrsStoryRange[]; expectVersion: string; expectFrameEpoch?: number; expectLayoutRevision?: number }
+  | { kind: 'reviewSnapshot'; expectPreviewVersion?: number }
+  | { kind: 'commentInsertionRange'; paraId: string; search?: string }
+  | { kind: 'toolbarMetadata' }
   | { kind: 'paragraphIdentities' }
   | { kind: 'resolveParagraphAnchors'; anchors: DocxParagraphAnchor[] }
   | { kind: 'readParagraphs'; request: DocxReadParagraphsRequest }
   | { kind: 'rawSelectionInfo'; selection: DocxCommandSelection }
+  | { kind: 'clipboardSlice'; selection: DocxCommandSelection }
+  | { kind: 'listStories' }
+  | { kind: 'readStories'; request: DocxReadStoriesRequest }
   | { kind: 'findText'; request: DocxFindTextRequest }
   | { kind: 'findMatches'; searchText: string; options: FindOptions; expectVersion: string }
   | { kind: 'searchText'; query: string; caseSensitive: boolean; carry?: YrsStickyPosition | null }
@@ -116,7 +137,7 @@ export type ResidentDocumentRead =
   | { kind: 'stickyAnchors'; locs: YrsLoc[]; version: string }
   | { kind: 'navigationTarget'; story: string; paraId: string }
   | { kind: 'anchorTargets'; targets: Exclude<AnchorGeometryTarget, { kind: 'proposal' }>[] }
-  | { kind: 'pointPosition'; hit: PointPosition; expectVersion: string }
+  | { kind: 'pointPosition'; hit: PointPosition; expectVersion: string; nativePoint?: DocxSelectionPointIntent }
   | {
       kind: 'selectionUnit';
       story: string;
@@ -144,10 +165,16 @@ export interface ResidentDocumentReadValues {
   listContentControls: DocxContentControlsResult;
   findContentControls: DocxContentControlsResult;
   rangeHighlights: ResidentRangeHighlights | null;
+  reviewSnapshot: ResidentReviewSnapshot | null;
+  commentInsertionRange: ResidentCommentInsertionRange;
+  toolbarMetadata: ResidentToolbarMetadata;
   paragraphIdentities: DocxParagraphIdentitySnapshot;
   resolveParagraphAnchors: { results: DocxParagraphAnchorResult[] };
   readParagraphs: DocxReadParagraphsResult;
   rawSelectionInfo: YrsSelectionText;
+  clipboardSlice: DocxClipboardSlice;
+  listStories: DocxListStoriesResult;
+  readStories: DocxReadStoriesResult;
   findText: DocxFindTextResult;
   findMatches: DocxFindDisplayMatch[] | null;
   navigationTarget: ReturnType<typeof resolveNavigationTarget>;

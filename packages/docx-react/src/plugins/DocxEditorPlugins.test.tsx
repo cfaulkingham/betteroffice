@@ -50,12 +50,14 @@ import {
   setMissingWorkerCapabilitiesForTests,
 } from '../components/DocxEditor/internals/engineChoice';
 import { setupWorkerEngine } from '../components/DocxEditor/__fixtures__/workerEngine';
+import { testScope } from '../components/DocxEditor/__fixtures__/testScope';
 
 const mount = (props: Partial<DocxEditorProps> = {}) => mountEditor(props, false, documentBytes(), false);
 
 const MOD = isMacPlatform() ? { metaKey: true } : { ctrlKey: true };
 
 const { act, cleanup, fireEvent, render, within } = await import('@testing-library/react');
+const { settle, until } = testScope(act);
 
 const FIXTURE = resolve(
   import.meta.dir,
@@ -141,17 +143,6 @@ async function inlineImageDocument(
     `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="${rel}" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><w:body>${body}<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/></w:sectPr></w:body></w:document>`
   );
   return zip.generateAsync({ type: 'arraybuffer' });
-}
-
-async function settle(ms = 20) {
-  await act(async () => {
-    await new Promise((done) => setTimeout(done, ms));
-  });
-}
-
-async function until(done: () => boolean) {
-  for (let attempt = 0; attempt < 300 && !done(); attempt += 1) await settle(10);
-  expect(done()).toBe(true);
 }
 
 type State = { count: number };
@@ -451,6 +442,15 @@ describe.each(editorEngines)('DocxEditor plugins (%s engine)', (_engine, experim
     expect(read.ok).toBe(true);
     if (!read.ok) return;
     const target = read.paragraphs.find((paragraph) => paragraph.text.length > 0)!;
+    const uses = [
+      { sectionIndex: 0, variant: 'default' as const },
+      { sectionIndex: 1, variant: 'default' as const },
+    ];
+    const listed = await context.read.listStories();
+    expect(listed.ok && listed.stories.filter((story) => story.uses)).toEqual([
+      { story: 'hf:rId3', kind: 'header', root: 'hf:rId3', part: expect.stringContaining('header'), uses },
+      { story: 'hf:rId4', kind: 'footer', root: 'hf:rId4', part: expect.stringContaining('footer'), uses },
+    ]);
     const validation = await context.read.validateEdits(appendRequest(read.version, target.paraId));
     expect(validation).toMatchObject({ ok: true, wouldApply: true });
     expect(
@@ -1103,6 +1103,42 @@ describe.each(editorEngines)('DocxEditor plugins (%s engine)', (_engine, experim
         },
       })
     ).toMatchObject({ ok: false, failure: { code: 'stale-version' } });
+  });
+
+  test('story reads answer in a read-only viewer with one worker read each', async () => {
+    const { plugin, contexts, log } = recorder();
+    await mount({ plugins: [plugin], readOnly: true });
+    await until(() => log.includes('load:loaded'));
+    const reads: string[] = [];
+    for (const worker of workers) {
+      const post = worker.postMessage.bind(worker);
+      worker.postMessage = (message, transfer) => {
+        const read = (message as { read?: { kind?: string } }).read?.kind;
+        if (read === 'listStories' || read === 'readStories') reads.push(read);
+        post(message, transfer);
+      };
+    }
+    const context = contexts.at(-1)!;
+    const replicaLoads = () =>
+      workers.reduce((count, worker) => count + worker.requests.filter((type) => type === 'encodeState').length, 0);
+    const loadsBefore = replicaLoads();
+    const listed = await context.read.listStories();
+    const uses = [
+      { sectionIndex: 0, variant: 'default' as const },
+      { sectionIndex: 1, variant: 'default' as const },
+    ];
+    expect(listed.ok && listed.stories.filter((story) => story.uses).map(({ story, kind, uses }) => ({ story, kind, uses })))
+      .toEqual([
+        { story: 'hf:rId3', kind: 'header', uses },
+        { story: 'hf:rId4', kind: 'footer', uses },
+      ]);
+    const read = await context.read.readStories({ stories: ['header', 'footer'], view: 'accepted' });
+    expect(read.ok && read.stories.map((story) => [story.story, story.ok])).toEqual([
+      ['hf:rId3', true],
+      ['hf:rId4', true],
+    ]);
+    expect(reads).toEqual(experimentalWorkerOpen === false ? [] : ['listStories', 'readStories']);
+    expect(replicaLoads()).toBe(loadsBefore);
   });
 
   test('host proposals anchor through the editor ref in a read-only viewer', async () => {

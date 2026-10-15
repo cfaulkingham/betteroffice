@@ -1525,6 +1525,43 @@ mod tests {
     }
 
     #[test]
+    fn display_lists_render_sheets_with_hidden_unused_columns() {
+        let mut sheet = Sheet::new("Form");
+        for row in 0..20 {
+            for col in 0..8 {
+                sheet.set_cell(
+                    CellRef::new(row, col),
+                    Cell {
+                        value: CellValue::Text {
+                            value: format!("r{row}c{col}"),
+                        },
+                        ..Cell::default()
+                    },
+                );
+            }
+        }
+        for col in 8..xlsx_model::MAX_COLS {
+            sheet.col_widths.insert(col, 0.0);
+        }
+        let model = WorkbookModel {
+            sheets: vec![sheet],
+            ..WorkbookModel::default()
+        };
+        let parts = xlsx_parse::serialize_workbook(&model).unwrap();
+        let bytes = ooxml_opc::rezip_parts(&parts).unwrap();
+        let session = Session::open(&bytes, None).unwrap();
+        let viewport = r#"{"x":0,"y":0,"width":1600,"height":1000}"#;
+        for result in [
+            session.display_list_json(viewport),
+            session.display_list_for_json(0, viewport),
+        ] {
+            let frame: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+            assert_eq!(frame["grid"]["colOffsets"].as_array().unwrap().len(), 9);
+            assert!(frame.to_string().contains("r19c7"));
+        }
+    }
+
+    #[test]
     fn preserves_display_and_sheet_info_wire_shapes() {
         let mut session = Session::open(&sample_xlsx(), None).unwrap();
         let display = session
@@ -1782,6 +1819,144 @@ mod tests {
             .selection_formatting_json(r#"{"sheet":0,"range":"A1:B2"}"#)
             .unwrap();
         assert!(formatting.contains(r#""bold":true"#));
+    }
+
+    #[test]
+    fn format_facets_capture_apply_and_reopen() {
+        let expected = serde_json::json!({
+            "font": null, "fill": null, "border": null, "num_fmt_id": null,
+            "alignment": {"h": "Fill", "v": null, "wrap_text": false, "shrink_to_fit": false,
+                "text_rotation": 255, "indent": 4, "relative_indent": -2,
+                "justify_last_line": true, "reading_order": 2},
+            "protection": {"locked": false, "hidden": true},
+            "xf_id": 1, "quote_prefix": true, "pivot_button": true
+        });
+        let mut model = WorkbookModel {
+            sheets: vec![Sheet::new("Data")],
+            ..Default::default()
+        };
+        model.styles.fonts.push(xlsx_model::Font::default());
+        model.styles.fills.push(xlsx_model::Fill::None);
+        model.styles.borders.push(xlsx_model::Border::default());
+        model
+            .styles
+            .cell_xfs
+            .push(serde_json::from_value(expected.clone()).unwrap());
+        model.sheets[0].set_cell(
+            CellRef::new(0, 0),
+            Cell {
+                value: CellValue::Number { value: 7.0 },
+                style: Some(0),
+                ..Default::default()
+            },
+        );
+        let mut parts = xlsx_parse::serialize_workbook(&model).unwrap();
+        let (_, styles) = parts
+            .iter_mut()
+            .find(|(name, _)| name == "xl/styles.xml")
+            .unwrap();
+        let xml = std::str::from_utf8(styles).unwrap()
+            .replace("<cellXfs", concat!(
+                r#"<cellStyleXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>"#,
+                r#"<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs"#,
+            ))
+            .replace("</styleSheet>", concat!(
+                r#"<cellStyles count="2"><cellStyle name="Normal" xfId="0" builtinId="0"/>"#,
+                r#"<cellStyle name="Custom" xfId="1"/></cellStyles></styleSheet>"#,
+            ));
+        *styles = xml.into_bytes();
+        let bytes = ooxml_opc::rezip_parts(&parts).unwrap();
+        let mut session = Session::open(&bytes, None).unwrap();
+        session
+            .patch_range_style_json(r#"{"sheet":0,"range":"A1","patch":{"bold":true}}"#, None)
+            .unwrap();
+        let captured = session
+            .capture_format_json(r#"{"sheet":0,"range":"A1"}"#)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&captured).unwrap();
+        assert_eq!(value["formats"][0]["protection"], expected["protection"]);
+        assert_eq!(value["formats"][0]["alignment"], expected["alignment"]);
+        assert_eq!(value["formats"][0]["xfId"], expected["xf_id"]);
+        assert_eq!(value["formats"][0]["quotePrefix"], expected["quote_prefix"]);
+        assert_eq!(value["formats"][0]["pivotButton"], expected["pivot_button"]);
+        session
+            .apply_format_json(
+                &format!(r#"{{"sheet":0,"range":"B1","format":{captured}}}"#),
+                None,
+            )
+            .unwrap();
+        let saved = session.save().unwrap();
+        let parts = ooxml_opc::unzip_parts(&saved).unwrap();
+        let styles = std::str::from_utf8(
+            &parts
+                .iter()
+                .find(|(name, _)| name == "xl/styles.xml")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        assert!(styles.contains(r#"applyProtection="1""#));
+        assert!(styles.find("<alignment").unwrap() < styles.find("<protection").unwrap());
+        let reopened = Session::open(&saved, None).unwrap();
+        let target: serde_json::Value = serde_json::from_str(
+            &reopened
+                .capture_format_json(r#"{"sheet":0,"range":"B1"}"#)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(without_provenance(target), without_provenance(value));
+    }
+
+    /// Capture provenance names xf indices, which a save renumbers.
+    fn without_provenance(mut capture: serde_json::Value) -> serde_json::Value {
+        let fields = capture.as_object_mut().unwrap();
+        fields.remove("sourceStyles");
+        fields.remove("sourceFormats");
+        capture
+    }
+
+    #[test]
+    fn pattern_border_full_format_wire_round_trip() {
+        let mut session = Session::open(&sample_xlsx(), None).unwrap();
+        let mut captured: serde_json::Value = serde_json::from_str(
+            &session
+                .capture_format_json(r#"{"sheet":0,"range":"A1"}"#)
+                .unwrap(),
+        )
+        .unwrap();
+        captured["formats"][0]["fill"] = serde_json::json!({"Pattern": {
+            "pattern": "lightUp", "fg": {"Rgb": "#123456"}, "bg": {"Rgb": "#fedcba"}
+        }});
+        captured["formats"][0]["border"]["top"] =
+            serde_json::json!({"style": "MediumDashed", "color": {"Indexed": 5}});
+        session
+            .apply_format_json(
+                &serde_json::json!({"sheet": 0, "range": "A1", "format": captured}).to_string(),
+                None,
+            )
+            .unwrap();
+        session
+            .patch_range_style_json(r#"{"sheet":0,"range":"A1","patch":{"bold":true}}"#, None)
+            .unwrap();
+        let source: serde_json::Value = serde_json::from_str(
+            &session
+                .capture_format_json(r#"{"sheet":0,"range":"A1"}"#)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(source["formats"][0]["fill"], captured["formats"][0]["fill"]);
+        assert_eq!(
+            source["formats"][0]["border"],
+            captured["formats"][0]["border"]
+        );
+        let reopened = Session::open(&session.save().unwrap(), None).unwrap();
+        let target: serde_json::Value = serde_json::from_str(
+            &reopened
+                .capture_format_json(r#"{"sheet":0,"range":"A1"}"#)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(without_provenance(target), without_provenance(source));
     }
 
     #[test]

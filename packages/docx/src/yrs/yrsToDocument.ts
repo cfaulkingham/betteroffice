@@ -56,7 +56,7 @@ import type {
   Endnote,
   HeaderFooter,
 } from '../types/document';
-import type { YrsSession } from './index';
+import type { YrsRunInheritance, YrsSession, YrsTableInheritance } from './index';
 
 type Attrs = Record<string, unknown>;
 
@@ -229,6 +229,12 @@ interface OriginalRunBoundary {
   propertyChanges?: Run['propertyChanges'];
 }
 
+interface LiveParagraphBreaks {
+  leading: readonly BlockBreakKind[];
+  trailing: readonly BlockBreakKind[];
+  leadingPage: boolean;
+}
+
 interface TableCellPayload {
   tcPr?: Attrs;
   story?: string;
@@ -313,10 +319,8 @@ function attrsToTextFormatting(attributes: Attrs): TextFormatting {
 
   if (attributes.bold) formatting.bold = true;
   if (attributes.italic) formatting.italic = true;
-  // Complex-script bold and italic follow the session where it states them (a comparison does),
-  // and bold and italic otherwise.
-  if (attributes.boldCs ?? attributes.bold) formatting.boldCs = true;
-  if (attributes.italicCs ?? attributes.italic) formatting.italicCs = true;
+  if (attributes.boldCs) formatting.boldCs = true;
+  if (attributes.italicCs) formatting.italicCs = true;
 
   const underline = asObject(attributes.underline);
   if (underline && underline.inheritedHyperlink !== true) {
@@ -346,9 +350,8 @@ function attrsToTextFormatting(attributes: Attrs): TextFormatting {
     };
   }
 
-  if (typeof attributes.highlight === 'string') {
-    formatting.highlight = attributes.highlight as TextFormatting['highlight'];
-  }
+  const highlight = asString(attributes.highlight) ?? asString(asObject(attributes.highlight)?.color);
+  if (highlight !== undefined) formatting.highlight = highlight as TextFormatting['highlight'];
 
   const fontSize = asObject(attributes.fontSize);
   if (fontSize) {
@@ -423,6 +426,49 @@ function attrsToTextFormatting(attributes: Attrs): TextFormatting {
   return formatting;
 }
 
+/** The run properties a run with these attributes saves with. */
+type RunFormatter = (attributes: Attrs) => TextFormatting;
+
+const directFormatting: RunFormatter = (attributes) =>
+  attrsToTextFormatting(formattingAttrs(attributes));
+
+const ON_OFF_RUN_PROPERTIES = new Set<string>([
+  'bold', 'italic', 'allCaps', 'smallCaps', 'strike', 'doubleStrike',
+  'outline', 'shadow', 'emboss', 'imprint', 'hidden', 'rtl', 'boldCs', 'italicCs',
+]);
+
+const SOURCE_RUN_PROPERTIES = ['bold', 'italic', 'fontSize', 'boldCs', 'italicCs', 'fontSizeCs'] as const;
+
+const lentByLinkStyle = (mark: unknown): boolean => asObject(mark)?.inheritedHyperlink === true;
+
+/** Writes differences from inherited run formatting, including explicit resets. */
+function relativeFormatting(attributes: Attrs, inherited: TextFormatting): TextFormatting {
+  const formatting = directFormatting(attributes);
+  const result: Attrs = {};
+  for (const key of new Set([...Object.keys(formatting), ...Object.keys(inherited)])) {
+    if ((key === 'boldCs' || key === 'italicCs') && typeof attributes[key] !== 'boolean') continue;
+    const value = formatting[key as keyof TextFormatting];
+    if (sameJson(value, inherited[key as keyof TextFormatting])) continue;
+    if (value !== undefined) result[key] = value;
+    else if (ON_OFF_RUN_PROPERTIES.has(key)) result[key] = false;
+    else if (key === 'color' && !lentByLinkStyle(attributes.textColor)) result[key] = { auto: true };
+    else if (key === 'underline' && !lentByLinkStyle(attributes.underline)) {
+      result[key] = { style: 'none' };
+    }
+  }
+  const source = asObject(attributes._sourceRunFormatting);
+  for (const key of SOURCE_RUN_PROPERTIES) {
+    const value = source?.[key];
+    if (value === undefined) continue;
+    const live = ON_OFF_RUN_PROPERTIES.has(key) ? formatting[key] ?? false : formatting[key];
+    if (sameJson(value, live) ||
+      ((key === 'boldCs' || key === 'italicCs') && attributes[key] === undefined)) {
+      result[key] = value;
+    }
+  }
+  return result as TextFormatting;
+}
+
 function runContentForText(text: string, formatting: TextFormatting): RunContent[] {
   const content: RunContent[] = [];
   let plainText = '';
@@ -465,12 +511,12 @@ function runContentForText(text: string, formatting: TextFormatting): RunContent
   return content;
 }
 
-function createTextRun(text: string, attributes: Attrs): Run {
-  const formatting = attrsToTextFormatting(formattingAttrs(attributes));
+function createTextRun(text: string, attributes: Attrs, format: RunFormatter): Run {
+  const formatting = format(attributes);
   return {
     type: 'run',
     formatting: Object.keys(formatting).length > 0 ? formatting : undefined,
-    content: runContentForText(text, formatting),
+    content: runContentForText(text, directFormatting(attributes)),
   };
 }
 
@@ -557,7 +603,11 @@ function hyperlinkKey(attributes: Attrs): string | null {
   return link ? asString(link.href) || '' : null;
 }
 
-function fieldFromPayload(payload: Attrs, attributes: Attrs): SimpleField | ComplexField {
+function fieldFromPayload(
+  payload: Attrs,
+  attributes: Attrs,
+  format: RunFormatter
+): SimpleField | ComplexField {
   const fieldData = asString(payload.fieldData);
   if (fieldData && fieldData.length <= 2_000_000) {
     try {
@@ -578,7 +628,7 @@ function fieldFromPayload(payload: Attrs, attributes: Attrs): SimpleField | Comp
     }
   }
 
-  const formatting = attrsToTextFormatting(formattingAttrs(attributes));
+  const formatting = format(attributes);
   const displayRun: Run = {
     type: 'run',
     content: [{ type: 'text', text: asString(payload.displayText) || '' }],
@@ -621,7 +671,7 @@ function mathFromPayload(payload: Attrs): MathEquation {
   };
 }
 
-function horizontalRuleRun(payload: Attrs, attributes: Attrs): Run {
+function horizontalRuleRun(payload: Attrs, attributes: Attrs, format: RunFormatter): Run {
   const value = asObject(payload.rule);
   const height = asFiniteNumber(value?.height);
   if (
@@ -640,7 +690,7 @@ function horizontalRuleRun(payload: Attrs, attributes: Attrs): Run {
     color: value.color,
     xml: value.xml,
   };
-  const formatting = attrsToTextFormatting(formattingAttrs(attributes));
+  const formatting = format(attributes);
   return {
     type: 'run',
     content: [{ type: 'horizontalRule', rule }],
@@ -668,7 +718,7 @@ function resolveMediaSrcs(value: unknown): void {
   }
 }
 
-function imageRunFromPayload(payload: Attrs): Run {
+function imageFromPayload(payload: Attrs): Image {
   const attrs = payload as YrsImageAttrs & Attrs;
   const wrap: Image['wrap'] = {
     type: (asString(attrs.wrapType) || 'inline') as Image['wrap']['type'],
@@ -762,7 +812,11 @@ function imageRunFromPayload(payload: Attrs): Run {
   if (attrs.effectExtentRight != null) padding.right = pixelsToEmu(attrs.effectExtentRight);
   if (Object.keys(padding).length > 0) image.padding = padding;
 
-  return { type: 'run', content: [{ type: 'drawing', image }] };
+  return image;
+}
+
+function imageRunFromPayload(payload: Attrs): Run {
+  return { type: 'run', content: [{ type: 'drawing', image: imageFromPayload(payload) }] };
 }
 
 /** The seeded shape, carrying the text body and everything else no payload field describes. */
@@ -808,11 +862,24 @@ function chartRunFromPayload(payload: Attrs, recovery: ChartRecovery): Run | nul
   }
 }
 
-function opaqueDrawingRunFromPayload(payload: Attrs): Run | null {
+function opaqueDrawingRunFromPayload(
+  payload: Attrs,
+  attributes: Attrs,
+  format: RunFormatter
+): Run | null {
   const kind = asString(payload.kind);
   const xml = asString(payload.xml);
   if (!kind || !xml) return null;
-  return { type: 'run', content: [{ type: 'opaqueDrawing', kind, xml }] };
+  const preview = asObject(payload.preview);
+  const formatting = format(attributes);
+  return {
+    type: 'run',
+    content: [{
+      type: 'opaqueDrawing', kind, xml,
+      ...(preview ? { preview: imageFromPayload(preview) } : {}),
+    }],
+    ...(Object.keys(formatting).length > 0 ? { formatting } : {}),
+  };
 }
 
 function shapeRunFromPayload(payload: Attrs): Run {
@@ -897,7 +964,11 @@ function shapeRunFromPayload(payload: Attrs): Run {
   return { type: 'run', content: [{ type: 'shape', shape }] };
 }
 
-function inlineSdtFromPayload(payload: Attrs, recovery: ChartRecovery): InlineSdt {
+function inlineSdtFromPayload(
+  payload: Attrs,
+  recovery: ChartRecovery,
+  format: RunFormatter
+): InlineSdt {
   let properties: SdtProperties = sdtAttrsToProps(payload);
   const propertiesJson = asString(payload.propertiesJson);
   if (propertiesJson && propertiesJson.length <= 1_000_000) {
@@ -929,7 +1000,7 @@ function inlineSdtFromPayload(payload: Attrs, recovery: ChartRecovery): InlineSd
       attributes,
     });
   }
-  let content = inlineSdtContent(buildParagraphContent(items, recovery, undefined, true));
+  let content = inlineSdtContent(buildParagraphContent(items, recovery, format, undefined, true));
   const authoredValue = contentControlValue(payload.value);
   if (authoredValue) {
     try {
@@ -996,31 +1067,36 @@ function commentReferenceFromPayload(payload: Attrs): Run | null {
   };
 }
 
-function ordinaryContentForItem(item: InlineItem, recovery: ChartRecovery): ParagraphContent | null {
-  if (item.kind === 'text') return createTextRun(item.text, item.attributes);
+function ordinaryContentForItem(
+  item: InlineItem,
+  recovery: ChartRecovery,
+  format: RunFormatter
+): ParagraphContent | null {
+  if (item.kind === 'text') return createTextRun(item.text, item.attributes, format);
   switch (item.embedKind) {
     case 'break':
       return { type: 'run', content: [{ type: 'break', breakType: 'textWrapping' }] };
     case 'tab':
-      return tabRun(item.attributes);
+      return tabRun(item.attributes, format);
     case 'image':
       return imageRunFromPayload(item.payload);
     case 'horizontalRule':
-      return horizontalRuleRun(item.payload, item.attributes);
+      return horizontalRuleRun(item.payload, item.attributes, format);
     case 'shape':
       return shapeRunFromPayload(item.payload);
     case 'chart':
       return chartRunFromPayload(item.payload, recovery);
     case 'opaqueDrawing':
-      return opaqueDrawingRunFromPayload(item.payload);
+      return opaqueDrawingRunFromPayload(item.payload, item.attributes, format);
     case 'field':
       return (
-        commentReferenceFromPayload(item.payload) ?? fieldFromPayload(item.payload, item.attributes)
+        commentReferenceFromPayload(item.payload) ??
+        fieldFromPayload(item.payload, item.attributes, format)
       );
     case 'math':
       return mathFromPayload(item.payload);
     case 'sdt':
-      return inlineSdtFromPayload(item.payload, recovery);
+      return inlineSdtFromPayload(item.payload, recovery, format);
     case 'noteRef': {
       const footnote = item.payload.footnoteRefId;
       const endnote = item.payload.endnoteRefId;
@@ -1038,8 +1114,8 @@ function ordinaryContentForItem(item: InlineItem, recovery: ChartRecovery): Para
   }
 }
 
-function tabRun(attributes: Attrs): Run {
-  const formatting = attrsToTextFormatting(formattingAttrs(attributes));
+function tabRun(attributes: Attrs, format: RunFormatter): Run {
+  const formatting = format(attributes);
   return {
     type: 'run',
     content: [{ type: 'tab' }],
@@ -1047,23 +1123,23 @@ function tabRun(attributes: Attrs): Run {
   };
 }
 
-function trackedContentForItem(item: InlineItem, info: TrackedChangeInfo, inControl: boolean, recovery: ChartRecovery): ParagraphContent | null {
+function trackedContentForItem(item: InlineItem, info: TrackedChangeInfo, inControl: boolean, recovery: ChartRecovery, format: RunFormatter): ParagraphContent | null {
   let child: TrackedWrapper['content'][number];
   if (inControl) {
-    const ordinary = ordinaryContentForItem(item, recovery);
+    const ordinary = ordinaryContentForItem(item, recovery, format);
     child = inlineSdtContent(ordinary ? [ordinary] : [])[0] ?? { type: 'run', content: [] };
-  } else if (item.kind === 'embed' && item.embedKind === 'sdt') child = inlineSdtFromPayload(item.payload, recovery);
+  } else if (item.kind === 'embed' && item.embedKind === 'sdt') child = inlineSdtFromPayload(item.payload, recovery, format);
   else if (item.kind === 'embed' && item.embedKind === 'image') child = imageRunFromPayload(item.payload);
-  else if (item.kind === 'embed' && item.embedKind === 'tab') child = tabRun(item.attributes);
+  else if (item.kind === 'embed' && item.embedKind === 'tab') child = tabRun(item.attributes, format);
   else if (item.kind === 'embed' && item.embedKind === 'horizontalRule')
-    child = horizontalRuleRun(item.payload, item.attributes);
+    child = horizontalRuleRun(item.payload, item.attributes, format);
   else if (item.kind === 'embed' && item.embedKind === 'shape')
     child = shapeRunFromPayload(item.payload);
   else if (item.kind === 'embed' && item.embedKind === 'chart')
     child = chartRunFromPayload(item.payload, recovery) ?? { type: 'run', content: [] };
   else if (item.kind === 'embed' && item.embedKind === 'opaqueDrawing')
-    child = opaqueDrawingRunFromPayload(item.payload) ?? { type: 'run', content: [] };
-  else if (item.kind === 'text') child = createTextRun(item.text, item.attributes);
+    child = opaqueDrawingRunFromPayload(item.payload, item.attributes, format) ?? { type: 'run', content: [] };
+  else if (item.kind === 'text') child = createTextRun(item.text, item.attributes, format);
   else child = { type: 'run', content: [] };
 
   if (item.kind === 'embed' && item.embedKind === 'chart' && child.type === 'run' && child.content.length === 0) return null;
@@ -1090,24 +1166,30 @@ function trackedContentForItem(item: InlineItem, info: TrackedChangeInfo, inCont
  * Adds an item to a hyperlink: a run to its children, and every child, in
  * order, to its structured children once it has them.
  */
-function addToHyperlink(hyperlink: Hyperlink, item: InlineItem, recovery: ChartRecovery): void {
+function addToHyperlink(
+  hyperlink: Hyperlink,
+  item: InlineItem,
+  recovery: ChartRecovery,
+  format: RunFormatter
+): void {
   let child: HyperlinkContent | undefined;
-  if (item.kind === 'text') child = createTextRun(item.text, item.attributes);
+  if (item.kind === 'text') child = createTextRun(item.text, item.attributes, format);
   else if (item.embedKind === 'break') {
     child = { type: 'run', content: [{ type: 'break', breakType: 'textWrapping' }] };
   } else if (item.embedKind === 'tab') child = { type: 'run', content: [{ type: 'tab' }] };
   else if (item.embedKind === 'horizontalRule') {
-    child = horizontalRuleRun(item.payload, item.attributes);
+    child = horizontalRuleRun(item.payload, item.attributes, format);
   } else if (item.embedKind === 'image') child = imageRunFromPayload(item.payload);
   else if (item.embedKind === 'shape') child = shapeRunFromPayload(item.payload);
   else if (item.embedKind === 'chart') child = chartRunFromPayload(item.payload, recovery) ?? undefined;
-  else if (item.embedKind === 'opaqueDrawing') child = opaqueDrawingRunFromPayload(item.payload) ?? undefined;
+  else if (item.embedKind === 'opaqueDrawing') child = opaqueDrawingRunFromPayload(item.payload, item.attributes, format) ?? undefined;
   else if (item.embedKind === 'field') {
     child =
-      commentReferenceFromPayload(item.payload) ?? fieldFromPayload(item.payload, item.attributes);
+      commentReferenceFromPayload(item.payload) ??
+      fieldFromPayload(item.payload, item.attributes, format);
   } else if (item.embedKind === 'math') child = mathFromPayload(item.payload);
   else if (item.embedKind === 'sdt') {
-    const control = inlineSdtFromPayload(item.payload, recovery);
+    const control = inlineSdtFromPayload(item.payload, recovery, format);
     if (item.attributes.ins || item.attributes.del || hasTrackedControlContent(control)) child = control;
   }
   if (!child) return;
@@ -1133,7 +1215,11 @@ function projectionSignature(items: InlineItem[]): string {
   return stableStringify(normalized);
 }
 
-function restoreProjectedFieldResults(items: InlineItem[], recovery: ChartRecovery): InlineItem[] {
+function restoreProjectedFieldResults(
+  items: InlineItem[],
+  recovery: ChartRecovery,
+  format: RunFormatter
+): InlineItem[] {
   const owners: { id: number; owner: EmbedItem; position: number }[] = [];
   for (const [position, item] of items.entries()) {
     if (item.kind !== 'embed' || item.embedKind !== 'field') continue;
@@ -1158,7 +1244,7 @@ function restoreProjectedFieldResults(items: InlineItem[], recovery: ChartRecove
     return false;
   });
   for (const { owner } of owners) {
-    const stored = fieldFromPayload(owner.payload, owner.attributes);
+    const stored = fieldFromPayload(owner.payload, owner.attributes, format);
     if (stored.type !== 'complexField') continue;
     const projection = asObject(owner.payload.resultProjection);
     const originals = Array.isArray(projection?.children) ? projection.children : [];
@@ -1169,7 +1255,7 @@ function restoreProjectedFieldResults(items: InlineItem[], recovery: ChartRecove
       if (index === undefined || !Array.isArray(child?.items)) continue;
       const current = groups.get(owner)?.get(index) ?? [];
       if (projectionSignature(current) === projectionSignature(child.items as InlineItem[])) continue;
-      const rebuilt = fieldInlineContent(buildParagraphContent(current, recovery));
+      const rebuilt = fieldInlineContent(buildParagraphContent(current, recovery, format));
       const original = index < 0 ? stored.structuredCode?.inline?.[-index - 1] : stored.structuredResult?.inline?.[index];
       if (original?.type === 'hyperlink' && rebuilt.length === 1 && rebuilt[0]?.type === 'hyperlink') {
         rebuilt[0] = { ...original, ...rebuilt[0], structuredChildren: rebuilt[0].structuredChildren };
@@ -1209,10 +1295,11 @@ function isTrackedWrapper(content: ParagraphContent | undefined): content is Tra
 function buildParagraphContent(
   items: InlineItem[],
   recovery: ChartRecovery,
+  format: RunFormatter,
   revisionIds?: RevisionIds,
   inControl = false
 ): ParagraphContent[] {
-  items = restoreProjectedFieldResults(items, recovery);
+  items = restoreProjectedFieldResults(items, recovery, format);
   const content: ParagraphContent[] = [];
   let currentRun: Run | null = null;
   let currentFormattingKey: string | null = null;
@@ -1233,7 +1320,7 @@ function buildParagraphContent(
     if (item.kind === 'embed' && item.embedKind === 'noteRef') {
       flushRun();
       flushHyperlink();
-      const note = ordinaryContentForItem(item, recovery);
+      const note = ordinaryContentForItem(item, recovery, format);
       if (note) content.push(note);
       continue;
     }
@@ -1247,7 +1334,7 @@ function buildParagraphContent(
     if (revision) {
       flushRun();
       flushHyperlink();
-      const tracked = trackedContentForItem(item, revision, inControl, recovery);
+      const tracked = trackedContentForItem(item, revision, inControl, recovery, format);
       if (!tracked) continue;
       const previous = content[content.length - 1];
       if (
@@ -1275,14 +1362,14 @@ function buildParagraphContent(
         flushHyperlink();
         currentHyperlink = createHyperlink(item.attributes);
       }
-      if (currentHyperlink) addToHyperlink(currentHyperlink, item, recovery);
+      if (currentHyperlink) addToHyperlink(currentHyperlink, item, recovery, format);
       continue;
     }
 
     flushHyperlink();
     if (item.kind === 'text') {
       const key = stableStringify(formattingAttrs(item.attributes));
-      const nextRun = createTextRun(item.text, item.attributes);
+      const nextRun = createTextRun(item.text, item.attributes, format);
       if (currentRun && currentFormattingKey === key) appendTextRun(currentRun, nextRun);
       else {
         flushRun();
@@ -1293,7 +1380,7 @@ function buildParagraphContent(
     }
 
     flushRun();
-    const child = ordinaryContentForItem(item, recovery);
+    const child = ordinaryContentForItem(item, recovery, format);
     if (child) content.push(child);
   }
 
@@ -1319,6 +1406,7 @@ function marksKeyToYrsAttrs(marksKey: string | undefined): Attrs | null {
     }
     if (name === 'comment' || name === 'footnoteRef') continue;
     if (BOOLEAN_MARKS.has(name)) attrs[name] = true;
+    else if (name === 'boldCs' || name === 'italicCs') attrs[name] = value.value;
     else if (name === 'highlight') attrs.highlight = value.color;
     else if (name === 'insertion' || name === 'deletion') {
       attrs[name === 'insertion' ? 'ins' : 'del'] = dropNulls({
@@ -1364,37 +1452,173 @@ function boundaryContent(boundary: OriginalRunBoundary, formatting: TextFormatti
   return content;
 }
 
+function sourceBreakBoundaries(paragraph: Paragraph | undefined): OriginalRunBoundary[] {
+  const recorded = paragraph && projectedBlocks.get(paragraph)?.sourceRuns;
+  if (recorded) return recorded;
+  const boundaries: OriginalRunBoundary[] = [];
+  for (const child of paragraph?.content ?? []) {
+    if (child.type !== 'run') {
+      if (
+        child.type === 'commentRangeStart' || child.type === 'commentRangeEnd' ||
+        child.type === 'bookmarkStart' || child.type === 'bookmarkEnd' || child.type === 'rawXml'
+      ) continue;
+      return [];
+    }
+    let text = '';
+    const breaks: NonNullable<OriginalRunBoundary['breaks']> = [];
+    for (const entry of child.content) {
+      if (entry.type === 'text') text += entry.text;
+      else if (entry.type === 'commentReference') text += '\uFFFC';
+      else if (entry.type === 'break' && (entry.breakType === 'page' || entry.breakType === 'column')) {
+        breaks.push({ offset: text.length, type: entry.breakType });
+      } else return [];
+    }
+    boundaries.push({ text, breaks });
+  }
+  return boundaries;
+}
+
+function liveRunBoundaries(
+  boundaries: OriginalRunBoundary[],
+  live: LiveParagraphBreaks
+): OriginalRunBoundary[] {
+  const count = boundaries.reduce((sum, boundary) =>
+    sum + (noteMarkContent(boundary) ? 0 : (boundary.breaks?.length ?? 0)), 0);
+  if (count === 0) return boundaries;
+  const source = boundaries.map((boundary): ParagraphContent => ({
+    type: 'run', content: boundaryContent(boundary, {}),
+  }));
+  const hoisted = count - trailingBlockBreaks({ type: 'paragraph', content: source }).length;
+  const visible = flowTokens(source).includes('visible');
+  let index = 0;
+  let leading = 0;
+  let trailing = 0;
+  return boundaries.map(boundary => {
+    if (!boundary.breaks?.length || noteMarkContent(boundary)) return boundary;
+    const breaks = boundary.breaks.filter(entry => {
+      const before = index++ < hoisted;
+      if (before && visible && entry.type === 'page') return live.leadingPage;
+      if (before) {
+        if (entry.type !== live.leading[leading]) return false;
+        leading += 1;
+      } else {
+        if (entry.type !== live.trailing[trailing]) return false;
+        trailing += 1;
+      }
+      return true;
+    });
+    return breaks.length === boundary.breaks.length ? boundary : { ...boundary, breaks };
+  });
+}
+
+function paragraphBreaksAreLive(content: ParagraphContent[], live: LiveParagraphBreaks): boolean {
+  const paragraph: Paragraph = { type: 'paragraph', content };
+  const tokens = flowTokens(content);
+  return (!(tokens[0] === 'page' && tokens.includes('visible')) || live.leadingPage) &&
+    leadingBlockBreaks(paragraph).every((kind, index) => kind === live.leading[index]) &&
+    trailingBlockBreaks(paragraph).every((kind, index) => kind === live.trailing[index]);
+}
+
+function restoreRecordedBreaks(
+  content: ParagraphContent[],
+  items: InlineItem[],
+  boundaries: OriginalRunBoundary[],
+  liveBreaks: LiveParagraphBreaks
+): ParagraphContent[] {
+  const breaks: { offset: number; type: BlockBreakKind }[] = [];
+  let start = 0;
+  for (const boundary of boundaries) {
+    let cursor = 0;
+    for (const entry of noteMarkContent(boundary) ? [] : (boundary.breaks ?? [])) {
+      cursor = Math.min(Math.max(entry.offset, cursor), boundary.text.length);
+      breaks.push({ offset: start + cursor, type: entry.type });
+    }
+    start += boundary.text.length;
+  }
+  if (breaks.length === 0) return content;
+  const source = boundaries.map((boundary): ParagraphContent => ({
+    type: 'run',
+    content: boundaryContent(boundary, {}),
+  }));
+  const trailing = trailingBlockBreaks({ type: 'paragraph', content: source });
+  const hoisted = breaks.length - trailing.length;
+  const visible = flowTokens(source).includes('visible');
+  const kept = breaks.filter(
+    (entry, index) => index >= hoisted || (visible && entry.type === 'page')
+  );
+  const recorded = boundaries.map((boundary) => boundary.text).join('');
+  const live = items
+    .map((item) => (item.kind === 'text' ? item.text : isBlockBreak(item) ? '' : '\uFFFC'))
+    .join('');
+  let prefix = 0;
+  const shared = Math.min(recorded.length, live.length);
+  while (prefix < shared && recorded[prefix] === live[prefix]) prefix += 1;
+  let suffix = 0;
+  while (
+    suffix < shared - prefix &&
+    recorded[recorded.length - 1 - suffix] === live[live.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+  const length = content.reduce((sum, child) => sum + paragraphContentLength(child), 0);
+  const placed = insertBoundaries(
+    content,
+    kept.map(({ offset }, id) => {
+      const mapped = offset <= prefix
+        ? offset
+        : offset >= recorded.length - suffix
+          ? offset + live.length - recorded.length
+          : Math.min(offset, live.length - suffix);
+      return { id, kind: 'start', offset: Math.min(Math.max(mapped, 0), length) };
+    }),
+    (boundary) => ({ type: 'run', content: [{ type: 'break', breakType: kept[boundary.id]!.type }] })
+  );
+  const placedTrailing = trailingBlockBreaks({ type: 'paragraph', content: placed });
+  return placedTrailing.length === trailing.length &&
+    placedTrailing.every((kind, index) => kind === trailing[index]) &&
+    paragraphBreaksAreLive(placed, liveBreaks)
+    ? placed
+    : content;
+}
+
 function restoreOriginalRuns(
   content: ParagraphContent[],
   items: InlineItem[],
-  boundaries: OriginalRunBoundary[] | undefined
+  boundaries: OriginalRunBoundary[] | undefined,
+  baseParagraph: Paragraph | undefined,
+  liveBreaks: LiveParagraphBreaks
 ): ParagraphContent[] {
+  if (!boundaries?.length) {
+    return restoreRecordedBreaks(content, items,
+      liveRunBoundaries(sourceBreakBoundaries(baseParagraph), liveBreaks), liveBreaks);
+  }
+  const recorded = liveRunBoundaries(boundaries, liveBreaks);
+  const fallback = (): ParagraphContent[] => restoreRecordedBreaks(content, items, recorded, liveBreaks);
   if (
-    !boundaries?.length ||
     !content.every(
       (child) => child.type === 'run' && child.content.every((entry) => entry.type === 'text')
     ) ||
     items.some((item) => item.kind !== 'text' || item.attributes.hyperlink) ||
-    boundaries.some((boundary) => boundary.noteMarks?.length && boundary.text.length > 0)
+    recorded.some((boundary) => boundary.noteMarks?.length && boundary.text.length > 0)
   ) {
-    return content;
+    return fallback();
   }
   const fullText = items.map((item) => (item.kind === 'text' ? item.text : '')).join('');
-  if (fullText !== boundaries.map((boundary) => boundary.text).join('')) return content;
+  if (fullText !== recorded.map((boundary) => boundary.text).join('')) return fallback();
 
   let itemIndex = 0;
   let itemOffset = 0;
   const restoredAttrs: Attrs[] = [];
-  for (const boundary of boundaries) {
+  for (const boundary of recorded) {
     const expected = marksKeyToYrsAttrs(boundary.marksKey);
-    if (!expected) return content;
+    if (!expected) return fallback();
     restoredAttrs.push(expected);
     let remaining = boundary.text.length;
     while (remaining > 0) {
       const item = items[itemIndex];
-      if (item?.kind !== 'text') return content;
+      if (item?.kind !== 'text') return fallback();
       if (stableStringify(formattingAttrs(item.attributes)) !== stableStringify(expected)) {
-        return content;
+        return fallback();
       }
       const available = item.text.length - itemOffset;
       const consumed = Math.min(remaining, available);
@@ -1407,24 +1631,19 @@ function restoreOriginalRuns(
     }
   }
 
-  if (itemIndex !== items.length || itemOffset !== 0) return content;
+  if (itemIndex !== items.length || itemOffset !== 0) return fallback();
 
-  return boundaries.map((boundary, index) => {
-    // restoreOriginalRuns restores the original segmentation/property-change
-    // cache, but non-empty runs keep formatting reconstructed from their live
-    // marks. Only empty runs have no node and therefore take cached formatting.
-    const formatting =
-      boundary.text.length === 0
-        ? boundary.formatting
-        : attrsToTextFormatting(restoredAttrs[index]);
+  const restored = recorded.map((boundary, index) => {
     const run: Run = {
       type: 'run',
-      content: boundaryContent(boundary, formatting ?? {}),
+      content: boundaryContent(boundary, attrsToTextFormatting(restoredAttrs[index])),
     };
+    const formatting = boundary.formatting;
     if (formatting && Object.keys(formatting).length > 0) run.formatting = formatting;
     if (boundary.propertyChanges?.length) run.propertyChanges = boundary.propertyChanges;
     return run;
   });
+  return paragraphBreaksAreLive(restored, liveBreaks) ? restored : content;
 }
 
 /** The story units a run entry projects from: one per UTF-16 unit of text, one per inline embed. */
@@ -1728,24 +1947,189 @@ function paragraphAttrs(properties: Attrs): ParagraphSaveAttrs {
   return attrs as ParagraphSaveAttrs;
 }
 
+function sourceRuns(content: readonly ParagraphContent[]): OriginalRunBoundary[] {
+  return content.flatMap((child): OriginalRunBoundary[] => {
+    if (child.type === 'run') {
+      return [{
+        text: child.content.map((entry) => {
+          if (entry.type === 'text' || entry.type === 'instrText') return entry.text;
+          if (entry.type === 'symbol') return entry.char;
+          if (entry.type === 'tab') return '\t';
+          if (entry.type === 'softHyphen') return '\u00ad';
+          if (entry.type === 'noBreakHyphen') return '\u2011';
+          return '\ufffc'.repeat(runContentLength(entry));
+        }).join(''),
+        formatting: child.formatting,
+      }];
+    }
+    if (child.type === 'hyperlink') return sourceRuns(child.children as ParagraphContent[]);
+    if (isTrackedWrapper(child) || child.type === 'inlineSdt') {
+      return sourceRuns(child.content as ParagraphContent[]);
+    }
+    return [{ text: '\ufffc'.repeat(paragraphContentLength(child)) }];
+  });
+}
+
+/** A midpoint of the shortest edit path, in UTF-16 units. */
+function editMidpoint(original: string, current: string): [number, number] | null {
+  const distanceLimit = Math.ceil((original.length + current.length) / 2);
+  const offset = distanceLimit + 1;
+  const forward = new Int32Array(2 * distanceLimit + 3).fill(-1);
+  const backward = new Int32Array(forward.length).fill(-1);
+  forward[offset + 1] = 0;
+  backward[offset + 1] = 0;
+  const delta = original.length - current.length;
+  const odd = delta % 2 !== 0;
+  let forwardStart = 0;
+  let forwardEnd = 0;
+  let backwardStart = 0;
+  let backwardEnd = 0;
+  for (let distance = 0; distance <= distanceLimit; distance += 1) {
+    for (let diagonal = -distance + forwardStart; diagonal <= distance - forwardEnd; diagonal += 2) {
+      const index = offset + diagonal;
+      let x = diagonal === -distance ||
+        (diagonal !== distance && forward[index - 1]! < forward[index + 1]!)
+        ? forward[index + 1]! : forward[index - 1]! + 1;
+      let y = x - diagonal;
+      while (x < original.length && y < current.length && original[x] === current[y]) {
+        x += 1;
+        y += 1;
+      }
+      forward[index] = x;
+      if (x > original.length) forwardEnd += 2;
+      else if (y > current.length) forwardStart += 2;
+      else if (odd && backward[offset + delta - diagonal]! >= 0 &&
+        x >= original.length - backward[offset + delta - diagonal]!) return [x, y];
+    }
+    for (let diagonal = -distance + backwardStart; diagonal <= distance - backwardEnd; diagonal += 2) {
+      const index = offset + diagonal;
+      let x = diagonal === -distance ||
+        (diagonal !== distance && backward[index - 1]! < backward[index + 1]!)
+        ? backward[index + 1]! : backward[index - 1]! + 1;
+      let y = x - diagonal;
+      while (x < original.length && y < current.length &&
+        original[original.length - x - 1] === current[current.length - y - 1]) {
+        x += 1;
+        y += 1;
+      }
+      backward[index] = x;
+      if (x > original.length) backwardEnd += 2;
+      else if (y > current.length) backwardStart += 2;
+      else if (!odd && forward[offset + delta - diagonal]! >= 0 &&
+        forward[offset + delta - diagonal]! >= original.length - x) {
+        const start = forward[offset + delta - diagonal]!;
+        return [start, start - delta + diagonal];
+      }
+    }
+  }
+  return null;
+}
+
+interface SourceTextMatch {
+  original: number;
+  current: number;
+  length: number;
+}
+
+function sourceTextMatches(original: string, current: string): SourceTextMatch[] {
+  const matches: SourceTextMatch[] = [];
+  const visit = (before: string, after: string, sourceOffset: number, liveOffset: number): void => {
+    let prefix = 0;
+    while (prefix < Math.min(before.length, after.length) && before[prefix] === after[prefix]) prefix += 1;
+    if (prefix > 0) matches.push({ original: sourceOffset, current: liveOffset, length: prefix });
+    let suffix = 0;
+    while (suffix < Math.min(before.length, after.length) - prefix &&
+      before[before.length - suffix - 1] === after[after.length - suffix - 1]) suffix += 1;
+    const oldMiddle = before.slice(prefix, before.length - suffix);
+    const newMiddle = after.slice(prefix, after.length - suffix);
+    if (oldMiddle.length > 0 && newMiddle.length > 0) {
+      const split = editMidpoint(oldMiddle, newMiddle);
+      if (split && (split[0] > 0 || split[1] > 0) &&
+        (split[0] < oldMiddle.length || split[1] < newMiddle.length)) {
+        visit(oldMiddle.slice(0, split[0]), newMiddle.slice(0, split[1]), sourceOffset + prefix, liveOffset + prefix);
+        visit(oldMiddle.slice(split[0]), newMiddle.slice(split[1]), sourceOffset + prefix + split[0], liveOffset + prefix + split[1]);
+      }
+    }
+    if (suffix > 0) matches.push({
+      original: sourceOffset + before.length - suffix,
+      current: liveOffset + after.length - suffix,
+      length: suffix,
+    });
+  };
+  visit(original, current, 0, 0);
+  return matches;
+}
+
+function preserveSourceRunFormatting(items: InlineItem[], sources: OriginalRunBoundary[]): InlineItem[] {
+  if (!sources.some((source) => SOURCE_RUN_PROPERTIES.some((key) => source.formatting?.[key] !== undefined))) {
+    return items;
+  }
+  const original = sources.map((source) => source.text).join('');
+  const current = items.map((item) => item.kind === 'text' ? item.text
+    : item.embedKind === 'tab' ? '\t' : '\ufffc').join('');
+  const matches = sourceTextMatches(original, current);
+  const mapped = (offset: number): number => {
+    if (offset === 0) return 0;
+    let sourceEnd = 0;
+    let liveEnd = 0;
+    for (const match of matches) {
+      if (offset < match.original) return offset === sourceEnd ? liveEnd : match.current;
+      if (offset <= match.original + match.length) return match.current + offset - match.original;
+      sourceEnd = match.original + match.length;
+      liveEnd = match.current + match.length;
+    }
+    return offset === sourceEnd ? liveEnd : current.length;
+  };
+  let sourceOffset = 0;
+  const spans = sources.map((source, index) => {
+    const start = mapped(sourceOffset);
+    sourceOffset += source.text.length;
+    return { start, end: index + 1 === sources.length ? current.length : mapped(sourceOffset), formatting: source.formatting };
+  }).filter((span) => span.end > span.start);
+  let offset = 0;
+  return items.flatMap((item): InlineItem[] => {
+    const end = offset + (item.kind === 'text' ? item.text.length : 1);
+    const slices: InlineItem[] = [];
+    while (offset < end) {
+      const span = spans.find((span) => span.start <= offset && offset < span.end);
+      const next = Math.min(end, span?.end ?? end);
+      const source = Object.fromEntries(SOURCE_RUN_PROPERTIES
+        .filter((key) => span?.formatting?.[key] !== undefined)
+        .map((key) => [key, span!.formatting![key]]));
+      const attributes = { ...item.attributes, _sourceRunFormatting: source };
+      slices.push(item.kind === 'text'
+        ? { ...item, text: item.text.slice(item.text.length - (end - offset), item.text.length - (end - next)), attributes }
+        : { ...item, attributes });
+      offset = next;
+    }
+    return slices;
+  });
+}
+
 function paragraphFromStory(
   paraId: string,
   properties: Attrs,
   items: InlineItem[],
   commentBoundaries: CommentBoundary[],
   baseParagraph: Paragraph | undefined,
+  liveBreaks: LiveParagraphBreaks,
   recovery: ChartRecovery,
+  format: RunFormatter,
   revisionIds?: RevisionIds,
   inherited?: ParagraphFormatting
 ): Paragraph {
   const attrs = paragraphAttrs(properties);
-  let content = buildParagraphContent(items, recovery, revisionIds);
+  const sources = baseParagraph ? sourceRuns(baseParagraph.content)
+    : Array.isArray(attrs._originalRunBoundaries) ? attrs._originalRunBoundaries as OriginalRunBoundary[] : [];
+  let content = buildParagraphContent(preserveSourceRunFormatting(items, sources), recovery, format, revisionIds);
   content = restoreOriginalRuns(
     content,
     items,
     Array.isArray(attrs._originalRunBoundaries)
       ? (attrs._originalRunBoundaries as OriginalRunBoundary[])
-      : undefined
+      : undefined,
+    baseParagraph,
+    liveBreaks
   );
   content = restoreRawInlines(content, baseParagraph);
   if (baseParagraph) restoreNestedOrdinals(content, baseParagraph.content);
@@ -1878,10 +2262,7 @@ function normalizeVMergeRuns(rows: TableRow[]): void {
 }
 
 function tableCellFromPayload(context: SaveContext, payload: TableCellPayload): TableCell {
-  const attrs = {
-    ...TABLE_CELL_ATTR_DEFAULTS,
-    ...(payload.tcPr ?? {}),
-  } as unknown as TableCellSaveAttrs;
+  const attrs = context.cellAttrs(payload);
   const content =
     payload.story && context.storyIds.has(payload.story)
       ? context.storyToBlocks(payload.story)
@@ -2013,8 +2394,9 @@ function tableFromPayload(context: SaveContext, payload: TablePayload): Table {
     ...(payload.tblPr ?? {}),
     columnWidths: grid.length > 0 ? grid : undefined,
   } as TableSaveAttrs;
+  context.applyTableBaseline(payload, attrs);
   let formatting = tableAttrsToFormatting(attrs);
-  if (!formatting?.borders) {
+  if (!formatting?.borders && !attrs._originalFormatting) {
     const borders = inferTableBorders(rows);
     if (borders) formatting = { ...(formatting ?? {}), borders };
   }
@@ -2247,6 +2629,8 @@ function restoreRawBlocks(projected: BlockContent[], base: readonly BlockContent
 
 /** A projected block plus a fingerprint of the story inputs it was built from. */
 interface ProjectedBlockMemo {
+  tableBaseline?: YrsTableInheritance;
+  tableSourcePrefix?: string;
   /** Bucket key for locating same-container candidates (first cell story / child story). */
   key?: string;
   /** Snapshot of the raw story inputs the block was built from. */
@@ -2255,6 +2639,9 @@ interface ProjectedBlockMemo {
   children?: readonly BlockContent[][];
   /** Session key of the pilcrow a paragraph was projected from. */
   sessionKey?: string;
+  /** The breaks of a projected paragraph that seeding moves behind it as block embeds. */
+  trailing?: readonly BlockBreakKind[];
+  sourceRuns?: OriginalRunBoundary[];
 }
 
 interface ProjectedStory {
@@ -2295,8 +2682,8 @@ function carryParagraphIdentities(
     const source = previous[index++];
     if (!source?.paraId) return block;
     const carried: Paragraph = { ...block, paraId: source.paraId };
-    const sessionKey = projectedBlocks.get(source)?.sessionKey;
-    if (sessionKey) projectedBlocks.set(carried, { sessionKey });
+    const memo = projectedBlocks.get(source);
+    if (memo?.sessionKey) projectedBlocks.set(carried, { sessionKey: memo.sessionKey, sourceRuns: memo.sourceRuns });
     return carried;
   });
 }
@@ -2310,18 +2697,26 @@ export function ownProjectedParagraphs(blocks: readonly BlockContent[]): BlockCo
   return blocks.map((block) => {
     if (block.type === 'paragraph') {
       const own: Paragraph = { ...block };
-      const sessionKey = projectedBlocks.get(block)?.sessionKey;
-      if (sessionKey) projectedBlocks.set(own, { sessionKey });
+      const memo = projectedBlocks.get(block);
+      if (memo?.sessionKey) projectedBlocks.set(own, { sessionKey: memo.sessionKey, sourceRuns: memo.sourceRuns });
       return own;
     }
     if (block.type !== 'table') return block;
-    return {
+    const own: Table = {
       ...block,
       rows: block.rows.map((row) => ({
         ...row,
         cells: row.cells.map((cell) => ({ ...cell, content: ownProjectedParagraphs(cell.content) })),
       })),
     };
+    const prior = projectedBlocks.get(block);
+    if (prior) {
+      projectedBlocks.set(own, {
+        tableBaseline: prior.tableBaseline,
+        tableSourcePrefix: prior.tableSourcePrefix,
+      });
+    }
+    return own;
   });
 }
 const sessionProjectionMemos = new WeakMap<YrsSession, SessionProjectionMemo>();
@@ -2361,7 +2756,61 @@ const NESTED_STORY_ID = /^(.*?)(?::t\d+:r\d+c\d+|:sdt\d+)$/;
 
 /** Page and column breaks the layout gives a block of their own, ahead of a paragraph. */
 const isBlockBreak = (item: InlineItem): boolean =>
-  item.kind === 'embed' && (item.embedKind === 'pageBreak' || item.embedKind === 'columnBreak');
+  item.kind === 'embed' && blockBreakKind(item.embedKind) !== null;
+
+type BlockBreakKind = 'page' | 'column';
+
+function blockBreakKind(embedKind: string): BlockBreakKind | null {
+  return embedKind === 'pageBreak' ? 'page' : embedKind === 'columnBreak' ? 'column' : null;
+}
+
+type FlowToken = BlockBreakKind | 'visible';
+
+function runFlowTokens(run: Run, tokens: FlowToken[]): void {
+  for (const content of run.content) {
+    if (content.type === 'break' && (content.breakType === 'page' || content.breakType === 'column')) {
+      tokens.push(content.breakType);
+    } else if (content.type !== 'text' || content.text.length > 0) tokens.push('visible');
+  }
+}
+
+function flowTokens(content: readonly ParagraphContent[], tokens: FlowToken[] = []): FlowToken[] {
+  for (const item of content) {
+    if (item.type === 'run') runFlowTokens(item, tokens);
+    else if (item.type === 'hyperlink') {
+      for (const child of item.children) if (child.type === 'run') runFlowTokens(child, tokens);
+    } else if (item.type === 'simpleField') {
+      for (const child of item.content) if (child.type === 'run') runFlowTokens(child, tokens);
+    } else if (item.type === 'complexField') {
+      for (const child of [...item.fieldCode, ...item.fieldResult]) runFlowTokens(child, tokens);
+    } else if (item.type === 'inlineSdt') flowTokens(item.content as ParagraphContent[], tokens);
+    else if (item.type === 'insertion' || item.type === 'deletion' || item.type === 'moveFrom' || item.type === 'moveTo') {
+      for (const child of item.content) if (child.type === 'run') runFlowTokens(child, tokens);
+    } else if (item.type === 'mathEquation') tokens.push('visible');
+  }
+  return tokens;
+}
+
+function leadingBlockBreaks(paragraph: Paragraph): BlockBreakKind[] {
+  const tokens = flowTokens(paragraph.content);
+  if (!tokens.includes('visible')) return tokens.slice(0, tokens.lastIndexOf('column') + 1) as BlockBreakKind[];
+  return tokens[0] === 'column' ? ['column'] : [];
+}
+
+/** The breaks of `paragraph` that seeding moves behind it as block embeds, in order. */
+function trailingBlockBreaks(paragraph: Paragraph): BlockBreakKind[] {
+  const tokens = flowTokens(paragraph.content);
+  if (!tokens.includes('visible')) return tokens.slice(tokens.lastIndexOf('column') + 1) as BlockBreakKind[];
+  const trailing: BlockBreakKind[] = [];
+  let leading = false;
+  let visible = false;
+  for (const token of tokens) {
+    if (token === 'visible') visible = true;
+    else if (visible || leading) trailing.push(token);
+    else leading = true;
+  }
+  return trailing;
+}
 
 /** Stories a committed op touched; `all` invalidates the whole session. */
 export function noteYrsStoriesDirty(
@@ -2407,6 +2856,15 @@ class SaveContext {
   private readonly styles: StyleResolver;
   private readonly syntheticDefaults: boolean;
   private readonly inherited = new Map<string, ParagraphFormatting | undefined>();
+  private readonly styleDefinitions: Document['package']['styles'];
+  private runInheritance: YrsRunInheritance | null = null;
+  private readonly inheritedRuns = new Map<string, TextFormatting>();
+  private readonly sourceTables = new Map<string, Table>();
+  private readonly tableBaselines = new Map<Table, YrsTableInheritance>();
+  private readonly payloadBaselines = new WeakMap<TablePayload, YrsTableInheritance>();
+  private readonly sourceCells = new Map<string, YrsTableInheritance['rows'][number][number]>();
+  private readonly cellParagraphs = new Map<string, ParagraphFormatting | undefined>();
+  private readonly cellRuns = new Map<string, TextFormatting | undefined>();
 
   constructor(
     private readonly session: YrsSession,
@@ -2417,6 +2875,13 @@ class SaveContext {
     this.storyIds = new Set(session.storyIds());
     this.baseStories = collectBaseStories(session, base);
     for (const [storyId, blocks] of this.baseStories) {
+      let tableIndex = 0;
+      for (const block of blocks) {
+        if (block.type !== 'table') continue;
+        const prefix = projectedBlocks.get(block)?.tableSourcePrefix ?? `${storyId}:t${tableIndex}`;
+        this.sourceTables.set(prefix, block);
+        tableIndex += 1;
+      }
       const scoped = new Map<string, string>();
       collectChartDrawings(blocks, scoped);
       if (scoped.size > 0) this.baseChartDrawings.set(storyId, scoped);
@@ -2424,6 +2889,7 @@ class SaveContext {
     this.baseParagraphs = collectBaseParagraphs(this.baseStories);
     this.comments = commentRanges(session, base.package.document.comments, commentIds);
     this.memo = sessionProjectionMemo(session);
+    this.styleDefinitions = base.package.styles;
     this.styles = createStyleResolver(base.package.styles);
     const defaultStyle = this.styles.getDefaultParagraphStyle();
     this.syntheticDefaults =
@@ -2449,6 +2915,77 @@ class SaveContext {
       : !this.memo.dirty.has(storyId);
   }
 
+  private inheritance(): YrsRunInheritance {
+    return (this.runInheritance ??= this.session.runInheritance(this.styleDefinitions));
+  }
+
+  private prepareTable(payload: TablePayload, parent: string): void {
+    const cells = (Array.isArray(payload.rows) ? payload.rows : [])
+      .flatMap((row) => Array.isArray(row.cells) ? row.cells : []);
+    let source: { prefix: string; table: Table } | undefined;
+    const candidates = payload.tblPr?._originalFormatting ? cells : [];
+    for (const cell of candidates) {
+      const story = asString(cell.tcPr?._sourceCellStory) ?? asString(cell.story);
+      const prefix = story?.match(/^(.*:t\d+):r\d+c\d+$/)?.[1];
+      const table = prefix ? this.sourceTables.get(prefix) : undefined;
+      if (prefix && table) {
+        source = { prefix, table };
+        break;
+      }
+    }
+    if (source) {
+      let baseline = this.tableBaselines.get(source.table);
+      if (!baseline) {
+        baseline = projectedBlocks.get(source.table)?.tableBaseline ??
+          this.inheritance().tableAttributes(source.table);
+        this.tableBaselines.set(source.table, baseline);
+      }
+      this.payloadBaselines.set(payload, baseline);
+      const prefix = source.prefix;
+      baseline.rows.forEach((row, rowIndex) => {
+        row.forEach((cell, cellIndex) => {
+          this.sourceCells.set(`${prefix}:r${rowIndex}c${cellIndex}`, cell);
+        });
+      });
+    }
+    for (const cell of cells) {
+      if (typeof cell.story !== 'string') continue;
+      this.memo.parents.set(cell.story, parent);
+      const source = asString(cell.tcPr?._sourceCellStory) ?? cell.story;
+      this.cellParagraphs.set(cell.story, this.sourceCells.get(source)?.paragraphFormatting ?? undefined);
+      this.cellRuns.set(cell.story, this.sourceCells.get(source)?.runFormatting ?? undefined);
+    }
+  }
+
+  applyTableBaseline(payload: TablePayload, attrs: TableSaveAttrs): void {
+    const baseline = this.payloadBaselines.get(payload);
+    if (baseline) {
+      attrs._originalResolvedMargins = baseline.attributes.cellMargins as TableSaveAttrs['cellMargins'];
+    }
+  }
+
+  cellAttrs(payload: TableCellPayload): TableCellSaveAttrs {
+    const attrs = {
+      ...TABLE_CELL_ATTR_DEFAULTS,
+      ...(payload.tcPr ?? {}),
+    } as unknown as TableCellSaveAttrs;
+    const origin = asString(payload.tcPr?._sourceCellStory);
+    const source = origin ?? asString(payload.story);
+    const baseline = source !== undefined ? this.sourceCells.get(source) : undefined;
+    if (baseline) {
+      attrs._originalResolvedBorders = baseline.attributes.borders as TableCellSaveAttrs['borders'];
+      attrs._originalResolvedMargins = baseline.attributes.margins as TableCellSaveAttrs['margins'];
+      const original = asObject(baseline.attributes._originalFormatting);
+      if (origin && original && !attrs._originalFormatting) {
+        const formatting = { ...original };
+        delete formatting.gridSpan;
+        delete formatting.vMerge;
+        attrs._originalFormatting = formatting as TableCellSaveAttrs['_originalFormatting'];
+      }
+    }
+    return attrs;
+  }
+
   private cellContents(payload: TablePayload, parent: string): BlockContent[][] {
     const contents: BlockContent[][] = [];
     for (const row of Array.isArray(payload.rows) ? payload.rows : []) {
@@ -2464,20 +3001,21 @@ class SaveContext {
     return contents;
   }
 
-  /**
-   * What a paragraph of `storyId` with pilcrow `properties` inherits from
-   * docDefaults and its style. None where more can apply than the resolver
-   * sees: table cells and content controls (a table style), numbered
-   * paragraphs or styles (the numbering level), synthesized defaults, and
-   * left and right indents (the style parser ignores w:start and w:end).
-   */
   private inheritedFormatting(storyId: string, properties: Attrs): ParagraphFormatting | undefined {
-    if (NESTED_STORY_ID.test(storyId) || this.syntheticDefaults || properties.numPr != null) {
+    const cell = this.cellParagraphs.has(storyId);
+    if (
+      (NESTED_STORY_ID.test(storyId) && !cell) ||
+      (this.syntheticDefaults && !cell) || properties.numPr != null
+    ) {
       return undefined;
     }
-    const key = typeof properties.pStyle === 'string' ? properties.pStyle : '';
+    const style = typeof properties.pStyle === 'string' ? properties.pStyle : '';
+    const tableFormatting = this.cellParagraphs.get(storyId);
+    const key = cell ? JSON.stringify([style, tableFormatting]) : style;
     if (!this.inherited.has(key)) {
-      const resolved = this.styles.resolveParagraphStyle(key || null).paragraphFormatting;
+      const resolved = cell
+        ? this.inheritance().paragraphFormatting(style || null, tableFormatting)
+        : this.styles.resolveParagraphStyle(style || null).paragraphFormatting;
       if (resolved === undefined || resolved.numPr != null) {
         this.inherited.set(key, undefined);
       } else {
@@ -2488,6 +3026,35 @@ class SaveContext {
       }
     }
     return this.inherited.get(key);
+  }
+
+  /**
+   * How the runs of a paragraph with pilcrow `properties` save: relative to
+   * what seeding merged into their marks under the styles the package saves.
+   */
+  private runFormatter(story: string, properties: Attrs): RunFormatter {
+    const paragraphStyle = typeof properties.pStyle === 'string' ? properties.pStyle : null;
+    return (attributes) =>
+      relativeFormatting(
+        attributes,
+        this.inheritedRun(paragraphStyle, asString(asObject(attributes.runStyle)?.styleId) || null, this.cellRuns.get(story))
+      );
+  }
+
+  private inheritedRun(paragraphStyle: string | null, runStyle: string | null, tableRun: TextFormatting | undefined): TextFormatting {
+    const key = JSON.stringify([paragraphStyle, runStyle, tableRun]);
+    let inherited = this.inheritedRuns.get(key);
+    if (inherited === undefined) {
+      const inheritance = this.inheritance();
+      inherited = attrsToTextFormatting(inheritance.attributes(paragraphStyle, runStyle, tableRun));
+      this.inheritedRuns.set(key, inherited);
+    }
+    return inherited;
+  }
+
+  dispose(): void {
+    this.runInheritance?.dispose();
+    this.runInheritance = null;
   }
 
   recovery(storyId: string): ChartRecovery {
@@ -2531,6 +3098,18 @@ class SaveContext {
     const blocks: BlockContent[] = [];
     const paragraphIds = this.session.storyParagraphIds(storyId);
     const segments = this.session.storySegments(storyId);
+    const trailingByParagraph = new Map<string, BlockBreakKind[]>();
+    let closing: string | undefined;
+    for (const segment of segments) {
+      if (segment.kind === 'pilcrow') {
+        closing = segment.paraId;
+        trailingByParagraph.set(closing, []);
+      } else {
+        const kind = segment.kind === 'embed' ? blockBreakKind(segment.embedKind) : null;
+        if (kind && closing !== undefined) trailingByParagraph.get(closing)!.push(kind);
+        else closing = undefined;
+      }
+    }
     let items: InlineItem[] = [];
     let paragraphStart = 0;
     let inlineStart = 0;
@@ -2594,16 +3173,23 @@ class SaveContext {
       if (cursor < text.length) items.push({ kind: 'text', text: text.slice(cursor), attributes });
     };
 
+    // Block breaks the previous paragraph's own content carries, and those only the stream does.
+    let witnesses: BlockBreakKind[] = [];
+    let breaks: BlockBreakKind[] = [];
     for (const segment of segments) {
       if (segment.kind === 'text') {
         pushText(segment.text, segment.attributes);
         storyOffset += segment.text.length;
+        witnesses = [];
         continue;
       }
       if (segment.kind === 'pilcrow') {
+        const liveTrailing = trailingByParagraph.get(segment.paraId)!;
         const savedParaId = paragraphIds[paragraphIndex] ?? '';
         const baseParagraph = this.baseParagraphs.get(segment.paraId);
         const boundaries = paragraphCommentBoundaries(storyOffset);
+        const source = sourceBreakBoundaries(baseParagraph);
+        const sourceRuns = source.some(boundary => boundary.breaks?.length) ? source : undefined;
         const inputs = [
           segment.paraId,
           savedParaId,
@@ -2611,6 +3197,9 @@ class SaveContext {
           segment.attributes,
           items,
           boundaries,
+          breaks,
+          liveTrailing,
+          sourceRuns,
         ] as const;
         const priorMemo =
           baseParagraph !== undefined ? projectedBlocks.get(baseParagraph) : undefined;
@@ -2621,6 +3210,7 @@ class SaveContext {
           sameJson(priorMemo.inputs, inputs)
         ) {
           paragraph = baseParagraph;
+          witnesses = [...(priorMemo.trailing ?? trailingBlockBreaks(baseParagraph))];
         } else {
           // Projection mutates `item.payload`; pin the pre-mutation inputs.
           const snapshot = inputs.map((input, index) =>
@@ -2632,14 +3222,25 @@ class SaveContext {
             items,
             boundaries,
             baseParagraph,
+            { leading: breaks, trailing: liveTrailing, leadingPage: segment.properties.pageBreakBeforeRun === true },
             this.recovery(storyId),
+            this.runFormatter(storyId, segment.properties),
             this.revisionIds,
             this.inheritedFormatting(storyId, segment.properties)
           );
-          projectedBlocks.set(paragraph, { inputs: snapshot, sessionKey: segment.paraId });
+          const trailing = trailingBlockBreaks(paragraph);
+          const leading = leadingBlockBreaks(paragraph);
+          const consumed = leading.every((kind, index) => kind === breaks[index]) ? leading.length : 0;
+          const pending = breaks.slice(consumed);
+          if (pending.length) paragraph = { ...paragraph, content: [...pending.map((breakType): ParagraphContent => ({
+            type: 'run', content: [{ type: 'break', breakType }],
+          })), ...paragraph.content] };
+          projectedBlocks.set(paragraph, { inputs: snapshot, sessionKey: segment.paraId, trailing, sourceRuns });
+          witnesses = [...trailing];
         }
         blocks.push(paragraph);
         items = [];
+        breaks = [];
         paragraphIndex += 1;
         storyOffset += 1;
         paragraphStart = storyOffset;
@@ -2649,6 +3250,7 @@ class SaveContext {
 
       if (segment.embedKind === 'table') {
         const payload = segment.payload as TablePayload;
+        this.prepareTable(payload, storyId);
         const inputs = [segment.attributes, payload] as const;
         const firstCell = Array.isArray(payload.rows) ? payload.rows[0]?.cells?.[0] : undefined;
         const key = `T${firstCell?.story ?? ''}`;
@@ -2666,6 +3268,8 @@ class SaveContext {
           projectedBlocks.set(table, {
             key,
             inputs,
+            tableBaseline: this.payloadBaselines.get(payload),
+            tableSourcePrefix: asString(firstCell?.story)?.match(/^(.*:t\d+):r\d+c\d+$/)?.[1],
             children: contents ?? this.cellContents(payload, storyId),
           });
         }
@@ -2727,16 +3331,42 @@ class SaveContext {
       } else {
         items.push(segment as EmbedItem);
       }
+      const kind = blockBreakKind(segment.embedKind);
+      if (!kind) witnesses = [];
+      else if (witnesses.includes(kind)) witnesses.splice(witnesses.indexOf(kind), 1);
+      else breaks.push(kind);
       storyOffset += 1;
       if (items.every(isBlockBreak)) inlineStart = storyOffset;
     }
 
+    const pendingBreaks = breaks.map((breakType): ParagraphContent => ({
+      type: 'run', content: [{ type: 'break', breakType }],
+    }));
     // Defensive recovery for malformed/legacy stories without a final pilcrow.
-    // A story ending in a flow-break embed is well-formed, not a lost
-    // paragraph, so only content the projection can carry opens one.
     if (items.length > 0) {
-      const trailing = buildParagraphContent(items, this.recovery(storyId), this.revisionIds);
-      if (trailing.length > 0) blocks.push({ type: 'paragraph', content: trailing });
+      const trailing = buildParagraphContent(
+        items,
+        this.recovery(storyId),
+        directFormatting,
+        this.revisionIds
+      );
+      if (trailing.length > 0) {
+        blocks.push({ type: 'paragraph', content: breaks.length ? [...pendingBreaks, ...trailing] : trailing });
+        breaks = [];
+      }
+    }
+    if (breaks.length > 0) {
+      let index = blocks.length - 1;
+      while (index >= 0 && blocks[index]!.type !== 'paragraph') index -= 1;
+      const previous = blocks[index];
+      if (previous?.type === 'paragraph') {
+        const paragraph: Paragraph = { ...previous, content: [...previous.content, ...pendingBreaks] };
+        const memo = projectedBlocks.get(previous);
+        if (memo?.sessionKey) projectedBlocks.set(paragraph, { sessionKey: memo.sessionKey, sourceRuns: memo.sourceRuns });
+        blocks[index] = paragraph;
+      } else {
+        blocks.push({ type: 'paragraph', content: pendingBreaks });
+      }
     }
     const projected = restoreRawBlocks(blocks, baseBlocks ?? []);
     this.memo.stories.set(storyId, { commentsKey, blocks: projected });
@@ -2791,20 +3421,22 @@ function projectDocument(
 ): Document {
   const previous = projectedMedia;
   projectedMedia = (token) => session.mediaDataUrl?.(token) ?? null;
+  let context: SaveContext | undefined;
   try {
-    return projectStories(session, base, options, revisionIds);
+    context = new SaveContext(session, base, options.commentIds, revisionIds);
+    return projectStories(context, session, base, options);
   } finally {
+    context?.dispose();
     projectedMedia = previous;
   }
 }
 
 function projectStories(
+  context: SaveContext,
   session: YrsSession,
   base: Document,
-  options: YrsToDocumentOptions,
-  revisionIds?: RevisionIds
+  options: YrsToDocumentOptions
 ): Document {
-  const context = new SaveContext(session, base, options.commentIds, revisionIds);
   const shouldProject = (storyId: string): boolean =>
     options.storyIds === undefined || options.storyIds.has(storyId);
   const bodyContent = context.storyIds.has('body') && shouldProject('body')

@@ -18,6 +18,7 @@ import type {
 import type { TransferResult } from '../../../../shared/office-session/protocol';
 import type { MethodHandlers, MethodPolicies } from '../../../../shared/office-session/types';
 import type { ColorValue } from '../types/colors';
+import type { Comment } from '../types/content';
 import type {
   YrsAuthor,
   YrsContentControlValue,
@@ -32,15 +33,21 @@ import type {
   YrsSession,
   YrsStickyPosition,
   YrsStoryRange,
+  YrsTableRange,
 } from './index';
+import type { DocxClipboardFragment } from './clipboardFragment';
 import type { LayoutMetaV1 } from './layoutMeta';
 import type { DecodedFrameDelta } from '../layout/render/frameDelta';
 import type { ResidentEngineSession } from './residentEngineSession';
 import type { DocxCommandSelectionLayout } from './residentCommandSelection';
+import type { DocxProposalRegistry, DocxProposalRequest, DocxProposalStateRequest, DocxProposalWithdrawRequest } from './proposals';
+import type { DocxCommentPatch } from './residentReview';
 import type { DocxCellNavigationPlan } from './residentCommandCells';
+import type { DocxTableCommandTarget } from './residentCommandTables';
 import type { DocxPartTarget, ResidentPartTarget, ResidentPartGeometry } from './residentParts';
 import type { SectionProperties, Watermark, FootnoteProperties, EndnoteProperties } from '../types/document';
 import type { DocxSectionMargins } from './residentSections';
+import type { ResidentFrameGeometry } from './residentObjectGeometry';
 
 export type DocxCommandPosition = YrsLoc & { sticky?: Uint8Array };
 
@@ -65,6 +72,8 @@ export interface DocxCommandTableContext {
   columnCount: number;
   hasMultiCellSelection: boolean;
   canSplitCell: boolean;
+  rowSpan?: number;
+  columnSpan?: number;
   justification?: string;
   cellBorderColor?: ColorValue;
   cellBackgroundColor?: string;
@@ -76,11 +85,20 @@ export type DocxEffectiveFormatting = Pick<
   | 'fontFamily' | 'color' | 'highlight' | 'styleId' | 'alignment'
 > & { fontSizePt: number | null };
 
+/** The comment an `addComment` command added, under the ID saves and the host use, with every comment after it. */
+export interface DocxCommentResult {
+  seq: number;
+  id: number;
+  comments: Comment[];
+}
+
 export interface DocxEditState {
   documentVersion?: string;
   batch?: { seq: number; result: DocxEditResult };
+  comment?: DocxCommentResult;
   activePart?: ResidentPartTarget | null;
   readOnly: boolean;
+  review?: { version: string; previewVersion: number };
   toolbar: YrsSelectionContext | null;
   effectiveFormatting: DocxEffectiveFormatting | null;
   storedMarks: DocxStoredMarks | null;
@@ -169,7 +187,48 @@ export interface DocxEchoDamageDependency {
   page: DocxCommandPageIdentity;
   rect: DocxEchoRect;
   backgroundId: string;
-  primitiveIds: readonly string[];
+  /** The echoed line's runs and decorations, which the background leaves out. */
+  omittedPrimitiveIds: readonly string[];
+}
+
+/**
+ * @internal The echoed line as the engine places it: one cluster per character, shaped through
+ * one glyph set, at pen positions `round3(x + sum of advances)`.
+ */
+export interface DocxEchoGlyphLine {
+  /** Key of the glyph set the line shapes with. */
+  glyphSet: string;
+  fontId: number;
+  size: number;
+  color: string;
+  x: number;
+  y: number;
+  /** The paragraph character after the line, which kerns with its last one; empty at the end. */
+  next: string;
+  /** Rightmost pen end a lengthened line keeps without wrapping. */
+  right: number;
+  canEmpty?: boolean;
+  /** Free width at the end of the previous line, when this line continues a paragraph. */
+  previousSlack?: number;
+  /** Width of the next line's leading letters and digits, when a line follows. */
+  nextWord?: number;
+  /** Repainted region in device pixels, and the scale pages raster at. */
+  device: DocxEchoRect;
+  pixelRatio: number;
+}
+
+/** @internal Shaping facts of one font at one size, indexed by `alphabet`; see `echo_glyph_set_json`. */
+export interface DocxEchoGlyphSet {
+  key: string;
+  fontId: number;
+  alphabet: string;
+  horizontal: number;
+  glyphIds: readonly number[];
+  advances: readonly number[];
+  kerning: readonly (readonly [number, number, number])[];
+  unsafePairs: readonly (readonly [number, number])[];
+  /** Outline JSON per glyph id, exactly as the worker's glyph cache reads it. */
+  outlines: Readonly<Record<string, string>>;
 }
 
 /** @internal Bounded, display-only active context; never a command target. */
@@ -185,6 +244,7 @@ export interface DocxCommandEchoContext {
   transform: DocxEchoTransform;
   damage: readonly DocxEchoDamageDependency[];
   shaping: 'simple-ltr' | 'unsupported';
+  glyphs?: DocxEchoGlyphLine;
 }
 
 /** @internal Transferable authoritative pixels and optional text-free restoration pixels. */
@@ -219,10 +279,40 @@ export interface DocxCommandPayloads {
   setSectionMargins: { section: string; margins: DocxSectionMargins; expectVersion: string };
   setTabStops: DocxSelectionIntent & { tabs: YrsParagraphAttrs['tabs']; expectVersion: string };
   removeTabStop: DocxSelectionIntent & { positionTwips: number; expectVersion: string };
+  formatSelection: DocxSelectionIntent & { delta: YrsInlineFormatDelta };
+  toggleStrike: DocxSelectionIntent;
+  toggleList: DocxSelectionIntent & { kind: 'bullet' | 'numbered' };
+  changeIndent: DocxSelectionIntent & { direction: 'increase' | 'decrease' };
+  insertImage: DocxSelectionIntent & { image: Readonly<Record<string, unknown>> };
+  insertTable: DocxSelectionIntent & { rows: number; columns: number };
+  insertTableRow: DocxSelectionIntent & { side: 'above' | 'below' };
+  insertTableColumn: DocxSelectionIntent & { side: 'left' | 'right' };
+  deleteTableRow: DocxSelectionIntent;
+  deleteTableColumn: DocxSelectionIntent;
+  deleteTable: DocxSelectionIntent;
+  mergeTableCells: DocxSelectionIntent;
+  splitTableCell: DocxSelectionIntent & { rows: number; columns: number };
+  setTableCellShading: DocxSelectionIntent & { color: string | null };
+  pasteFragment: DocxSelectionIntent & { fragment: DocxClipboardFragment };
+  insertPageBreak: DocxSelectionIntent;
+  insertSectionBreak: DocxSelectionIntent & { type: 'nextPage' | 'continuous' | 'oddPage' | 'evenPage' };
+  resizeObject: { handle: string; expectVersion: string } &
+    ({ widthEmu: number; heightEmu: number } | { widthTwips: number });
+  moveObject: { handle: string; hOffsetEmu: number; vOffsetEmu: number; expectVersion: string };
   replaceMatches: { targets: DocxTextRange[]; text: string; expectVersion: string; suggesting?: YrsAuthor };
   undo: Record<string, never>;
   redo: Record<string, never>;
+  addComment: { ranges: YrsStoryRange[]; author: string; date: string; body: unknown; expectVersion: string };
+  updateComment: { id: string; patch: DocxCommentPatch; expectVersion: string };
+  setCommentRanges: { id: string; ranges: YrsStoryRange[]; expectVersion: string };
+  removeComment: { id: string; expectVersion: string };
+  acceptRevision: { revisionId: string; expectVersion: string };
+  rejectRevision: { revisionId: string; expectVersion: string };
+  propose: DocxProposalRequest;
+  setProposalStates: DocxProposalStateRequest;
+  withdrawProposals: DocxProposalWithdrawRequest;
   navigateCell: DocxSelectionIntent & { direction: 'forward' | 'backward'; extend: boolean; createLastRow: boolean };
+  selectTableCells: DocxSelectionIntent & { target: 'table' | 'row' | 'column' };
   select: { selection: DocxCommandSelection };
   navigate: DocxNavigationIntent;
   selectPoint: DocxSelectionPointIntent;
@@ -250,6 +340,7 @@ export type DocxCommandIntent = {
 export interface DocxCommandFramePayload {
   fontEnvironment?: ResidentFontEnvironmentSnapshot;
   parts?: ResidentPartGeometry[];
+  geometry?: ResidentFrameGeometry;
   frame: ArrayBuffer;
   pageFrames?: ArrayBuffer[];
   caret: YrsResidentCaretSnapshot;
@@ -258,7 +349,11 @@ export interface DocxCommandFramePayload {
   documentVersion?: string;
   layoutMeta?: LayoutMetaV1;
   layoutProvisional?: boolean;
+  finalizedPages?: number;
+  documentWidth?: number;
   echoContext?: DocxCommandEchoContext;
+  /** Glyph sets the main thread has not been sent yet in this session. */
+  echoGlyphSets?: DocxEchoGlyphSet[];
   stagedPresentation?: DocxCommandStagedPresentation;
 }
 
@@ -285,6 +380,8 @@ export interface ResidentCommandInitRequest {
   extras: string;
   displayWindow?: [number, number];
   retainBuiltPages?: boolean;
+  provisionalPages?: number;
+  rasterScale?: number;
 }
 
 export type ResidentCommandInitReply = DocxCommandAck &
@@ -302,6 +399,10 @@ export interface PreparedDocxCommand {
   selection: DocxCommandSelection | null;
   range: YrsStoryRange | null;
   cellNavigation?: DocxCellNavigationPlan;
+  cells?: YrsTableRange | null;
+  table?: DocxTableCommandTarget;
+  paragraphChanges?: Array<{ range: YrsStoryRange; attrs: YrsParagraphAttrs }>;
+  sectionBreakProperties?: SectionProperties;
 }
 
 export type DocxCommandPreflightResult =
@@ -324,6 +425,7 @@ export interface ResidentCommandHooks {
 /** @internal Worker-owned layout access for ordered selection resolution. */
 export interface ResidentCommandHooksEnvironment {
   supportsFontEnvironment?: boolean;
+  proposals?: DocxProposalRegistry;
   readSelectionLayout(): DocxCommandSelectionLayout;
   setRenderEnvironment?(environment: DocxCommandPayloads['setRenderEnvironment']): void;
 }
@@ -365,6 +467,7 @@ export interface ResidentCommandViewportRequest {
   start: number;
   end: number;
   frameEpoch: number;
+  rasterScale?: number;
 }
 
 export interface ResidentCommandClient {
@@ -413,12 +516,15 @@ export interface ResidentDocxCommandState {
   selection: DocxCommandSelection | null;
   storedMarks: DocxStoredMarks | null;
   stickyPositions: Map<string, YrsStickyPosition>;
+  proposals?: DocxProposalRegistry;
 }
 
 export type ResidentDocxCommandEngine = ResidentEngineSession & Pick<YrsSession,
   | 'paragraphs' | 'selectionContext' | 'storySegments' | 'cellSelection' | 'tablePayload'
   | 'insertText' | 'replaceRange' | 'deleteRange' | 'splitParagraph'
   | 'toggleMark' | 'formatRange' | 'clearFormatting' | 'setParagraphAttrs' | 'applyParagraphStyle'
+  | 'insertColumn' | 'deleteRow' | 'deleteColumn' | 'deleteTable'
+  | 'mergeCells' | 'splitCell' | 'setCellShading'
   | 'beginUndoCapture' | 'canUndo' | 'canRedo'
 >;
 

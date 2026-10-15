@@ -1,9 +1,29 @@
 import { test, expect, type Page } from 'playwright/test';
 
+let peerless = false;
+
 async function open(page: Page) {
-  await page.goto('/');
+  await page.goto(peerless ? '/?peerless=1' : '/');
   await expect(page.locator('canvas[data-page-index="0"]')).toBeVisible({ timeout: 120_000 });
   await expect(page.locator('[data-probe-page="0"]')).toBeAttached({ timeout: 60_000 });
+}
+
+// Chromium's inspector holds an awaited promise weakly: a GC after it settles but before the reply
+// fails the call ("Promise was collected", reported as a navigation). The holder keeps it reachable.
+async function operate<R, A = undefined>(page: Page, operation: (arg: A) => Promise<R>, arg?: A): Promise<R> {
+  const holder = await page.evaluateHandle<{ run(arg: unknown): Promise<R>; promise?: Promise<R> }>(
+    `({ run: ${operation} })`
+  );
+  try {
+    const result = await holder.evaluateHandle((holder, arg) => (holder.promise = holder.run(arg)), arg);
+    try {
+      return (await result.jsonValue()) as R;
+    } finally {
+      await result.dispose();
+    }
+  } finally {
+    await holder.dispose();
+  }
 }
 
 async function offsets(page: Page) {
@@ -20,6 +40,9 @@ async function offsets(page: Page) {
   });
 }
 
+for (const mode of ['hybrid', 'peerless'] as const) {
+  test.describe(mode, () => {
+    test.beforeEach(() => { peerless = mode === 'peerless'; });
 test('managed overlays land on the rendered pages at every zoom', async ({ page }) => {
   await open(page);
   await expect(page.getByTestId('probe-card')).toBeVisible();
@@ -52,7 +75,7 @@ test('after an edit, overlays and sidebar cards follow the new version; cards ke
   const before = await card.getAttribute('data-version');
   await page.getByTestId('probe-append').click();
   await expect(card).not.toHaveAttribute('data-version', before!);
-  const version = await page.evaluate(async () => {
+  const version = await operate(page, async () => {
     const editor = (
       window as unknown as {
         __probe: {
@@ -84,6 +107,48 @@ test('navigation scrolls the paragraph into view and reports success', async ({ 
   await expect
     .poll(() => scroller.evaluate((element) => element.scrollTop))
     .toBeGreaterThan(before);
+});
+
+test('navigation keeps the selection unless focus is requested', async ({ page }) => {
+  await open(page);
+  const paragraphs = () => operate(page, async () =>
+    (await (window as unknown as LooseProbe).__probe.editor.readParagraphs({ view: 'accepted' })).paragraphs);
+  const text = async (paraId: string) => (await paragraphs()).find(paragraph => paragraph.paraId === paraId)?.text;
+  const navigate = async (id: string) => {
+    await page.evaluate(() => { (window as unknown as { __probe: { navigation: unknown } }).__probe.navigation = null; });
+    await page.getByTestId(id).click();
+    await expect.poll(() => page.evaluate(() => (window as unknown as { __probe: { navigation: unknown } }).__probe.navigation)).toEqual({ ok: true });
+  };
+  const before = await paragraphs();
+  const origin = before[0]!;
+  const destination = before.filter(paragraph => paragraph.text.trim()).at(-1)!;
+  expect(destination.paraId).not.toBe(origin.paraId);
+  await page.evaluate(() => (window as unknown as LooseProbe).__probe.editor.focus());
+  await page.keyboard.press('ControlOrMeta+Home');
+  await navigate('probe-navigate');
+  await page.evaluate(() => (window as unknown as LooseProbe).__probe.editor.focus());
+  await page.keyboard.type('Q7');
+  await expect.poll(() => text(origin.paraId)).toBe(`Q7${origin.text}`);
+  expect(await text(destination.paraId)).toBe(destination.text);
+  await navigate('probe-navigate-focus');
+  await page.keyboard.type('R8');
+  await expect.poll(() => text(destination.paraId)).toBe(`R8${destination.text}`);
+  expect(await text(origin.paraId)).toBe(`Q7${origin.text}`);
+});
+
+test('navigation builds and reaches a paragraph on an unresident page', async ({ page }) => {
+  await open(page);
+  const filled = await operate(page, async () => {
+    const { editor } = (window as unknown as LooseProbe).__probe;
+    const read = await editor.readParagraphs({ view: 'accepted' });
+    return editor.applyEdits({ expectVersion: read.version, steps: [{ op: 'insertParagraphs',
+      target: { story: 'body', paraId: read.paragraphs.at(-1)!.paraId }, at: 'end',
+      paragraphs: Array.from({ length: 100 }, (_, index) => ({ text: `Paragraph ${index + 1} needs a later resident page.` })) }] });
+  });
+  expect(filled).toMatchObject({ ok: true, applied: true });
+  await page.getByTestId('probe-navigate').click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __probe: { navigation: unknown } }).__probe.navigation)).toEqual({ ok: true });
+  await expect.poll(() => page.locator('.docx-editor__scroll-container').evaluate(element => element.scrollTop)).toBeGreaterThan(1000);
 });
 
 test('dock tabs work by keyboard, and narrow docks open panels as drawers', async ({ page }) => {
@@ -132,7 +197,7 @@ test('plugin toolbar commands work by pointer, shortcut and the keyboard overflo
     .locator('.canvas-page canvas')
     .first()
     .click({ position: { x: 150, y: 150 } });
-  await expect(page.getByTestId('yrs-input')).toBeFocused();
+  await expect(page.locator(peerless ? '.paged-editor__peerless-input' : '[data-testid=yrs-input]')).toBeFocused();
   await page.keyboard.press('ControlOrMeta+Alt+Shift+P');
   await expect.poll(marks).toBe(2);
 
@@ -157,7 +222,7 @@ test('sidebar cards make room for comments and start afresh after replacement', 
   await open(page);
   const card = page.getByTestId('probe-card');
   await expect(card).toBeVisible();
-  await page.evaluate(async () => {
+  await operate(page, async (worker) => {
     const editor = (
       window as unknown as {
         __probe: {
@@ -166,14 +231,17 @@ test('sidebar cards make room for comments and start afresh after replacement', 
               view: 'accepted';
             }): Promise<{ paragraphs: { paraId: string; text: string }[] }>;
             addComment(options: { paraId: string; text: string; author: string }): number | null;
+            insertComment(options: { paraId: string; text: string; author: string }): Promise<number | null>;
           };
         };
       }
     ).__probe.editor;
     const read = await editor.readParagraphs({ view: 'accepted' });
     const first = read.paragraphs.find((paragraph) => paragraph.text.trim().length > 0)!;
-    editor.addComment({ paraId: first.paraId, text: 'Collision note', author: 'Probe' });
-  });
+    const options = { paraId: first.paraId, text: 'Collision note', author: 'Probe' };
+    if (worker) await editor.insertComment(options);
+    else editor.addComment(options);
+  }, peerless);
   const comment = page.locator('.docx-unified-sidebar').getByText('Collision note');
   await expect(comment).toBeVisible();
   await expect
@@ -189,7 +257,7 @@ test('sidebar cards make room for comments and start afresh after replacement', 
   await expect(card).toHaveAttribute('data-expanded', 'true');
   await expect(card).toHaveAttribute('data-clicks', '1');
   const before = await card.getAttribute('data-version');
-  await page.evaluate(() =>
+  await operate(page, () =>
     (window as unknown as { __probe: { reload(): Promise<void> } }).__probe.reload()
   );
   await expect(card).toBeVisible({ timeout: 60_000 });
@@ -217,6 +285,7 @@ interface LooseProbe {
   __probe: {
     editor: {
       setZoom(zoom: number): void;
+      focus(): void;
       readParagraphs(request: {
         story?: string;
         view: 'accepted';
@@ -224,14 +293,17 @@ interface LooseProbe {
       applyEdits(request: { expectVersion: string; steps: unknown[] }): Promise<unknown>;
       whenLayoutComplete(options?: { timeoutMs?: number }): Promise<number>;
       getPositionAtPoint(clientX: number, clientY: number): PointHit | null;
+      readPositionAtPoint(clientX: number, clientY: number): Promise<PointHit | null>;
+      readSelectionInfo(): Promise<{ paraId: string; before: string } | null>;
       getEditorRef(): {
         getYrsSession(): { selection(): { head: unknown } | null };
         displayPositionToYrsLoc(hit: PointHit): unknown;
       };
     };
     geometry: {
-      layout: { version: string };
+      layout: { version: string; pageCount: number };
       getPositionAtPoint(clientX: number, clientY: number): PointHit | null;
+      readPositionAtPoint(clientX: number, clientY: number): Promise<PointHit | null>;
     };
   };
 }
@@ -240,8 +312,9 @@ test('page overlays stay on the previous layout while an edit lays out, then fol
   page,
 }) => {
   await open(page);
-  await expect(page.locator('[data-probe-page="1"]')).not.toBeAttached();
-  const version = await page.evaluate(async () => {
+  const added = page.locator(`[data-probe-page="${await page.evaluate(() => (window as unknown as LooseProbe).__probe.geometry.layout.pageCount)}"]`);
+  await expect(added).not.toBeAttached();
+  const version = await operate(page, async () => {
     const { editor } = (window as unknown as LooseProbe).__probe;
     const read = await editor.readParagraphs({ view: 'accepted' });
     const gaps = { count: 0 };
@@ -271,7 +344,8 @@ test('page overlays stay on the previous layout while an edit lays out, then fol
     await editor.whenLayoutComplete({ timeoutMs: 60_000 });
     return applied.version;
   });
-  await expect(page.locator('[data-probe-page="1"]')).toBeAttached({ timeout: 60_000 });
+  await expect(added).toBeAttached({ timeout: 60_000 });
+  await expect.poll(() => page.evaluate(() => (window as unknown as LooseProbe).__probe.geometry.layout.version), { timeout: 30_000 }).toBe(version);
   const after = await page.evaluate(() => {
     const { __gaps, __gapObserver, __probe, __probePage } = window as unknown as LooseProbe & {
       __gaps: { count: number };
@@ -295,7 +369,7 @@ test('a drop point on page 2 resolves like a caret click and inserts there at ev
   page,
 }) => {
   await open(page);
-  const filled = await page.evaluate(async () => {
+  const filled = await operate(page, async () => {
     const { editor } = (window as unknown as LooseProbe).__probe;
     const read = await editor.readParagraphs({ view: 'accepted' });
     const paragraphs = Array.from({ length: 80 }, (_, index) => ({
@@ -326,11 +400,12 @@ test('a drop point on page 2 resolves like a caret click and inserts there at ev
       .toBeLessThan(1.5);
     await second.scrollIntoViewIfNeeded();
     await expect(second).toBeInViewport();
-    const query = await page.evaluate(() => {
+    const query = await operate(page, async (worker) => {
       const { editor, geometry } = (window as unknown as LooseProbe).__probe;
-      const canvas = document.querySelector('canvas[data-page-index="1"]')!.getBoundingClientRect();
-      const session = editor.getEditorRef().getYrsSession();
-      const selection = JSON.stringify(session.selection());
+      const surface = document.querySelector('canvas[data-page-index="1"]')!;
+      const canvas = surface.getBoundingClientRect();
+      const session = worker ? null : editor.getEditorRef().getYrsSession();
+      const selection = JSON.stringify(worker ? await editor.readSelectionInfo() : session!.selection());
       const active = document.activeElement;
       let found: { x: number; y: number; hit: PointHit } | null = null;
       for (let fy = 0.1; fy < 0.9 && !found; fy += 0.01) {
@@ -338,7 +413,8 @@ test('a drop point on page 2 resolves like a caret click and inserts there at ev
           const x = canvas.left + canvas.width * fx;
           const y = canvas.top + canvas.height * fy;
           if (y < 0 || y > window.innerHeight) continue;
-          const hit = editor.getPositionAtPoint(x, y);
+          if (document.elementFromPoint(x, y) !== surface) continue;
+          const hit = worker ? await editor.readPositionAtPoint(x, y) : editor.getPositionAtPoint(x, y);
           if (hit?.region === 'body' && hit.pageIndex === 1 && hit.target.start.offset > 4) {
             found = { x, y, hit };
           }
@@ -346,13 +422,13 @@ test('a drop point on page 2 resolves like a caret click and inserts there at ev
       }
       return {
         found,
-        loc: found && editor.getEditorRef().displayPositionToYrsLoc(found.hit),
-        plugin: found && geometry.getPositionAtPoint(found.x, found.y),
-        outside: editor.getPositionAtPoint(canvas.left - 12, canvas.top + canvas.height / 2),
+        loc: found && (worker ? { paraId: found.hit.target.start.paraId, offset: found.hit.target.start.offset } : editor.getEditorRef().displayPositionToYrsLoc(found.hit)),
+        plugin: found && (worker ? await geometry.readPositionAtPoint(found.x, found.y) : geometry.getPositionAtPoint(found.x, found.y)),
+        outside: worker ? await editor.readPositionAtPoint(canvas.left - 12, canvas.top + canvas.height / 2) : editor.getPositionAtPoint(canvas.left - 12, canvas.top + canvas.height / 2),
         unchanged:
-          JSON.stringify(session.selection()) === selection && document.activeElement === active,
+          JSON.stringify(worker ? await editor.readSelectionInfo() : session!.selection()) === selection && document.activeElement === active,
       };
-    });
+    }, peerless);
     expect(query.found).not.toBeNull();
     const { x, y, hit } = query.found!;
     expect(query.outside).toBeNull();
@@ -362,14 +438,16 @@ test('a drop point on page 2 resolves like a caret click and inserts there at ev
     await page.mouse.click(x, y);
     await expect
       .poll(() =>
-        page.evaluate(() => {
+        operate(page, async (worker) => {
           const { editor } = (window as unknown as LooseProbe).__probe;
-          return editor.getEditorRef().getYrsSession().selection()?.head ?? null;
-        })
+          if (!worker) return editor.getEditorRef().getYrsSession().selection()?.head ?? null;
+          const info = await editor.readSelectionInfo();
+          return info ? { paraId: info.paraId, offset: info.before.length } : null;
+        }, peerless)
       )
       .toEqual(query.loc);
 
-    const inserted = await page.evaluate(async ({ target, version }: PointHit) => {
+    const inserted = await operate(page, async ({ target, version }: PointHit) => {
       const { editor } = (window as unknown as LooseProbe).__probe;
       const text = async (): Promise<string> => {
         const read = await editor.readParagraphs({ story: target.story, view: 'accepted' });
@@ -390,3 +468,38 @@ test('a drop point on page 2 resolves like a caret click and inserts there at ev
     );
   }
 });
+
+test('a header anchor has a rect in the header band of every page at 100% and 150% zoom', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1600 });
+  await page.goto(`/?doc=repeated-header${peerless ? '&peerless=1' : ''}`);
+  await expect(page.locator('canvas[data-page-index="2"]')).toBeVisible({ timeout: 120_000 });
+  for (const zoom of [1, 1.5]) {
+    await page.evaluate(
+      (value) => (window as unknown as LooseProbe).__probe.editor.setZoom(value),
+      zoom
+    );
+    await expect
+      .poll(
+        () =>
+          page.evaluate((scale) =>
+            Array.from(document.querySelectorAll<HTMLElement>('[data-probe-header-rect]'), (element) => {
+              const pageIndex = Number(element.dataset.probeHeaderRect);
+              const rect = element.getBoundingClientRect();
+              const canvas = document
+                .querySelector(`canvas[data-page-index="${pageIndex}"]`)
+                ?.getBoundingClientRect();
+              const top = canvas ? (rect.top - canvas.top) / scale : -1;
+              const left = canvas ? (rect.left - canvas.left) / scale : -1;
+              return {
+                pageIndex,
+                inHeaderBand: rect.width > 0 && top >= 0 && top + rect.height / scale <= 72 && left > 96,
+              };
+            }), zoom),
+        { timeout: 30_000 }
+      )
+      .toEqual([0, 1, 2].map((pageIndex) => ({ pageIndex, inHeaderBand: true })));
+  }
+});
+
+  });
+}

@@ -11,6 +11,7 @@ import { isLayoutMetaV1, type LayoutMetaV1 } from './layoutMeta';
 import type { Layout } from '../layout/pagination';
 import { proposalRevisionPreview } from './proposals';
 import { createYrsSession } from './index';
+import { storiesDocx } from './__fixtures__/storiesDocx';
 import { readSidebar, readOutlineHeadings } from './sidebarReads';
 import { sidebarDocx } from './__fixtures__/sidebarDocx';
 import { readResidentSearch } from './residentSearch';
@@ -26,6 +27,7 @@ import { createResidentCommandConnection } from './residentCommandConnection';
 import { createDocxWorkerEditSession } from './createDocxWorkerEditSession';
 import type {
   DocxCommandEnvelope,
+  DocxCommandEchoContext,
   DocxCommandFrame,
   DocxEditState,
   ResidentCommandConnection,
@@ -52,6 +54,7 @@ import {
   type ResidentDocumentRead,
   type ResidentProposalOperation,
 } from './residentEngineWorkerProtocol';
+import type { EchoGlyphProvider } from './residentCommandViewProjection';
 
 let startWorker: (scope: unknown, canvas: unknown, harness: unknown, clock: unknown, fetch: unknown, decode: unknown) => void;
 
@@ -77,7 +80,7 @@ beforeAll(async () => {
       'export class GlyphCache { constructor(options) { testHarness.glyphs = options.provider; testHarness.glyphCacheCreations += 1; } }',
     '../wasm/loadWasmAsset': 'export const wasmModuleMemories = () => testHarness.memories;',
     './residentCommandViewProjection':
-      'export const projectCommandEchoContext = () => undefined;',
+      'export const projectCommandEchoContext = (input) => testHarness.projectEchoContext?.(input);',
     '../layout/render/frameDelta': `
       export { applyFrameDelta, applyFrameDeltaOwned, retainedFramePageById } from ${JSON.stringify(frameDelta)};
       export const decodeFrameDelta = () => { testHarness.decodes += 1; return testHarness.delta; };
@@ -186,6 +189,7 @@ function worker() {
     decodes: 0,
     commandText: null as string | null,
     pendingPages: null as Set<string> | null,
+    projectEchoContext: null as ((input: { glyphs: EchoGlyphProvider; layout: { frame: { frameEpoch: number } } }) => DocxCommandEchoContext) | null,
     failImageDecode: false,
     imageDecodes: 0,
     resolvedImages: [] as unknown[],
@@ -288,6 +292,7 @@ function worker() {
       },
       layoutDocumentJson() {},
       layoutDocumentWithRegionsRetained() {},
+      layoutDocumentWithRegionsAfterEdit() {},
       retainedHeadersFootersJson(): string | undefined {
         return undefined;
       },
@@ -354,8 +359,8 @@ function worker() {
         harness.failRaster = null;
         throw new Error('raster failed');
       }
-      buffer.width = page.width * dpr * zoom;
-      buffer.height = page.height * dpr * zoom;
+      buffer.width = Math.ceil(page.width * dpr * zoom);
+      buffer.height = Math.ceil(page.height * dpr * zoom);
       buffer.pixels = harness.commandText ?? `${id}:${page.width}`;
     },
     present(canvas: Surface, buffer: Surface) {
@@ -606,6 +611,110 @@ function commandEnvelope(seq: number, text = '!'): DocxCommandEnvelope {
     basis: { epoch: COMMAND_INIT.epoch, version: 0 }, seq, kind: 'insertText', payload: { text },
   };
 }
+
+test('command raster scale sizes the initial bitmaps before presentation', async () => {
+  const { client, w } = await commandWorker();
+  try {
+    const initial = await client.commandInit({ ...COMMAND_INIT, rasterScale: 2 } as ResidentCommandInitRequest);
+    const pages = initial.frame.payload.stagedPresentation!.pages;
+    expect(pages.map(({ bitmap }) => [bitmap.width, bitmap.height])).toEqual([[200, 200]]);
+    expect(w.harness.rasterized).toEqual([1]);
+  } finally { client.destroy(); }
+});
+
+test('command raster scale repaints every window page in one viewport frame', async () => {
+  const { client, w } = await commandWorker();
+  Object.assign(w.harness.session, {
+    buildDisplayListFrame(_extras: string, expected: number) {
+      w.delta([1, 2, 3], expected === 0, 100.25, 3);
+      return Uint8Array.of(w.harness.delta!.frameEpoch);
+    },
+  });
+  try {
+    const initial = await client.commandInit({ ...COMMAND_INIT, displayWindow: [0, 3], rasterScale: 1 } as ResidentCommandInitRequest);
+    const frames: DocxCommandFrame[] = [];
+    client.onFrame((candidate) => frames.push(candidate));
+    w.resetCalls();
+    await client.requestViewport({ start: 0, end: 3, frameEpoch: initial.frame.revision, rasterScale: 2 } as Parameters<typeof client.requestViewport>[0]);
+    expect(frames).toHaveLength(1);
+    expect(frames[0]!.payload.stagedPresentation!.pages.map(({ page, bitmap }) => [page.pageIndex, bitmap.width, bitmap.height]))
+      .toEqual([[0, 201, 200], [1, 201, 200], [2, 201, 200]]);
+    expect(w.harness.rasterized).toEqual([1, 2, 3]);
+  } finally { client.destroy(); }
+});
+
+test('command raster scale preserves pixels when rounded window sizes match', async () => {
+  const { client, w } = await commandWorker();
+  Object.assign(w.harness.session, {
+    buildDisplayPagesFrame(pages: number[]) {
+      w.delta(pages.map((index) => index + 1), false, 100, 1);
+      return Uint8Array.of(w.harness.delta!.frameEpoch);
+    },
+  });
+  try {
+    const initial = await client.commandInit({ ...COMMAND_INIT, displayWindow: [0, 1], rasterScale: 1.001 } as ResidentCommandInitRequest);
+    const frames: DocxCommandFrame[] = [];
+    client.onFrame((candidate) => frames.push(candidate));
+    w.resetCalls();
+    await client.requestViewport({ start: 0, end: 1, frameEpoch: initial.frame.revision, rasterScale: 1.002 } as Parameters<typeof client.requestViewport>[0]);
+    expect(frames).toHaveLength(1);
+    expect(frames[0]!.payload.stagedPresentation!.pages).toEqual([]);
+    expect(w.harness.rasterized).toEqual([]);
+  } finally { client.destroy(); }
+});
+
+test('command echo refreshes its scale when rounded page dimensions stay equal', async () => {
+  const { client, w } = await commandWorker();
+  const page = { pageId: '1', pageIndex: 0 };
+  const rect = { x: 40, y: 400, width: 100, height: 20 };
+  const build = (full: boolean) => {
+    w.delta(full ? [1] : [], full, 816, 1);
+    for (const operation of w.harness.delta!.operations) {
+      if (operation.kind === 'upsert') operation.page.height = 1056;
+    }
+    return Uint8Array.of(w.harness.delta!.frameEpoch);
+  };
+  Object.assign(w.harness.session, {
+    buildDisplayListFrame: (_extras: string, expected: number) => build(expected === 0),
+    buildDisplayPagesFrame: () => build(false),
+  });
+  w.harness.projectEchoContext = ({ glyphs, layout }) => ({
+    page, frameEpoch: layout.frame.frameEpoch, layoutRevision: 1, serializedBytes: 900, text: 'AA',
+    styleRuns: [], boundaries: [0, 1, 2].map((utf16) => ({ utf16, grapheme: utf16, caret: rect })),
+    selection: { anchorGrapheme: 2, focusGrapheme: 2 }, transform: [1, 0, 0, 1, 0, 0],
+    damage: [{ page, rect, backgroundId: 'background', omittedPrimitiveIds: [] }], shaping: 'simple-ltr',
+    glyphs: { glyphSet: 'set', fontId: 1, size: 12, color: '#000', x: 40, y: 414, next: '', right: 140,
+      device: { x: 50, y: 500, width: 125, height: 25 }, pixelRatio: glyphs.pixelRatio },
+  });
+  try {
+    const initial = await client.commandInit({ ...COMMAND_INIT, displayWindow: [0, 1], rasterScale: 1.25 });
+    const original = initial.frame.payload.stagedPresentation!.pages[0]!;
+    expect([original.bitmap.width, original.bitmap.height]).toEqual([1020, 1320]);
+    expect(initial.frame.payload.echoContext!.glyphs!.pixelRatio).toBe(1.25);
+    const frames: DocxCommandFrame[] = [];
+    client.onFrame((candidate) => frames.push(candidate));
+    w.resetCalls();
+    await client.requestViewport({ start: 0, end: 1, frameEpoch: initial.frame.revision, rasterScale: 1.2499 });
+    expect(frames).toHaveLength(1);
+    expect(frames[0]!.payload.echoContext?.glyphs?.pixelRatio).toBe(1.2499);
+    const refreshed = frames[0]!.payload.stagedPresentation!.pages[0]!;
+    expect([refreshed.bitmap.width, refreshed.bitmap.height]).toEqual([1020, 1320]);
+    expect(refreshed.backgrounds).toHaveLength(1);
+    expect(w.harness.rasterized).toEqual([1, 1]);
+    w.harness.projectEchoContext = null;
+    await client.requestViewport({ start: 0, end: 1, frameEpoch: frames[0]!.revision, rasterScale: 1.25 });
+    expect(frames).toHaveLength(2);
+    expect(frames[1]!.payload.echoContext).toBeUndefined();
+    expect(frames[1]!.payload.stagedPresentation!.pages).toHaveLength(1);
+    expect(frames[1]!.payload.stagedPresentation!.pages[0]!.backgrounds).toBeUndefined();
+    expect(w.harness.rasterized).toEqual([1, 1, 1]);
+    w.resetCalls();
+    await client.requestViewport({ start: 0, end: 1, frameEpoch: frames[1]!.revision, rasterScale: 1.25 });
+    expect(frames).toHaveLength(3);
+    expect(frames[2]!.payload.stagedPresentation!.pages).toEqual([]);
+    expect(w.harness.rasterized).toEqual([]);
+  } finally { client.destroy(); }
+});
 
 function replaceCommandDocument(client: ResidentEngineWorkerClient) {
   return client.bootstrap({
@@ -1786,6 +1895,45 @@ test('document reads skip stale versions and read the current version', async ()
   });
   expect(current).not.toHaveProperty('superseded');
   expect(reads).toBe(1);
+});
+
+test('story reads answer from the worker as the session would', async () => {
+  const main = await createYrsSession();
+  const engine = await createResidentEngineSession();
+  const w = worker();
+  try {
+    main.openDocx(storiesDocx(), true);
+    engine.openDocx(storiesDocx());
+    await w.bootstrap();
+    Object.assign(w.harness.session, {
+      proposalEngine: engine.proposalEngine,
+      listStories: engine.listStories,
+      readStories: engine.readStories,
+    });
+    const version = engine.proposalEngine.version();
+    const value = (reply: unknown) => (reply as { read?: { value?: Record<string, unknown> } }).read?.value;
+    const listed = await w.send({ type: 'documentRead', read: { kind: 'listStories' } });
+    expect(listed).toMatchObject({ ok: true, read: { version, value: { ok: true, version } } });
+    expect(value(listed)?.stories).toEqual(main.listStories().stories);
+    for (const stories of ['all', ['header', 'tableCell'], ['missing', 'footer']] as const) {
+      const request = { stories, view: 'accepted' as const };
+      const reply = await w.send({ type: 'documentRead', read: { kind: 'readStories', request } });
+      const local = main.readStories(request);
+      expect(reply).toMatchObject({ ok: true, read: { value: { ok: true, version } } });
+      expect(value(reply)?.stories).toEqual(local.ok ? local.stories : undefined);
+    }
+    const stale = await w.send({
+      type: 'documentRead',
+      read: { kind: 'readStories', request: { view: 'accepted', expectVersion: 'older' } },
+    });
+    expect(stale).toMatchObject({
+      ok: true,
+      read: { value: { ok: false, version, failure: { code: 'stale-version' } } },
+    });
+  } finally {
+    main.destroy();
+    engine.destroy();
+  }
 });
 
 test.each([false, true])(
