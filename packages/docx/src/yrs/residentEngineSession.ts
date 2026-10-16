@@ -22,6 +22,7 @@ import type {
   CollaborationTextInsertion,
   CollaborationUpdateOrigin,
 } from '../collaboration/types';
+import { requireUnreservedClientId } from '../collaboration/protocol';
 import type {
   DocxEditResult,
   DocxFindTextResult,
@@ -254,6 +255,7 @@ export async function createResidentEngineSession(
   heapLimitBytes?: number,
   clientId = randomClientId()
 ): Promise<ResidentEngineSession> {
+  requireUnreservedClientId(clientId);
   await preloadEditWasm();
   setEditWasmHeapLimit(heapLimitBytes);
   const session = createEditSession(clientId);
