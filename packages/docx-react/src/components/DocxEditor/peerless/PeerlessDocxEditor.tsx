@@ -27,6 +27,7 @@ import type { DocxEditorProps, DocxEditorRef } from '../../DocxEditor';
 import { createPeerlessShellController } from './shellController';
 import { commandPageGeometry } from './commandPageGeometry';
 import { createDocxPluginHost } from '../../../plugins/createDocxPluginHost';
+import { usePluginReservations } from '../../../plugins/reservations';
 import { DocxCommandProvider } from '../../../commands/DocxCommandProvider';
 import { DocxEditorShell } from '../DocxEditorShell';
 import { DocxEditorToolbar } from '../DocxEditorToolbar';
@@ -41,7 +42,7 @@ import { PluginDock } from '../../../plugins/PluginPanels';
 import { useIsDark } from '../hooks/useIsDark';
 import { copyWorkerSelection, isPasteFragmentAllowed } from './clipboard';
 import { admitInputIntents } from './inputAdmission';
-import type { DocxClipboardFragment } from '@betteroffice/docx/yrs';
+import type { DocxClipboardFragment, DocxReservationsPayload } from '@betteroffice/docx/yrs';
 import { useWorkerFileIO } from './useWorkerFileIO';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { yrsSelectionState } from '../hooks/useSelectionTracker';
@@ -198,8 +199,9 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
   const [overlayLayer, setOverlayLayer] = useState<HTMLDivElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const [geometryRevision, redrawGeometry] = useState(0);
+  const sentReservationsRef = useRef<() => DocxReservationsPayload | null>(() => null);
   const [pluginGeometry] = useState(() => createWorkerPluginGeometry(controller, () => host.current, () => overlayRef.current, () => redrawGeometry(value => value + 1),
-    (target, focus) => navigation.revealParagraph(target.paraId, target.story, focus)));
+    (target, focus) => navigation.revealParagraph(target.paraId, target.story, focus), () => sentReservationsRef.current()));
   const setPluginLayer = useCallback((element: HTMLDivElement | null) => { overlayRef.current = element; setOverlayLayer(element); }, []);
   const [expandedSidebarItem, setExpandedSidebarItem] = useState<string | null>(null);
   const [pluginHost] = useState(() => createDocxPluginHost({
@@ -217,6 +219,22 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
     workerNavigation: pluginGeometry.navigation,
   }));
   const activations = useSyncExternalStore(pluginHost.subscribe, pluginHost.activations, pluginHost.activations);
+  const reservations = usePluginReservations(pluginHost, activations);
+  const reservationsRef = useRef<{ payload: DocxReservationsPayload | null; sent: boolean; source: DocxReservationsPayload | string | null;
+    keyed: DocxReservationsPayload | null; serial: number }>({ payload: reservations, sent: false, source: null, keyed: null, serial: 0 });
+  reservationsRef.current.payload = reservations;
+  /** The set the editor sends, keyed so a frame names the set it was laid out with; once sent, none is an empty set. */
+  const sentReservations = useCallback((): DocxReservationsPayload | null => {
+    const reserved = reservationsRef.current;
+    const source = reserved.payload ?? (reserved.sent ? pluginHost.version() : null);
+    if (source === null) return null;
+    if (reserved.source !== source) {
+      reserved.source = source;
+      reserved.keyed = { ...(typeof source === 'string' ? { version: source, sets: [] } : source), key: String(++reserved.serial) };
+    }
+    return reserved.keyed;
+  }, [pluginHost]);
+  sentReservationsRef.current = sentReservations;
   useEffect(() => {
     pluginHost.setReporter(props.onPluginError);
     pluginHost.setGrants(props.pluginGrants);
@@ -520,7 +538,11 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
     if (!current) return;
     const theme = settings.current.theme ?? renderEnvironment.current.theme;
     const themeColors = Object.fromEntries(Object.entries(theme?.colorScheme ?? {}).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
-    const payload = { themeColors, showHiddenText: settings.current.showHiddenText };
+    const reserved = reservationsRef.current;
+    const reservations = sentReservations();
+    const payload = {
+      themeColors, showHiddenText: settings.current.showHiddenText, ...(reservations ? { reservations } : {}),
+    };
     const requested = JSON.stringify(payload);
     if (current.requestedRenderEnvironment === requested) return;
     const result = current.binding.commands.submit({ kind: 'setRenderEnvironment', payload }, { fence: true, onSubmitted: (ticket) => {
@@ -536,8 +558,11 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
         reportRecoverableError(error instanceof Error ? error : new Error(String(error)));
       });
     } });
-    if (result.status !== 'ignored') current.requestedRenderEnvironment = requested;
-  }, [reportRecoverableError]);
+    if (result.status !== 'ignored') {
+      current.requestedRenderEnvironment = requested;
+      reserved.sent = reserved.payload !== null;
+    }
+  }, [sentReservations, reportRecoverableError]);
   const updateFontEnvironment = useCallback(() => {
     const current = active.current;
     const client = worker.current;
@@ -625,7 +650,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
     updateFontEnvironment();
   }, [updateReadOnly, updateRenderEnvironment, updateFontEnvironment, controller]);
   useLayoutEffect(updateReadOnly, [effectiveReadOnly, updateReadOnly]);
-  useLayoutEffect(updateRenderEnvironment, [props.theme, props.showHiddenText, updateRenderEnvironment]);
+  useLayoutEffect(updateRenderEnvironment, [props.theme, props.showHiddenText, reservations, updateRenderEnvironment]);
   useLayoutEffect(updateFontEnvironment, [props.fonts, measurementFontProvider, props.onFontsLoaded, updateFontEnvironment]);
   useLayoutEffect(() => () => { active.current = null; fontAbort.current?.abort(); fontJob.current = null; fontSource.current = null; }, []);
 
@@ -663,6 +688,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
         objects: frame.payload.geometry,
         documentWidth: frame.payload.documentWidth,
         layoutProvisional: frame.payload.layoutProvisional,
+        ...(frame.payload.reservations ? { reservations: frame.payload.reservations } : {}),
         pages,
         caret: caret.caretRect ? { ...caret.caretRect,
           x: caret.caretRect.x + (pages[caret.caretRect.pageIndex]?.bounds.x ?? 0), y: caret.caretRect.y + (pages[caret.caretRect.pageIndex]?.bounds.y ?? 0), width: 1 } : null,
