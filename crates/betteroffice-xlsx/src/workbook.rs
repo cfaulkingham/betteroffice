@@ -57,7 +57,7 @@ use xlsx_render::{
 use crate::authority::{
     AuthorityError, HistoryUpdate, MAX_STATE_VECTOR_ENTRIES, SnapshotAdoption, StagedLocalUpdate,
     StagedUpdate, SyncOrigin, WorkbookAuthority, WorkbookStructure,
-    is_collaborative_local_layout_op, is_structural_op,
+    is_collaborative_local_layout_op, is_structural_op, validate_hyperlink_edit_baseline,
 };
 use crate::move_range::{move_range_ops, preserved_move_unsupported_part};
 use crate::sheet_json::{
@@ -120,7 +120,7 @@ struct UpdateObservers {
 
 enum WorkbookMode {
     Standalone,
-    Collaborative { structure: WorkbookStructure },
+    Collaborative { structure: Box<WorkbookStructure> },
 }
 
 /// Package identity the model does not carry: per current sheet, the source
@@ -710,7 +710,9 @@ impl Workbook {
             .collect();
         let graph = build_graph.then(|| DepGraph::build(&model));
         let mode = match client_id {
-            Some(_) => WorkbookMode::Collaborative { structure },
+            Some(_) => WorkbookMode::Collaborative {
+                structure: Box::new(structure),
+            },
             None => WorkbookMode::Standalone,
         };
         let preserved = match &source_package {
@@ -932,7 +934,9 @@ impl Workbook {
         self.invalidate_sheet_info();
         self.graph = Some(graph);
         self.last_calculation = calculation;
-        self.mode = WorkbookMode::Collaborative { structure };
+        self.mode = WorkbookMode::Collaborative {
+            structure: Box::new(structure),
+        };
         self.pending_remote_updates.clear();
         self.undo.clear();
         self.preserved_undo.clear();
@@ -1095,7 +1099,7 @@ impl Workbook {
             .map_err(authority_error)?;
         self.install_model(model)?;
         self.mode = WorkbookMode::Collaborative {
-            structure: new_structure,
+            structure: Box::new(new_structure),
         };
         self.invalidate_sheet_info();
         self.graph = Some(graph);
@@ -1644,6 +1648,24 @@ impl Workbook {
         ))
     }
 
+    pub fn set_hyperlink(
+        &mut self,
+        sheet: SheetId,
+        hyperlink: Hyperlink,
+        options: CalculationOptions,
+    ) -> Result<MutationResult> {
+        self.apply_ops(vec![Op::SetHyperlink { sheet, hyperlink }], options)
+    }
+
+    pub fn remove_hyperlink(
+        &mut self,
+        sheet: SheetId,
+        range: CellRange,
+        options: CalculationOptions,
+    ) -> Result<MutationResult> {
+        self.apply_ops(vec![Op::RemoveHyperlink { sheet, range }], options)
+    }
+
     pub fn edit_cell(
         &mut self,
         sheet: SheetId,
@@ -2174,7 +2196,7 @@ impl Workbook {
         retain_array_formulas(&self.model, &mut restored);
         self.install_model(restored)?;
         self.mode = WorkbookMode::Collaborative {
-            structure: new_structure,
+            structure: Box::new(new_structure),
         };
         self.invalidate_sheet_info();
         self.edited_since_open = true;
@@ -2819,7 +2841,7 @@ impl Workbook {
             retain_array_formulas(&self.model, &mut model);
             self.install_model_with_ops(model, ops)?;
             self.mode = WorkbookMode::Collaborative {
-                structure: new_structure,
+                structure: Box::new(new_structure),
             };
             self.update_sheet_info_cache(ops, &prior_styles);
             Some(staged.update)
@@ -2989,6 +3011,8 @@ impl Workbook {
                 | Op::RestoreRowDimension { sheet, .. }
                 | Op::SetFreezePane { sheet, .. }
                 | Op::SetHyperlinks { sheet, .. }
+                | Op::SetHyperlink { sheet, .. }
+                | Op::RemoveHyperlink { sheet, .. }
                 | Op::RestoreColStyles { sheet, .. }
                 | Op::RestoreRowStyles { sheet, .. }
                 | Op::MergeCells { sheet, .. }
@@ -3733,6 +3757,8 @@ fn worksheet_edit_target(op: &Op) -> Option<SheetId> {
         | Op::RestoreRowDimension { sheet, .. }
         | Op::SetFreezePane { sheet, .. }
         | Op::SetHyperlinks { sheet, .. }
+        | Op::SetHyperlink { sheet, .. }
+        | Op::RemoveHyperlink { sheet, .. }
         | Op::RestoreColStyles { sheet, .. }
         | Op::RestoreRowStyles { sheet, .. }
         | Op::SetCharts { sheet, .. }
@@ -3883,6 +3909,30 @@ fn validate_op(model: &WorkbookModel, op: &Op) -> Result<()> {
         Op::SetHyperlinks { sheet, hyperlinks } => {
             require_sheet(model, *sheet)?;
             validate_hyperlinks(hyperlinks)?;
+        }
+        Op::SetHyperlink { sheet, hyperlink } => {
+            validate_hyperlink_edit_baseline(&require_sheet(model, *sheet)?.hyperlinks)
+                .map_err(Error::InvalidOperation)?;
+            validate_hyperlinks(std::slice::from_ref(hyperlink))?;
+            if [
+                &hyperlink.external_target,
+                &hyperlink.location,
+                &hyperlink.tooltip,
+                &hyperlink.display,
+            ]
+            .into_iter()
+            .flatten()
+            .any(String::is_empty)
+            {
+                return Err(Error::InvalidOperation(
+                    "hyperlink field must not be empty".to_string(),
+                ));
+            }
+        }
+        Op::RemoveHyperlink { sheet, range } => {
+            validate_hyperlink_edit_baseline(&require_sheet(model, *sheet)?.hyperlinks)
+                .map_err(Error::InvalidOperation)?;
+            validate_range(*range)?;
         }
         Op::SetChartAnchor {
             sheet,
@@ -4838,6 +4888,8 @@ impl CalculationScope {
             | Op::UnmergeCells { .. }
             | Op::SetFreezePane { .. }
             | Op::SetHyperlinks { .. }
+            | Op::SetHyperlink { .. }
+            | Op::RemoveHyperlink { .. }
             | Op::RestoreColStyles { .. }
             | Op::RestoreRowStyles { .. }
             | Op::SetCharts { .. }
@@ -5156,7 +5208,7 @@ impl Workbook {
         let graph = build_graph.then(|| DepGraph::build(&model));
         let mode = match client_id {
             Some(_) => WorkbookMode::Collaborative {
-                structure: authority.structure_oracle().map_err(authority_error)?,
+                structure: Box::new(authority.structure_oracle().map_err(authority_error)?),
             },
             None => WorkbookMode::Standalone,
         };

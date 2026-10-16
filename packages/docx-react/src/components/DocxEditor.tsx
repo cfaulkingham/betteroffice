@@ -2687,6 +2687,8 @@ const LegacyDocxEditor = forwardRef<DocxEditorRef, DocxEditorBaseProps>(function
               commandBridgeRef={commandBridgeRef}
               yrsCore={yrsCore}
               pluginHostOpen={pluginHostSession !== null}
+              reservations={pluginHost.reservations}
+              reservationSets={pluginHost.reservationSets}
               onError={reportPagedError}
               collaboration={collaboration}
               pagedEditorRef={pagedEditorRef}
