@@ -47,7 +47,7 @@ afterAll(async () => { if (ownsDom) await GlobalRegistrator.unregister(); });
 
 const bounds = (x: number, y: number, width: number, height: number) => ({ x, y, left: x, top: y, width, height, right: x + width, bottom: y + height, toJSON() {} }) as DOMRect;
 
-test('worker proposal highlights use page-local review geometry at every zoom', async () => {
+test('worker proposal anchors use page-local frame geometry at every zoom', async () => {
   const h = proposalHost();
   await h.submit('propose', { proposals: inputs }, {}).ack;
   const pages = document.createElement('div');
@@ -71,7 +71,8 @@ test('worker proposal highlights use page-local review geometry at every zoom', 
   })) });
   const queries = { pageCount: () => 2, pageSize: () => ({ width: 300, height: 500 }),
     pageBounds: (pageIndex: number) => ({ pageIndex, x: 0, y: 0, width: 300, height: 500 }),
-    rangeRects: () => [], anchorRect: () => null, dispose() {} } as unknown as display.DisplayListQueries;
+    rangeRects: (from: number, to: number) => from === 20 && to === 25 ? [{ pageIndex: 1, x: 30, y: 40, width: 50, height: 12 }] : [],
+    anchorRect: () => null, dispose() {} } as unknown as display.DisplayListQueries;
   const load = spyOn(display, 'loadRustDisplayListQueryEngine').mockResolvedValue({} as never);
   const create = spyOn(display, 'createDisplayListQueries').mockReturnValue(queries);
   const geometry = createWorkerPluginGeometry(h.controller, () => pages, () => layer, () => {});
@@ -81,6 +82,47 @@ test('worker proposal highlights use page-local review geometry at every zoom', 
     const placed = geometry.geometry()!.getAnchorGeometry({ kind: 'proposal', id: inputs[2]!.id });
     expect(placed).toMatchObject({ ok: true, version: h.snapshot().version, previewVersion: h.snapshot().previewVersion,
       rects: [{ pageIndex: 1, x: 80, y: 1130, width: 100, height: 24 }], anchor: { pageIndex: 1, x: 180, y: 1130, width: 0, height: 24 } });
+  } finally { geometry.dispose(); load.mockRestore(); create.mockRestore(); h.controller.dispose(); }
+});
+
+test('a viewport frame of the presented layout keeps every proposal anchor without waiting for another review read', async () => {
+  const h = proposalHost();
+  await h.submit('propose', { proposals: inputs }, {}).ack;
+  const pages = document.createElement('div');
+  pages.getBoundingClientRect = () => bounds(100, 100, 600, 2140);
+  const host = document.createElement('div');
+  host.setAttribute('data-peerless-pages-host', '');
+  host.getBoundingClientRect = pages.getBoundingClientRect;
+  pages.appendChild(host);
+  const layer = document.createElement('div');
+  layer.getBoundingClientRect = () => bounds(80, 90, 600, 2140);
+  const present = () => {
+    const frame = h.binding.viewStore.getSnapshot().geometry!;
+    h.binding.viewStore.installFrameGeometry({ ...frame, frameEpoch: frame.frameEpoch + 1, pages: Array.from({ length: 2 }, (_, pageIndex) => ({
+      page: { pageId: String(pageIndex + 1), pageIndex }, bounds: { x: 0, y: pageIndex * 520, width: 300, height: 500 },
+      transform: [1, 0, 0, 1, 0, pageIndex * 520],
+    })) });
+  };
+  present();
+  const queries = { pageCount: () => 2, pageSize: () => ({ width: 300, height: 500 }),
+    pageBounds: (pageIndex: number) => ({ pageIndex, x: 0, y: 0, width: 300, height: 500 }),
+    rangeRects: (from: number) => [{ pageIndex: from < 20 ? 0 : 1, x: 30, y: 40, width: 50, height: 12 }],
+    anchorRect: () => null, dispose() {} } as unknown as display.DisplayListQueries;
+  const load = spyOn(display, 'loadRustDisplayListQueryEngine').mockResolvedValue({} as never);
+  const create = spyOn(display, 'createDisplayListQueries').mockReturnValue(queries);
+  const geometry = createWorkerPluginGeometry(h.controller, () => pages, () => layer, () => {});
+  const anchors = () => inputs.map(({ id }) => geometry.geometry()!.getAnchorGeometry({ kind: 'proposal', id }))
+    .map(result => result.ok ? result.anchor.pageIndex : result.failure.code);
+  try {
+    await geometry.update();
+    expect(anchors()).toEqual([0, 0, 1, 1]);
+    const reads = h.readAt.mock.calls.length;
+    h.readAt.mockImplementation(() => new Promise(() => {}));
+    present();
+    void geometry.update();
+    for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+    expect(anchors()).toEqual([0, 0, 1, 1]);
+    expect(h.readAt.mock.calls.length).toBe(reads);
   } finally { geometry.dispose(); load.mockRestore(); create.mockRestore(); h.controller.dispose(); }
 });
 
@@ -111,7 +153,7 @@ test('plugin selection ranges label the native worker caret with its accepted of
       : [{ ok: false, failure: { code: 'missing-target', message: 'unused' } }];
   };
   const controller = { getSnapshot: () => ({ status: 'ready', view }), readAt,
-    review: async () => ({ version: 'v1', previewVersion: 0 }), ref: { getZoom: () => 1 } };
+    review: async () => ({ version: 'v1', previewVersion: 0 }), describedReview: () => null, ref: { getZoom: () => 1 } };
   const geometry = createWorkerPluginGeometry(controller as never, () => document.createElement('div'), () => document.createElement('div'), () => {});
   await geometry.update();
   expect(reads.find(read => read.kind === 'anchorTargets')?.targets?.[0]?.range).toEqual({ story: 'body', view: 'accepted',
@@ -175,14 +217,10 @@ async function shellOf({ engine, frame, window: built }: LaidOut, { zoom = 1, wi
     geometry: { identity, coversThroughSeq: 0, frameEpoch: frame.frameEpoch, layoutRevision: 1, pages, caret: null, selectionRects: [] } };
   const version = engine.geometryReader.version();
   const review = { version, previewVersion: 0 };
-  const reads: Promise<unknown>[] = [];
   const controller = { getSnapshot: () => ({ status: 'ready', view }),
-    review: async () => review, reviewSnapshot: () => review,
-    readAt(request: { targets: Parameters<typeof computeAnchorTargetGeometry>[1] }) {
-      const read = Promise.resolve(computeAnchorTargetGeometry(engine.geometryReader, request.targets).map(answer));
-      reads.push(read);
-      return read;
-    },
+    review: async () => review, describedReview: () => review,
+    readAt: async (request: { targets: Parameters<typeof computeAnchorTargetGeometry>[1] }) =>
+      computeAnchorTargetGeometry(engine.geometryReader, request.targets).map(answer),
     ref: { getZoom: () => zoom, readParagraphs: async () => ({ ok: true, version, paragraphs: [] }) } };
   const plugin = createWorkerPluginGeometry(controller as never, () => container, () => layer, () => {});
   if (window) plugin.setDisplayWindow(window);
@@ -192,9 +230,7 @@ async function shellOf({ engine, frame, window: built }: LaidOut, { zoom = 1, wi
     version,
     bounds: pages.map(({ bounds }) => bounds),
     async anchor(target: DocxGeometryTarget) {
-      plugin.geometry()!.getAnchorGeometry(target);
-      await Promise.all(reads);
-      return plugin.geometry()!.getAnchorGeometry(target);
+      return (await plugin.geometry()!.readAnchorGeometries([target]))[0]!;
     },
   };
 }
@@ -216,6 +252,7 @@ test('a header target has rects on every built page that paints it and its ancho
   const shell = await shellOf(laid);
   const odd = ok(await shell.anchor(range(laid, shell.version, 'hf:rIdH1', '10000001', '{{odd}}')));
   expect(pageIndices(odd)).toEqual([2, 4]);
+  expect(odd.unbuiltPages).toBeUndefined();
   expect(odd.anchor).toMatchObject({ pageIndex: 2, width: 0 });
   expect(odd.anchor.x).toBeCloseTo(odd.rects[0]!.x + odd.rects[0]!.width, 6);
   expect(pageIndices(await shell.anchor(range(laid, shell.version, 'hf:rIdH2', '10000011', '{{even}}')))).toEqual([1, 3, 5]);
@@ -226,6 +263,25 @@ test('a header target has rects on every built page that paints it and its ancho
   const built = ok(await early.anchor(range(partial, early.version, 'hf:rIdH1', '10000001', '{{odd}}')));
   expect(pageIndices(built)).toEqual([2]);
   expect(built.anchor.pageIndex).toBe(2);
+  expect(built.unbuiltPages).toEqual([4]);
+  const even = ok(await early.anchor(range(partial, early.version, 'hf:rIdH2', '10000011', '{{even}}')));
+  expect(pageIndices(even)).toEqual([1]);
+  expect(even.unbuiltPages).toEqual([3, 5]);
+});
+
+test('a body table cell target has its own rects, anchored at its end', async () => {
+  const laid = await laidOut();
+  const shell = await shellOf(laid);
+  const intro = ok(await shell.anchor(range(laid, shell.version, 'body', '00000001', 'Intro')));
+  const cell = ok(await shell.anchor(range(laid, shell.version, 'body:t0:r0c0', '00000002', '{{cell}}')));
+  expect(cell.rects).toHaveLength(1);
+  const [rect] = cell.rects;
+  expect(rect).toMatchObject({ pageIndex: 0 });
+  expect(rect!.x).toBeGreaterThan(intro.rects[0]!.x);
+  expect(rect!.y).toBeGreaterThan(intro.rects[0]!.y);
+  expect(cell.anchor).toMatchObject({ pageIndex: 0, y: rect!.y, width: 0 });
+  expect(cell.anchor.x).toBeCloseTo(rect!.x + rect!.width, 6);
+  expect(cell.unbuiltPages).toBeUndefined();
 });
 
 test('hidden ranges of a header target are left out of its rects', async () => {

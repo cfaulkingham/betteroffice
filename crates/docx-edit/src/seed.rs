@@ -292,7 +292,7 @@ pub(crate) struct StyledParagraph {
 }
 
 /// Pilcrow keys seeded from direct formatting with a paragraph-style fallback.
-const STYLE_FALLBACK_KEYS: [&str; 23] = [
+const STYLE_FALLBACK_KEYS: [&str; 24] = [
     "alignment",
     "spaceBefore",
     "spaceAfter",
@@ -314,6 +314,7 @@ const STYLE_FALLBACK_KEYS: [&str; 23] = [
     "snapToGrid",
     "autoSpaceDE",
     "autoSpaceDN",
+    "adjustRightInd",
     "outlineLevel",
     "bidi",
 ];
@@ -2014,14 +2015,14 @@ fn shape_payload(shape: &Value, source: &BTreeMap<String, String>) -> JsonObject
     map_from_value(json!({ "shapeJson": source_json(shape, source) }))
 }
 
-fn chart_payload(chart: &Value, source: &BTreeMap<String, String>) -> JsonObject {
+pub(crate) fn chart_payload(chart: &Value, source: &BTreeMap<String, String>) -> JsonObject {
     let size = field(Some(chart), "size");
     map_from_value(json!({
         "chartJson": source_json(chart, source),
         "chartType": nullish(field(Some(chart), "chartType")),
         "title": nullish(field(Some(chart), "title")),
-        "width": number(field(size, "width")).filter(|value| *value != 0.0).map(emu_to_pixels).unwrap_or(320.0),
-        "height": number(field(size, "height")).filter(|value| *value != 0.0).map(emu_to_pixels).unwrap_or(220.0),
+        "width": number(field(size, "width")).map(emu_to_pixels).filter(|value| *value > 0.0).unwrap_or(320.0),
+        "height": number(field(size, "height")).map(emu_to_pixels).filter(|value| *value > 0.0).unwrap_or(220.0),
         "rId": nullish(field(Some(chart), "rId")),
         "path": nullish(field(Some(chart), "path"))
     }))
@@ -3088,6 +3089,7 @@ fn paragraph_attrs(
         ("listAbstractNumId", field(list, "abstractNumId")),
         ("listStartOverride", field(list, "startOverride")),
         ("_originalFormatting", formatting),
+        ("cnfStyle", field(formatting, "cnfStyle")),
     ] {
         if let Some(value) = value.filter(|value| !value.is_null()) {
             attrs.insert(key.to_owned(), drop_nulls(value.clone()));
@@ -3201,6 +3203,7 @@ fn paragraph_attrs(
             "snapToGrid",
             "autoSpaceDE",
             "autoSpaceDN",
+            "adjustRightInd",
             "outlineLevel",
             "bidi",
         ] {
@@ -8815,6 +8818,7 @@ mod tests {
             "snapToGrid": null,
             "autoSpaceDE": null,
             "autoSpaceDN": null,
+            "adjustRightInd": null,
             "outlineLevel": null,
             "bidi": null,
             "spacingExplicit": null,
