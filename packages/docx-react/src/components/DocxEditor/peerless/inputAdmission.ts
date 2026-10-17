@@ -6,7 +6,7 @@ import type {
 } from '@betteroffice/docx/peerless';
 import type { YrsAuthor } from '@betteroffice/docx/yrs';
 import type { PeerlessEchoIntent, PeerlessEchoPainter } from './echoPainter';
-import { hasImplicitVerticalGoal, type PeerlessInputIntent, type PeerlessProposalIntent, type PeerlessTextIntent } from './inputEvents';
+import { hasImplicitVerticalGoal, type PeerlessInputIntent, type PeerlessProposalIntent, type PeerlessRevisionIntent, type PeerlessTextIntent } from './inputEvents';
 import type { PeerlessViewStore } from './viewStore';
 
 /** @internal */
@@ -86,6 +86,7 @@ export function createInputAdmission(_options: PeerlessInputAdmissionOptions): P
   const { session, viewStore, echoPainter } = _options;
   const pending = new Map<CommandTicket, number>();
   const prefixes = new WeakMap<CommandTicket, Promise<boolean>>();
+  const reviewDependencies = new WeakMap<CommandTicket, CommandTicket | undefined>();
   const deferred = new WeakMap<CommandTicket, Promise<{ ticket?: CommandTicket; blocked?: boolean }>>();
   const cancellations = new Set<() => void>();
   const held: Array<{ intent: AdmissionIntent; options: PeerlessAdmissionOptions; deletionExtension: boolean;
@@ -126,10 +127,16 @@ export function createInputAdmission(_options: PeerlessInputAdmissionOptions): P
   };
   const readOnly = () => requestedReadOnly ?? viewStore.getSnapshot().editState?.readOnly ?? session.state.editState?.readOnly ?? false;
   const workerSelection = () => latestSelection(session, viewStore);
-  const track = (ticket: CommandTicket) => {
+  const latestEditState = () => (session.state.throughSeq >= viewStore.getSnapshot().throughSeq ? session.state.editState : undefined) ??
+    viewStore.getSnapshot().editState;
+  const documentVersion = () => latestEditState()?.documentVersion ?? viewStore.getSnapshot().editState?.documentVersion ?? '';
+  const refusal = (reason: string): CommandTicket => ({ id: --nextTicket, seq: undefined,
+    ack: Promise.resolve({ status: 'refused', reason }), presented: Promise.resolve('dropped') });
+  const dependencyOf = (ticket: CommandTicket | undefined) => ticket && reviewDependencies.has(ticket) ? reviewDependencies.get(ticket) : ticket;
+  const track = (ticket: CommandTicket, review = false) => {
     const prefix = tail ? prefixes.get(tail) ?? Promise.resolve(true) : Promise.resolve(true);
     prefixes.set(ticket, Promise.all([prefix, ticket.ack]).then(([ok, outcome]) =>
-      ok && outcome.status !== 'refused' && outcome.status !== 'cancelled', () => false));
+      ok && (review || (outcome.status !== 'refused' && outcome.status !== 'cancelled')), () => false));
     tail = ticket;
     pending.set(ticket, 1);
     const settle = () => {
@@ -268,27 +275,35 @@ export function createInputAdmission(_options: PeerlessInputAdmissionOptions): P
           verticalGoal = hasImplicitVerticalGoal(intent) ? goalX : intent.payload.goalX;
           goalX = verticalGoal;
         } else verticalGoal = undefined;
+        const revisionId = isRevision(intent) ? intent.payload.revisionId ?? latestEditState()?.currentRevisionId : undefined;
+        if (isRevision(intent) && !revisionId) {
+          const refused = refusal('revision-required');
+          reviewDependencies.set(refused, dependencyOf(predecessor));
+          return refused;
+        }
         const payload = intent.kind === 'formatRange'
           ? { ...intent.payload, selection: requireSelection(selection) }
+          : isRevision(intent) ? { revisionId: revisionId ?? '', expectVersion: documentVersion() }
           : vertical && intent.kind === 'navigate' && goalX !== undefined
             ? { ...intent.payload, goalX }
             : target?.kind === 'worker-selection' && target.snapshot.workerSelection && isText(intent)
               ? { ...intent.payload, selection: target.snapshot.workerSelection } : intent.payload;
         const ticket = session.submit(intent.kind, payload, {
-          ...metadata, after: predecessor, fence: !!fence,
+          ...metadata, after: dependencyOf(predecessor), fence: !!fence,
           coalesceKey: fence ? undefined : metadata.coalesceKey ?? intent.kind,
           echo,
         });
+        if (isRevision(intent)) reviewDependencies.set(ticket, dependencyOf(predecessor));
         if (onSubmitted) {
           try { onSubmitted(ticket); } catch (error) { console.error('[PeerlessInput] submission observer failed', error); }
         }
         return ticket;
       };
-      const waitForSelection = intent.kind === 'formatRange' || deletionExtension || vertical !== undefined;
+      const waitForSelection = intent.kind === 'formatRange' || isRevision(intent) || deletionExtension || vertical !== undefined;
       const ticket = deletionExtension || vertical || (after && (waitForSelection || deferred.has(after))) ||
         (intent.kind === 'formatRange' && !workerSelection())
         ? defer(after, waitForSelection, send, vertical) : send(after)!;
-      track(ticket);
+      track(ticket, isRevision(intent));
       return { status: 'submitted', ticket, echoEnabled: echo !== undefined };
     } catch (error) {
       if (!counted) releaseCount();
@@ -447,7 +462,7 @@ const SUGGESTED = {
   openPart: false, ensurePart: false, removePart: false,
   select: false, navigate: false, selectPoint: false, extendSelection: false,
   undo: false, redo: false, setRenderEnvironment: false, setFontEnvironment: false,
-  propose: false, setProposalStates: false, withdrawProposals: false,
+  propose: false, setProposalStates: false, withdrawProposals: false, acceptRevision: false, rejectRevision: false,
 } satisfies Record<AdmissionIntent['kind'], boolean>;
 const admissions = new WeakMap<PeerlessInputAdmission,
   (intent: AdmissionIntent, options?: PeerlessAdmissionOptions, deletionExtension?: boolean) => PeerlessAdmissionResult>();
@@ -479,6 +494,10 @@ function requireSelection(selection: DocxCommandSelection | null | undefined): D
 
 function isProposal(intent: AdmissionIntent): intent is PeerlessProposalIntent {
   return intent.kind === 'propose' || intent.kind === 'setProposalStates' || intent.kind === 'withdrawProposals';
+}
+
+function isRevision(intent: AdmissionIntent): intent is PeerlessRevisionIntent {
+  return intent.kind === 'acceptRevision' || intent.kind === 'rejectRevision';
 }
 
 function isSelection(intent: AdmissionIntent): boolean {

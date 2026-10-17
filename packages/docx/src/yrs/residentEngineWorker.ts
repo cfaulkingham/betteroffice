@@ -86,7 +86,7 @@ import {
   resolveSelectionText,
   resolveSelectionUnit,
 } from './viewerSelection';
-import { readSidebar, readOutlineHeadings } from './sidebarReads';
+import { readAdjacentRevision, readSidebar, readOutlineHeadings } from './sidebarReads';
 import { clipboardTablePayload, readClipboardSlice } from './clipboardFragment';
 import { storyOffsetForLoc, tableAnchors } from './storyPlainText';
 import { createResidentScheduler, type SchedulerMessage } from './residentScheduler';
@@ -2167,6 +2167,10 @@ async function handle(request: ResidentEngineWorkerRequest): Promise<void> {
         break;
       case 'headings':
         value = readOutlineHeadings(session.geometryReader, request.read.expectVersion);
+        break;
+      case 'adjacentRevision':
+        value = readAdjacentRevision(session.geometryReader, request.read.selection, request.read.direction,
+          new Set(proposals?.snapshot().proposals.flatMap((proposal) => proposal.revisionIds)));
         break;
       case 'stickyAnchors': {
         const currentSession = session;

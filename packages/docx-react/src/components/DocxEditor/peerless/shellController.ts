@@ -25,6 +25,7 @@ import type { DocxHostSearch } from '../hooks/useHostSearch';
 import type { SelectionState } from '../types';
 import { yrsSelectionState } from '../hooks/useSelectionTracker';
 import { readPresentedReview, reviewDescribes, reviewMatches } from './workerReview';
+import { workerRevisions, type WorkerRevisionState } from './workerRevisions';
 import type { DocxProposalResult, DocxProposalSnapshot, ResidentReviewSnapshot, ResidentReviewTarget } from '@betteroffice/docx/yrs';
 import type { Comment } from '@betteroffice/docx/types/content';
 
@@ -112,6 +113,7 @@ export function createPeerlessShellController(initial: Options) {
   let reviewBinding: PeerlessEditSessionBinding | null = null;
   let reviewIdentity: PeerlessViewSnapshot['identity'] | null = null;
   let proposalTail: Promise<unknown> = Promise.resolve();
+  let revisions: { binding: PeerlessEditSessionBinding; key: string; value: WorkerRevisionState } | null = null;
   let documentKey: unknown;
   let generation = 0;
   let borderPen: { style: string; size: number; color: { rgb: string } } = { style: 'single', size: 4, color: { rgb: '000000' } };
@@ -144,7 +146,7 @@ export function createPeerlessShellController(initial: Options) {
   };
   const reset = (status: typeof snapshot.status, error: Error | null = null) => {
     const selected = snapshot.view?.workerSelection;
-    fontRevision = 0; fontFamilies = []; metadata = null; firstPainted = false; workerMemory = null;
+    fontRevision = 0; fontFamilies = []; metadata = null; revisions = null; firstPainted = false; workerMemory = null;
     unsubscribe?.(); binding = null; reviewValue = null; reviewBinding = null; reviewIdentity = null;
     batchResults.clear(); commentResults.clear(); appliedBatches.clear(); commentList = null; snapshot = { status, view: null, error, mode: mode(), preview: null, previewPainted: false }; publish();
     if (selected) selectionChanged(null);
@@ -169,7 +171,7 @@ export function createPeerlessShellController(initial: Options) {
       sidebarOpen: false, sidebarControl: 'fixed', zoom: options.zoom, zoomWhileOpening: true, tableGridlines: options.tableGridlines === true, canOpen: options.showFileOpen !== false, canReportIssue: false,
       bodyStory: (view?.workerSelection?.focus.story ?? 'body') === 'body' || view?.workerSelection?.focus.story.startsWith('body:') === true, pendingInput: false,
       supportedCommands: new Set(['zoom', 'tableGridlines', 'open', 'save', 'print', 'undo', 'redo', 'find', 'replace', 'editingMode', 'pageSetup', 'watermark', 'imageProperties', 'imageWrap', 'imageTransform', 'insertTable', 'insertImage', 'tableAction',
-        'insertPageBreak', 'insertSectionBreakNextPage', 'insertSectionBreakContinuous', 'insertLink', ...FORMATTING_COMMANDS]),
+        'insertPageBreak', 'insertSectionBreakNextPage', 'insertSectionBreakContinuous', 'insertLink', 'reviewAccept', 'reviewReject', 'reviewNext', 'reviewPrevious', ...FORMATTING_COMMANDS]),
       tableActions: new Set(['selectTable', 'selectRow', 'selectColumn', 'addRowAbove', 'addRowBelow', 'addColumnLeft',
         'addColumnRight', 'deleteRow', 'deleteColumn', 'deleteTable', 'mergeCells', 'splitCell', 'cellFillColor',
         'borderAll', 'borderOutside', 'borderInside', 'borderNone', 'borderTop', 'borderBottom', 'borderLeft', 'borderRight',
@@ -179,7 +181,7 @@ export function createPeerlessShellController(initial: Options) {
         fontSize: view?.editState?.effectiveFormatting?.fontSizePt ?? null } : null,
       table: view?.editState?.tableContext ? { isInTable: true, ...view.editState.tableContext,
         table: { attrs: { justification: view.editState.tableContext.justification } } } : null,
-      image: options.image !== undefined ? options.image : options.imagePropertiesAvailable ? { wrap: null } : null, revisions: [], revisionIds: new Set(), currentRevisionId: null,
+      image: options.image !== undefined ? options.image : options.imagePropertiesAvailable ? { wrap: null } : null, ...revisionEnvironment(view),
       styles: workerStyleOptions(metadata && metadata.binding === binding && metadata.version === view?.version ? metadata.value.styles : [], translate), fonts: [
         ...choices.map(font => ({ args: { family: getPrimaryFontFamily(font.fontFamily) || font.name }, label: font.name,
           preview: { fontFamily: font.fontFamily, group: font.category ?? 'other' } })),
@@ -188,8 +190,17 @@ export function createPeerlessShellController(initial: Options) {
       ], translate,
     };
   };
+  const revisionEnvironment = (view: PeerlessViewSnapshot | null | undefined) => {
+    const state = revisions?.binding === binding ? revisions?.value : null;
+    return { revisions: state?.navigation ?? [], revisionIds: state?.ids ?? new Set<string>(), currentRevisionId: view?.editState?.currentRevisionId ?? null };
+  };
   const queryOrigins = new WeakMap<object, { binding: PeerlessEditSessionBinding; identity: PeerlessViewSnapshot['identity']; version: number }>();
   const capture = () => binding;
+  const currentQuery = (result: object) => {
+    const origin = queryOrigins.get(result);
+    const view = binding?.viewStore.getSnapshot();
+    return !!origin && origin.binding === binding && !!view && sameIdentity(origin.identity, view.identity) && origin.version === view.version;
+  };
   const ready = () => {
     if (!binding || snapshot.status !== 'ready') throw new Error('Peer-less editor is not ready');
     return binding;
@@ -331,7 +342,9 @@ export function createPeerlessShellController(initial: Options) {
     const outcome = await admitted.ticket.ack;
     if (current !== binding) return replaced;
     if (outcome.status === 'applied' || outcome.status === 'noop') return { result: { ok: true, status: outcome.status === 'applied' ? 'executed' : 'noop' }, seq: outcome.seq };
-    return { result: { ok: false, failure: { code: outcome.reason === 'read-only' ? 'read-only' : 'command-failed', message: outcome.reason ?? 'Worker command failed.' } }, seq: outcome.seq };
+    const code = outcome.reason === 'read-only' ? 'read-only' : outcome.reason === 'revision-required' ? 'revision-required'
+      : outcome.reason === 'unknown-revision' ? 'revision-not-found' : 'command-failed';
+    return { result: { ok: false, failure: { code, message: outcome.reason ?? 'Worker command failed.' } }, seq: outcome.seq };
   };
   const settleCommand = async (current: PeerlessEditSessionBinding, held: PeerlessAdmissionResult): Promise<DocxCommandResult> =>
     (await settleTicket(current, held)).result;
@@ -371,7 +384,7 @@ export function createPeerlessShellController(initial: Options) {
   };
   const commandBinding: DocxCommandBinding = {
     environment,
-    ordered: (id) => !FORMATTING_COMMANDS.has(id) && !['zoom', 'tableGridlines', 'open', 'print', 'insertTable'].includes(id),
+    ordered: (id) => !FORMATTING_COMMANDS.has(id) && !['zoom', 'tableGridlines', 'open', 'print', 'insertTable', 'reviewAccept', 'reviewReject'].includes(id),
     admit: async (operation) => {
       const current = binding;
       if (current && snapshot.status === 'ready') {
@@ -388,6 +401,15 @@ export function createPeerlessShellController(initial: Options) {
         return { ok: true, status: 'executed' };
       }
       if (id === 'undo' || id === 'redo') return submit({ kind: id, payload: {} });
+      if (id === 'reviewAccept' || id === 'reviewReject') {
+        const revisionId = (args as DocxCommandArgs['reviewAccept'])?.revisionId;
+        return submit({ kind: id === 'reviewAccept' ? 'acceptRevision' : 'rejectRevision', payload: revisionId ? { revisionId } : {} });
+      }
+      if (id === 'reviewNext' || id === 'reviewPrevious') {
+        const target = await query({ kind: 'adjacentRevision', selection: ready().viewStore.getSnapshot().workerSelection ?? null, direction: id === 'reviewNext' ? 'next' : 'previous' });
+        return target.value && await revealReviewTarget({ kind: 'revision', revisionId: target.value.revisionId }) ? { ok: true, status: 'executed' }
+          : { ok: false, failure: { code: 'command-failed', message: 'Worker command failed.' } };
+      }
       if (id === 'strikethrough') return format({ kind: 'toggleStrike', payload: {} });
       if (id === 'superscript' || id === 'subscript') return format({ kind: 'toggleMark', payload: { mark: { type: id } } });
       if (id === 'clearFormatting') return format({ kind: 'clearFormatting', payload: {} });
@@ -860,6 +882,16 @@ export function createPeerlessShellController(initial: Options) {
       }
       commands.refresh();
     },
+    revisions(review: PeerlessWorkerQuery<'reviewSnapshot'> | null, sidebar: PeerlessWorkerQuery<'sidebar'> | null) {
+      if (!review?.value || !currentQuery(review) || (sidebar && (!currentQuery(sidebar) || sidebar.version !== review.version))) return;
+      const value = workerRevisions(review.value, sidebar?.value ?? null);
+      if (!value) return;
+      const key = JSON.stringify([[...value.ids], value.navigation, value.entries, [...value.anchors]]);
+      if (revisions?.binding === binding && revisions.key === key) return;
+      revisions = { binding: binding!, key, value };
+      publish();
+    },
+    trackedChanges: () => revisions?.binding === binding ? revisions?.value ?? null : null,
     fontChoices(families: string[]) { fontFamilies = [...families]; publish(); },
     fontEnvironment(event: ResidentFontEnvironmentEvent) {
       if (event.phase !== 'ready' || event.revision <= fontRevision || snapshot.status === 'empty' || snapshot.status === 'failed') return;

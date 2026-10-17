@@ -4,7 +4,7 @@ import { toolbarFixture } from './toolbarCommands.testing';
 test('worker toolbar preserves unsupported command reasons', () => {
   const { controller } = toolbarFixture();
   for (const id of ['insertTOC',
-    'reviewAccept', 'reviewReject', 'reviewPrevious', 'reviewNext', 'commentsSidebar', 'reportIssue'] as const) {
+    'commentsSidebar', 'reportIssue'] as const) {
     expect(controller.commands.store.getState(id)).toMatchObject({ enabled: false, disabledReason: { code: 'unsupported-command' } });
   }
 });
