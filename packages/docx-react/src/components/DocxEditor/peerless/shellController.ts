@@ -28,6 +28,7 @@ import { readPresentedReview, reviewDescribes, reviewMatches } from './workerRev
 import type { DocxProposalResult, DocxProposalSnapshot, ResidentReviewSnapshot, ResidentReviewTarget } from '@betteroffice/docx/yrs';
 import type { Comment } from '@betteroffice/docx/types/content';
 
+import { LAYOUT_POLL_MS, LAYOUT_REFUSALS, LAYOUT_WAIT_MS, VIEWER_LAYOUT_WAIT_MS, type WorkerPageExportResult } from '../internals/workerOpenExport';
 import { PeerlessSyncApiError } from './contracts';
 export { LEGACY_SYNC_API_PROP, PeerlessSyncApiError } from './contracts';
 
@@ -66,6 +67,7 @@ interface Options extends Pick<DocxEditorProps, 'i18n' | 'theme' | 'mode' | 'rea
   onTableGridlines?(visible: boolean): void;
   read: ResidentEngineWorkerClient['documentRead'];
   readAt?: ResidentEngineWorkerClient['documentReadAt'];
+  layoutRequest?(): string | null;
   search?: DocxHostSearch;
   save?(): Promise<ArrayBuffer>;
   loadBuffer?(buffer: DocxInput): Promise<void>;
@@ -671,6 +673,84 @@ export function createPeerlessShellController(initial: Options) {
     if (receipt) return receipt;
     return { ok: false as const, version: request.expectVersion, failure: { code: (outcome.reason ?? 'unsupported') as import('@betteroffice/docx/yrs').DocxEditFailureCode, message: outcome.reason ?? 'Worker batch failed' } };
   };
+  const whenLayoutComplete: DocxEditorRef['whenLayoutComplete'] = ({ timeoutMs = 30000 } = {}) => new Promise<number>((resolve, reject) => {
+    let current: PeerlessEditSessionBinding | null = null;
+    let flushed = false;
+    let stop: (() => void) | undefined;
+    const settle = (error: Error | null) => {
+      clearTimeout(timeout); waits.delete(check); stop?.(); stop = undefined;
+      if (error) reject(error); else resolve(current?.viewStore.getSnapshot().geometry?.pages.length ?? 0);
+    };
+    const check = () => {
+      if (closed) return settle(new Error('Editor was closed'));
+      if (snapshot.error) return settle(snapshot.error);
+      if (current) {
+        if (binding !== current) return settle(new Error('Document was replaced'));
+        const view = current.viewStore.getSnapshot();
+        if (flushed && view.geometry && view.presentedThroughSeq >= view.throughSeq && !view.geometry.layoutProvisional) settle(null);
+        return;
+      }
+      if (snapshot.status !== 'ready' || !binding) return;
+      const opened = binding;
+      current = opened;
+      void flushAdmittedInput(opened).then(() => {
+        if (!waits.has(check)) return;
+        flushed = true; stop = opened.viewStore.subscribe(check); check();
+      }, (error: unknown) => { if (waits.has(check)) settle(error instanceof Error ? error : new Error(String(error))); });
+    };
+    const timeout = setTimeout(() => settle(new Error('Layout timed out')), timeoutMs);
+    waits.add(check);
+    check();
+  });
+  const exportStructuredWithPages: DocxEditorRef['exportStructuredWithPages'] = async (config) => {
+    const current = await opened();
+    await flush();
+    const view = current.viewStore.getSnapshot();
+    let request: string | null = null;
+    let superseded = false;
+    const assertCurrent = () => { if (binding !== current) throw new WorkerReadSupersededError('Document was replaced'); };
+    const moved = (): WorkerPageExportResult => {
+      superseded = true;
+      return { ok: false, version: view.editState?.documentVersion ?? view.geometry?.documentVersion ?? '',
+        failure: { code: 'stale-document', target: null, message: 'The document changed while exporting.' } };
+    };
+    const attempt = async (): Promise<WorkerPageExportResult> => {
+      assertCurrent();
+      request = options.layoutRequest?.() ?? null;
+      if (request === null) return { ok: false, version: view.editState?.documentVersion ?? '',
+        failure: { code: 'layout-unavailable', target: null, message: 'The fonts this document uses are not loaded yet.' } };
+      try {
+        const value = await read({ kind: 'exportStructuredWithPages', options: config, currentRequest: request, workerFonts: true });
+        assertCurrent();
+        return JSON.parse(value) as WorkerPageExportResult;
+      } catch (error) {
+        assertCurrent();
+        if (error instanceof WorkerReadSupersededError) return moved();
+        throw error;
+      }
+    };
+    const showsMarkup = () => {
+      if (request === null) return false;
+      const preview = (JSON.parse(request) as { renderEnv?: { revisionPreview?: object } }).renderEnv?.revisionPreview;
+      return !preview || Object.keys(preview).length === 0;
+    };
+    let result = await attempt();
+    if (config.expectLayoutVersion !== undefined || superseded) return result;
+    if (!result.ok && (LAYOUT_REFUSALS.has(result.failure.code) ||
+      (result.failure.code === 'unsupported-revision-layout' && showsMarkup()))) {
+      await whenLayoutComplete({ timeoutMs: VIEWER_LAYOUT_WAIT_MS }).catch(() => {});
+      assertCurrent();
+      result = await attempt();
+      if (superseded) return result;
+    }
+    const deadline = Date.now() + LAYOUT_WAIT_MS;
+    while (!result.ok && LAYOUT_REFUSALS.has(result.failure.code) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, LAYOUT_POLL_MS));
+      result = await attempt();
+      if (superseded) return result;
+    }
+    return result;
+  };
   const implemented = {
     commands: commands.store,
     insertComment,
@@ -684,35 +764,8 @@ export function createPeerlessShellController(initial: Options) {
     validateEdits: async (request) => { await flush(); return batchPolicy(request) ?? read({ kind: 'validateEdits', request }); },
     applyEdits: (request) => applyEdits(request),
     readPositionAtPoint: (x, y) => options.readPositionAtPoint?.(x, y) ?? Promise.resolve(null),
-    whenLayoutComplete: ({ timeoutMs = 30000 } = {}) => new Promise<number>((resolve, reject) => {
-      let current: PeerlessEditSessionBinding | null = null;
-      let flushed = false;
-      let stop: (() => void) | undefined;
-      const settle = (error: Error | null) => {
-        clearTimeout(timeout); waits.delete(check); stop?.(); stop = undefined;
-        if (error) reject(error); else resolve(current?.viewStore.getSnapshot().geometry?.pages.length ?? 0);
-      };
-      const check = () => {
-        if (closed) return settle(new Error('Editor was closed'));
-        if (snapshot.error) return settle(snapshot.error);
-        if (current) {
-          if (binding !== current) return settle(new Error('Document was replaced'));
-          const view = current.viewStore.getSnapshot();
-          if (flushed && view.geometry && view.presentedThroughSeq >= view.throughSeq && !view.geometry.layoutProvisional) settle(null);
-          return;
-        }
-        if (snapshot.status !== 'ready' || !binding) return;
-        const opened = binding;
-        current = opened;
-        void flushAdmittedInput(opened).then(() => {
-          if (!waits.has(check)) return;
-          flushed = true; stop = opened.viewStore.subscribe(check); check();
-        }, (error: unknown) => { if (waits.has(check)) settle(error instanceof Error ? error : new Error(String(error))); });
-      };
-      const timeout = setTimeout(() => settle(new Error('Layout timed out')), timeoutMs);
-      waits.add(check);
-      check();
-    }),
+    whenLayoutComplete,
+    exportStructuredWithPages,
     flushPendingInput: async () => { await flushComments(); },
     readParagraphs: (request) => read({ kind: 'readParagraphs', request }),
     getParagraphIdentities: () => read({ kind: 'paragraphIdentities' }),
