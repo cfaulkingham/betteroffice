@@ -14,7 +14,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use yrs::{ReadTxn, Transact, Update};
 
-use crate::deck::{shape_fill, stroked_outline, validate_adjustments, validate_rect};
+use crate::deck::{
+    shape_fill, stroked_outline, validate_adjustments, validate_background, validate_rect,
+};
 use crate::model::validate_xml_text;
 use crate::proposals::inherited_style;
 use crate::staging::Adoption;
@@ -198,6 +200,15 @@ pub struct OutlineGuard {
     pub outline: Option<Box<ShapeOutline>>,
 }
 
+/// Refuses a step unless the slide's effective background is exactly
+/// `background`; `null` is no background of its own.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BackgroundGuard {
+    #[serde(deserialize_with = "nullable")]
+    pub background: Option<Box<ShapeFill>>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SlideTarget {
@@ -253,6 +264,14 @@ pub enum EditStep {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expect: Option<TextGuard>,
+    },
+    /// Replaces the slide's background; `null` clears the declaration.
+    SetSlideBackground {
+        target: SlideTarget,
+        #[serde(deserialize_with = "nullable")]
+        background: Option<Box<ShapeFill>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<BackgroundGuard>,
     },
     SetShapeRect {
         target: ShapeTarget,
@@ -509,6 +528,7 @@ impl Claim {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Property {
     Notes,
+    Background,
     Rect,
     Fill,
     Stroke,
@@ -542,6 +562,7 @@ enum Effect {
         alignment: Option<String>,
     },
     Notes(String),
+    Background(Option<ShapeFill>),
     Rect(ShapeRect),
     Fill(Option<String>),
     Stroke(ShapeStroke),
@@ -639,7 +660,7 @@ impl Planned {
     fn owned_property(&self) -> Option<(&str, Property)> {
         let property = self.property?;
         let owner = match property {
-            Property::Notes => self.slide_id.as_str(),
+            Property::Notes | Property::Background => self.slide_id.as_str(),
             _ => self.shape_id.as_deref()?,
         };
         Some((owner, property))
@@ -1122,6 +1143,38 @@ fn plan_notes(
     ))
 }
 
+fn plan_background(
+    deck: &Deck<'_>,
+    index: u32,
+    target: &SlideTarget,
+    background: &Option<Box<ShapeFill>>,
+    expect: Option<&BackgroundGuard>,
+) -> Result<Planned, EditFailure> {
+    let requested = EditTarget::Slide(target.clone());
+    let slide = deck.slide(&target.slide_id, &requested)?;
+    if let Some(guard) = expect
+        && guard.background.as_deref() != slide.background.as_ref()
+    {
+        return Err(mismatch(
+            "the slide's background differs from the expected background",
+            &requested,
+        ));
+    }
+    let fill = background.as_deref().cloned();
+    if let Some(fill) = &fill {
+        validate_background(fill).map_err(|error| invalid(error, &requested))?;
+    }
+    let effect = (slide.background != fill).then_some(Effect::Background(fill));
+    Ok(Planned::property(
+        index,
+        requested,
+        &slide.id,
+        None,
+        Property::Background,
+        effect,
+    ))
+}
+
 /// A shape that geometry, fill and outline steps may address.
 fn top_level_shape<'a>(
     deck: &Deck<'a>,
@@ -1291,6 +1344,11 @@ fn plan_step(deck: &Deck<'_>, index: u32, step: &EditStep) -> Result<Planned, Ed
             text,
             expect,
         } => plan_notes(deck, index, target, text, expect.as_ref()),
+        EditStep::SetSlideBackground {
+            target,
+            background,
+            expect,
+        } => plan_background(deck, index, target, background, expect.as_ref()),
         EditStep::SetShapeRect {
             target,
             rect,
@@ -1388,6 +1446,9 @@ fn execute(stage: &DeckSession, steps: &[Planned]) -> EditResult<()> {
                 )?;
             }
             Some(Effect::Notes(text)) => stage.set_slide_notes(&context, slide, text)?,
+            Some(Effect::Background(background)) => {
+                stage.set_slide_background(&context, slide, background.as_ref())?;
+            }
             Some(Effect::Rect(rect)) => {
                 stage.set_shape_rect(&context, slide, shape, *rect)?;
             }

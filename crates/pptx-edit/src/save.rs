@@ -6,10 +6,10 @@ use std::collections::{BTreeMap, HashMap};
 use base64::Engine as _;
 use ooxml_drawingml::{ColorValue, ShapeFill};
 use pptx_parse::{
-    Bullet, CommentAuthorWrite, CommentFlavor, CommentSlide, CommentWrite, CommentsWrite,
-    DeckWrite, InheritedTransform, NotesWrite, ParagraphWrite, PictureAdd, PptxPackage,
-    RunProperties, RunWrite, ShapeAdd, ShapeNode, ShapePatch, ShapeWrite, SlideWrite, TextTarget,
-    TextWrite,
+    BackgroundWrite, Bullet, CommentAuthorWrite, CommentFlavor, CommentSlide, CommentWrite,
+    CommentsWrite, DeckWrite, InheritedTransform, NotesWrite, ParagraphWrite, PictureAdd,
+    PptxPackage, RunProperties, RunWrite, ShapeAdd, ShapeNode, ShapePatch, ShapeWrite, SlideWrite,
+    TextTarget, TextWrite,
 };
 
 use crate::comments::{derived_guid, seeded_comment_id};
@@ -67,6 +67,7 @@ fn deck_write(
             Some(base) => SlideWrite::Patch {
                 part_path: source_part_path(slide)?,
                 shapes: shape_writes(&slide.shapes, &base.shapes, source_shapes(package, slide))?,
+                background: background_write(slide, base),
             },
             None if slide.source_part_path.is_some() => {
                 let mut base = baseline
@@ -86,6 +87,7 @@ fn deck_write(
                         &base.shapes,
                         source_shapes(package, slide),
                     )?,
+                    background: background_write(slide, &base),
                 }
             }
             None => SlideWrite::Add {
@@ -96,6 +98,7 @@ fn deck_write(
                     .iter()
                     .map(shape_add)
                     .collect::<EditResult<Vec<_>>>()?,
+                background: slide.background.clone().map(Box::new),
             },
         };
         slides.push(write);
@@ -121,6 +124,18 @@ fn rename_duplicate_shape(shape: &mut ShapeSnapshot, old_slide: &str, new_slide:
     for child in &mut shape.children {
         rename_duplicate_shape(child, old_slide, new_slide);
     }
+}
+
+/// The background write a slide's snapshot change needs; `None` keeps the
+/// source declaration untouched.
+fn background_write(current: &SlideSnapshot, baseline: &SlideSnapshot) -> Option<BackgroundWrite> {
+    if current.background == baseline.background {
+        return None;
+    }
+    Some(match current.background.clone() {
+        Some(fill) => BackgroundWrite::Set(Box::new(fill)),
+        None => BackgroundWrite::Clear,
+    })
 }
 
 fn notes_write(current: &DeckSnapshot, baseline: &DeckSnapshot) -> Option<NotesWrite> {

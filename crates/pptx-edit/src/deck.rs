@@ -29,8 +29,8 @@ use crate::{
     DeckSession, DeckSnapshot, EditCtx, EditError, EditResult, META, MIGRATE_ORIGIN, PendingMedia,
     PictureDraft, PresetShapeDraft, SHAPES, SLIDE_ORDER, SLIDES, STORIES, ShapeAdjustReceipt,
     ShapeDraft, ShapeFillReceipt, ShapeKind, ShapeReceipt, ShapeRect, ShapeSnapshot, ShapeStroke,
-    ShapeStrokeReceipt, ShapeZOrderReceipt, SlideReceipt, SlideScope, SlideSnapshot,
-    TransformReceipt,
+    ShapeStrokeReceipt, ShapeZOrderReceipt, SlideBackgroundReceipt, SlideReceipt, SlideScope,
+    SlideSnapshot, TransformReceipt,
 };
 
 const SCHEMA_VERSION: f64 = 2.3;
@@ -474,6 +474,42 @@ impl DeckSession {
         drop(txn);
         self.automatic_undo_barrier();
         Ok(())
+    }
+
+    /// Replaces a slide's background; `None` removes the declaration so the
+    /// layout or master background shows.
+    pub fn set_slide_background(
+        &self,
+        context: &EditCtx,
+        slide_id: &str,
+        background: Option<&ShapeFill>,
+    ) -> EditResult<SlideBackgroundReceipt> {
+        if let Some(background) = background {
+            validate_background(background)?;
+        }
+        let read = self.doc.transact();
+        let slide = slide_ref(&read, slide_id)?;
+        let before = slide_background(&slide, &read, &self.package)?;
+        drop(read);
+        self.automatic_undo_barrier();
+        let mut txn = self.transact_for(context);
+        match background {
+            Some(background) => {
+                insert_json(&slide, &mut txn, "backgroundJson", Some(background))?;
+                slide.remove(&mut txn, "backgroundCleared");
+            }
+            None => {
+                slide.remove(&mut txn, "backgroundJson");
+                slide.insert(&mut txn, "backgroundCleared", true);
+            }
+        }
+        drop(txn);
+        self.automatic_undo_barrier();
+        Ok(SlideBackgroundReceipt {
+            slide_id: slide_id.to_owned(),
+            before,
+            after: background.cloned(),
+        })
     }
 
     pub fn delete_slide(&self, context: &EditCtx, slide_id: &str) -> EditResult<SlideReceipt> {
@@ -1269,13 +1305,19 @@ pub(crate) fn import_source_render_data(
         }
     }
     for slide in &mut package.slides {
-        if let Some(source) = source
+        let Some(source) = source
             .slides
             .iter()
             .find(|source| source.part_path == slide.part_path)
-            && slide.notes != source.notes
-        {
+        else {
+            continue;
+        };
+        if slide.notes != source.notes {
             slide.notes.clone_from(&source.notes);
+            changed = true;
+        }
+        if slide.background != source.background {
+            slide.background.clone_from(&source.background);
             changed = true;
         }
     }
@@ -1998,6 +2040,7 @@ fn snapshot_slide<T: ReadTxn>(
     } = slide_parts(slides, package, txn, slide_id)?;
     let slide = slide_ref(txn, slide_id)?;
     snapshot.notes = slide_notes(&slide, txn, package);
+    snapshot.background = slide_background(&slide, txn, package)?;
     for shape_id in shape_ids {
         snapshot.shapes.push(snapshot_shape(
             shapes,
@@ -2052,6 +2095,7 @@ pub(crate) fn slide_parts<T: ReadTxn>(
             layout_part_path,
             name: map_string(&slide, txn, "name"),
             notes: String::new(),
+            background: None,
             shapes: Vec::new(),
         },
         theme,
@@ -2145,6 +2189,130 @@ pub(crate) fn slide_notes<T: ReadTxn>(slide: &MapRef, txn: &T, package: &PptxPac
         .find(|source| Some(&source.part_path) == source_part_path.as_ref())
         .map(|source| source.notes.clone())
         .unwrap_or_default()
+}
+
+/// The slide's effective background: a stored override, an explicit clear, or
+/// the declaration on the source part.
+pub(crate) fn slide_background<T: ReadTxn>(
+    slide: &MapRef,
+    txn: &T,
+    package: &PptxPackage,
+) -> EditResult<Option<ShapeFill>> {
+    if let Some(background) = optional_json::<ShapeFill, _>(slide, txn, "backgroundJson")? {
+        return Ok(Some(background));
+    }
+    if map_bool(slide, txn, "backgroundCleared") == Some(true) {
+        return Ok(None);
+    }
+    let source_part_path = map_string(slide, txn, "sourcePartPath");
+    Ok(package
+        .slides
+        .iter()
+        .find(|source| Some(&source.part_path) == source_part_path.as_ref())
+        .and_then(|source| source.background.clone()))
+}
+
+/// Rejects backgrounds the writer cannot serialize; `theme` fills only come
+/// from parsed sources and are not settable.
+pub(crate) fn validate_background(fill: &ShapeFill) -> EditResult<()> {
+    match fill.fill_type.as_str() {
+        "none" => Ok(()),
+        "solid" => {
+            let color = fill.color.as_ref().ok_or_else(|| {
+                EditError::InvalidFill("the background fill is missing its colour".to_owned())
+            })?;
+            validate_background_color(color)
+        }
+        "gradient" => {
+            let gradient = fill.gradient.as_ref().ok_or_else(|| {
+                EditError::InvalidFill(
+                    "the background fill is missing its gradient stops".to_owned(),
+                )
+            })?;
+            if gradient.stops.len() < 2 {
+                return Err(EditError::InvalidFill(
+                    "a gradient background needs at least two stops".to_owned(),
+                ));
+            }
+            if gradient.angle.is_some_and(|angle| !angle.is_finite()) {
+                return Err(EditError::InvalidFill(
+                    "the gradient angle is not a finite number".to_owned(),
+                ));
+            }
+            for stop in &gradient.stops {
+                if !stop.position.is_finite() || !(0.0..=100_000.0).contains(&stop.position) {
+                    return Err(EditError::InvalidFill(format!(
+                        "gradient stop position {} is outside 0..=100000",
+                        stop.position
+                    )));
+                }
+                validate_background_color(&stop.color)?;
+            }
+            Ok(())
+        }
+        other => Err(EditError::InvalidFill(format!(
+            "background fill type {other:?} is not supported"
+        ))),
+    }
+}
+
+fn validate_background_color(color: &ColorValue) -> EditResult<()> {
+    if let Some(rgb) = &color.rgb {
+        if rgb.len() != 6 || !rgb.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(EditError::InvalidFill(format!(
+                "background colour {rgb:?} must be a six-digit hex value"
+            )));
+        }
+    } else if !color.theme_color.as_deref().is_some_and(known_scheme_color) {
+        return Err(EditError::InvalidFill(
+            "the background colour needs an RGB or theme value".to_owned(),
+        ));
+    }
+    for (name, value) in [
+        ("alpha", color.alpha),
+        ("luminance modulation", color.luminance_modulation),
+        ("luminance offset", color.luminance_offset),
+        ("saturation modulation", color.saturation_modulation),
+    ] {
+        if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+            return Err(EditError::InvalidFill(format!(
+                "background colour {name} is outside 0..=1"
+            )));
+        }
+    }
+    for (name, value) in [("tint", &color.theme_tint), ("shade", &color.theme_shade)] {
+        if let Some(value) = value
+            && (value.len() != 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(EditError::InvalidFill(format!(
+                "background colour {name} {value:?} must be two hex digits"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn known_scheme_color(color: &str) -> bool {
+    matches!(
+        color,
+        "background1"
+            | "text1"
+            | "background2"
+            | "text2"
+            | "bg1"
+            | "tx1"
+            | "bg2"
+            | "tx2"
+            | "accent1"
+            | "accent2"
+            | "accent3"
+            | "accent4"
+            | "accent5"
+            | "accent6"
+            | "hlink"
+            | "folHlink"
+            | "phClr"
+    )
 }
 
 pub(crate) fn snapshot_shape<T: ReadTxn>(
@@ -2342,6 +2510,7 @@ fn baseline_slide(
         layout_part_path: slide.layout_part_path.clone(),
         name: slide.name.clone(),
         notes: slide.notes.clone(),
+        background: slide.background.clone(),
         shapes,
     })
 }

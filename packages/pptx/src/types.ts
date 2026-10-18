@@ -177,6 +177,8 @@ export interface SlideSnapshot {
   name: string | null;
   /** Speaker notes as plain text; absent when the slide has none. */
   notes?: string;
+  /** The slide's own background; absent when it inherits the layout's. */
+  background?: ShapeFill;
   shapes: ShapeSnapshot[];
 }
 

@@ -37,12 +37,13 @@ mod target;
 mod undo;
 
 pub use batch::{
-    DocumentVersion, EditApplication, EditFailure, EditFailureCode, EditHistory, EditOutcome,
-    EditPreview, EditReceipt, EditRefusal, EditRequest, EditSource, EditStep, EditTarget,
-    EditValidation, FillGuard, MAX_REQUEST_BYTES, OutlineGuard, RectGuard, SlideTarget, TargetEdge,
-    TextGuard, ValidationOutcome, outcome_json, oversized_request,
+    BackgroundGuard, DocumentVersion, EditApplication, EditFailure, EditFailureCode, EditHistory,
+    EditOutcome, EditPreview, EditReceipt, EditRefusal, EditRequest, EditSource, EditStep,
+    EditTarget, EditValidation, FillGuard, MAX_REQUEST_BYTES, OutlineGuard, RectGuard, SlideTarget,
+    TargetEdge, TextGuard, ValidationOutcome, outcome_json, oversized_request,
 };
 pub use model::*;
+pub use ooxml_drawingml::{ColorValue, GradientFill, GradientStop, ShapeFill};
 #[doc(hidden)]
 pub use peer::{PeerError, PeerFont};
 pub use proposal_diff::*;
