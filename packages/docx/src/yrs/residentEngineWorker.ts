@@ -14,7 +14,7 @@ import { buildCommandFrame, exactFrameBuffer, packResidentFrame } from './reside
 import { createResidentCommandHost } from './residentCommandHost';
 import { createResidentDocxCommandHooks } from './residentCommandActions';
 import { releaseResidentSelectionReads } from './residentCommandSelection';
-import { readCommandStickyPosition } from './residentCommandAnchors';
+import { currentSelectionRange, readCommandStickyPosition } from './residentCommandAnchors';
 import { projectCommandEchoContext } from './residentCommandViewProjection';
 import { EchoGlyphSources, type EchoGlyphEngine } from './residentEchoGlyphSource';
 import { echoBackgroundPage, stageCommandPresentation } from './residentCommandPresentation';
@@ -1749,9 +1749,9 @@ async function handle(request: ResidentEngineWorkerRequest): Promise<void> {
     pendingUpdates = [];
     const before = session.proposalEngine.version();
     try {
-      const projection = commandHost ? session.commentProjection(true) : null;
+      const projection = commandHost ? session.commentProjection(request.commentsSource !== 'host') : null;
       editorSaves.commentIds = projection?.sessionIds;
-      const comments = projection?.comments ?? request.comments;
+      const comments = request.commentsSource === 'host' ? request.comments : projection?.comments ?? request.comments;
       const saved = openedParsed ? await session.saveDocument(request.host, comments, editorSaves) : await session.save(
         new Uint8Array(openedSource!.bytes),
         openedSource!.hostJson,
@@ -1927,6 +1927,9 @@ async function handle(request: ResidentEngineWorkerRequest): Promise<void> {
     switch (request.read.kind) {
       case 'commentInsertionRange':
         value = readCommentInsertionRange(session, request.read.paraId, request.read.search);
+        break;
+      case 'commentSelectionRange':
+        value = currentSelectionRange(session, request.read.selection);
         break;
       case 'collabStateVector':
         value = session.encodeStateVector();

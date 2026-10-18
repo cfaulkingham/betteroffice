@@ -128,6 +128,7 @@ export type ResidentDocumentRead =
   | { kind: 'rangeHighlights'; ranges: YrsStoryRange[]; expectVersion: string; expectFrameEpoch?: number; expectLayoutRevision?: number }
   | { kind: 'reviewSnapshot'; expectPreviewVersion?: number }
   | { kind: 'commentInsertionRange'; paraId: string; search?: string }
+  | { kind: 'commentSelectionRange'; selection: DocxCommandSelection }
   | { kind: 'toolbarMetadata' }
   | { kind: 'paragraphIdentities' }
   | { kind: 'resolveParagraphAnchors'; anchors: DocxParagraphAnchor[] }
@@ -180,6 +181,7 @@ export interface ResidentDocumentReadValues {
   rangeHighlights: ResidentRangeHighlights | null;
   reviewSnapshot: ResidentReviewSnapshot | null;
   commentInsertionRange: ResidentCommentInsertionRange;
+  commentSelectionRange: YrsStoryRange | null;
   toolbarMetadata: ResidentToolbarMetadata;
   paragraphIdentities: DocxParagraphIdentitySnapshot;
   resolveParagraphAnchors: { results: DocxParagraphAnchorResult[] };
@@ -281,6 +283,8 @@ export type ResidentEngineWorkerRequest =
       id: number;
       type: 'save';
       comments: Comment[];
+      /** `host` when `comments` is the host's list and wins over the worker's own comments. @internal */
+      commentsSource?: 'host';
       host?: Document;
       stateVector?: Uint8Array;
       /** The editor peer's marked stories. @internal */

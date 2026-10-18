@@ -3164,3 +3164,60 @@ test('an imported reply without range markers inherits its ancestor anchor and s
     expect(restored?.done ?? false).toBe(false);
   } finally { client.destroy(); }
 }, TIMEOUT);
+
+const note = (id: number, text: string) => ({ id, author: 'Host', date: '2026-02-01T00:00:00Z',
+  content: [{ type: 'paragraph' as const, formatting: {}, content: [{ type: 'run' as const, formatting: {}, content: [{ type: 'text' as const, text }] }] }] });
+
+test('a host comment list wins over the worker comment projection on save and keeps native anchors', async () => {
+  const { client, engine } = await openWorker({ bodyXml: SOURCE_COMMENT.body, commentsXml: SOURCE_COMMENT.comments });
+  try {
+    const [source] = engine.listComments();
+    const id = engine.commentProjection()!.ids[source!.id]!;
+    const part = async (request: Parameters<typeof client.save>[0], name: string) =>
+      new TextDecoder().decode(unzipContainer(new Uint8Array((await client.save(request)).bytes))[name] ?? new Uint8Array());
+    const hosted = { comments: [note(id, 'Host note'), note(id + 40, 'Host only')], commentsSource: 'host' as const };
+    const comments = await part(hosted, 'word/comments.xml');
+    expect(comments).toContain('Host note');
+    expect(comments).toContain('Host only');
+    expect(comments).not.toContain('Parent');
+    const anchored = comments.match(/<w:comment [^>]*w:id="(\d+)"(?:(?!<\/w:comment>)[\s\S])*Host note/)?.[1];
+    expect(await part(hosted, 'word/document.xml')).toContain(`<w:commentRangeStart w:id="${anchored}"`);
+    expect(await part({ comments: [], commentsSource: 'host' }, 'word/comments.xml')).not.toContain('Parent');
+    expect(await part({ comments: [note(id, 'Ignored')] }, 'word/comments.xml')).toContain('Parent');
+  } finally { client.destroy(); }
+}, TIMEOUT);
+
+test('a host comment list saves on the comment ids the worker handed out after a removal', async () => {
+  const { client, engine } = await openWorker({ bodyXml: SOURCE_COMMENT.body, commentsXml: SOURCE_COMMENT.comments });
+  try {
+    const paraId = engine.paragraphs('body')[1]!.paraId;
+    const range = { story: 'body', start: { paraId, offset: 0 }, end: { paraId, offset: 5 } };
+    const ids: number[] = [];
+    for (const [index, body] of ['First', 'Second'].entries()) {
+      const added = await client.edit(intent(index + 1, index, 'addComment', { ranges: [range], author: 'A', date: '2026-01-01', body,
+        expectVersion: engine.proposalEngine.version() }));
+      ids.push(added.editState!.comment!.id);
+    }
+    const first = (await client.documentRead({ kind: 'reviewTarget', target: { kind: 'comment', id: ids[0]! } })).value!;
+    expect((await client.edit(intent(3, 2, 'removeComment', { id: first.id, expectVersion: engine.proposalEngine.version() }))).outcomes[0]?.status).toBe('applied');
+    const parts = unzipContainer(new Uint8Array((await client.save({ comments: [note(0, 'Host parent'), note(ids[1]!, 'Host second')], commentsSource: 'host' })).bytes));
+    const part = (name: string) => new TextDecoder().decode(parts[name] ?? new Uint8Array());
+    const saved = part('word/comments.xml').match(/<w:comment [^>]*w:id="(\d+)"(?:(?!<\/w:comment>)[\s\S])*Host second/)?.[1];
+    expect(saved).toBeDefined();
+    expect(part('word/document.xml')).toContain(`<w:commentRangeStart w:id="${saved}"`);
+  } finally { client.destroy(); }
+}, TIMEOUT);
+
+test('a comment selection range follows its issued sticky positions across later edits', async () => {
+  const { client, engine, point } = await openWorker();
+  try {
+    const locs = [{ ...point, offset: 1 }, { ...point, offset: 3 }];
+    const [anchor, focus] = (await client.documentRead({ kind: 'stickyAnchors', locs, version: engine.proposalEngine.version() })).value;
+    const atStart = { ...point, offset: 0 };
+    expect((await client.edit(intent(1, 0, 'insertText', { text: '--', selection: { anchor: atStart, focus: atStart } }))).outcomes[0]?.status).toBe('applied');
+    const read = await client.documentRead({ kind: 'commentSelectionRange', selection: {
+      anchor: { ...locs[0]!, sticky: anchor!.encoded }, focus: { ...locs[1]!, sticky: focus!.encoded } } });
+    expect(read.value).toEqual({ story: point.story, start: { paraId: point.paraId, offset: 3 }, end: { paraId: point.paraId, offset: 5 } });
+    expect(read.version).toBe(engine.proposalEngine.version());
+  } finally { client.destroy(); }
+}, TIMEOUT);
