@@ -5589,6 +5589,7 @@ mod tests {
     #[test]
     fn only_a_picture_with_its_own_geometry_gets_a_mask() {
         let mut picture = Picture {
+            aspect_ratio_locked: false,
             base: ShapeBase {
                 id: 1,
                 name: "Photo".to_owned(),
@@ -9126,6 +9127,7 @@ mod tests {
             bytes: media,
         });
         let picture = pptx_parse::Picture {
+            aspect_ratio_locked: false,
             effects: Vec::new(),
             shape_effects: None,
             base: pptx_parse::ShapeBase {
@@ -9584,6 +9586,7 @@ mod tests {
         assert!(!slide_number(12).matches(&indexed));
 
         let snapshot = ShapeSnapshot {
+            aspect_ratio_locked: false,
             id: "placeholder".to_owned(),
             source_id: 1,
             kind: ShapeKind::Shape,

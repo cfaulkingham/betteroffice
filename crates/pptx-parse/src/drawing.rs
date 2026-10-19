@@ -285,6 +285,12 @@ fn parse_picture(
     let transform = properties.and_then(|value| value.child("xfrm"));
     Ok(Picture {
         base: parse_base(element.child("nvPicPr"), transform),
+        aspect_ratio_locked: element
+            .child("nvPicPr")
+            .and_then(|value| value.child("cNvPicPr"))
+            .and_then(|value| value.child("picLocks"))
+            .and_then(|value| value.attribute("noChangeAspect"))
+            .is_some_and(parse_bool),
         relationship_id,
         media_part_path,
         crop: parse_crop(blip_fill.and_then(|value| value.child("srcRect"))),
@@ -434,6 +440,7 @@ fn parse_graphic_frame(
                     .and_then(|spid| previews.get(spid))?;
                 Some(Picture {
                     base: base.clone(),
+                    aspect_ratio_locked: false,
                     relationship_id: None,
                     media_part_path: preview.media_part_path.clone(),
                     crop: PictureCrop::default(),
