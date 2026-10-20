@@ -554,6 +554,69 @@ test('d2b_format_range_requires_the_acked_worker_selection', async () => {
   expect(failed.admission.getSnapshot().tail).toBeUndefined();
 });
 
+test('Tab recovers from a cancelled deferred predecessor and restarts the selection prefix', async () => {
+  const { admission, submitted } = lane();
+  try {
+    admitIntent(admission, { kind: 'insertText', payload: { text: 'a' } });
+    const cancelled = submitFormattingIntent(admission, { kind: 'formatRange', payload: { delta: { bold: true } } });
+    const tab = admitIntent(admission, { kind: 'insertText', payload: { text: '\t' } }, { tabDirection: 'forward' });
+    admitIntent(admission, { kind: 'insertText', payload: { text: 'b' } });
+    if (cancelled.status !== 'submitted' || tab.status !== 'submitted') throw new Error('input was not submitted');
+    submitted[0]!.settle({ status: 'refused', seq: 1, reason: 'invalid-selection' });
+    expect(await cancelled.ticket.ack).toMatchObject({ status: 'cancelled' });
+    for (let turn = 0; turn < 12; turn++) await Promise.resolve();
+    expect(submitted.map(({ kind, payload }) => ({ kind, payload }))).toEqual([
+      { kind: 'insertText', payload: { text: 'a' } },
+      { kind: 'insertText', payload: { text: '\t' } },
+      { kind: 'insertText', payload: { text: 'b' } },
+    ]);
+    expect(submitted[1]!.options.after).toBeUndefined();
+    expect(submitted[2]!.options.after).toBe(submitted[1]!.ticket);
+    submitFormattingIntent(admission, { kind: 'formatRange', payload: { delta: { italic: true } } });
+    submitted[1]!.settle({ status: 'applied', seq: 2 });
+    submitted[2]!.settle({ status: 'applied', seq: 3 });
+    for (let turn = 0; turn < 12; turn++) await Promise.resolve();
+    expect(submitted.map(({ kind }) => kind)).toEqual(['insertText', 'insertText', 'insertText', 'formatRange']);
+    expect(submitted[3]!.options.after).toBe(submitted[2]!.ticket);
+  } finally { admission.dispose(); }
+});
+
+test('Shift+Tab recovering from a cancelled predecessor inserts nothing', async () => {
+  const { admission, submitted } = lane();
+  try {
+    admitIntent(admission, { kind: 'insertText', payload: { text: 'a' } });
+    const cancelled = submitFormattingIntent(admission, { kind: 'formatRange', payload: { delta: { bold: true } } });
+    const tab = admitIntent(admission, { kind: 'insertText', payload: { text: '\t' } }, { tabDirection: 'backward' });
+    if (cancelled.status !== 'submitted' || tab.status !== 'submitted') throw new Error('input was not submitted');
+    submitted[0]!.settle({ status: 'refused', seq: 1, reason: 'invalid-selection' });
+    expect(await tab.ticket.ack).toEqual({ status: 'noop' });
+    expect(submitted.map(({ kind, payload }) => ({ kind, payload }))).toEqual([
+      { kind: 'insertText', payload: { text: 'a' } },
+    ]);
+  } finally { admission.dispose(); }
+});
+
+test('Tab queued behind a click that lands in a table cell navigates cells instead of inserting a tab', async () => {
+  for (const [tabDirection, createLastRow] of [['forward', true], ['backward', false]] as const) {
+    const { admission, snapshot, submitted, waitForSubmitted } = lane();
+    try {
+      admitIntent(admission, { kind: 'insertText', payload: { text: 'a' } });
+      admitIntent(admission, { kind: 'insertText', payload: { text: '\t' } }, { tabDirection });
+      expect(submitted).toHaveLength(1);
+      snapshot.editState = { readOnly: false, toolbar: null, effectiveFormatting: null, storedMarks: null,
+        canUndo: false, canRedo: false, hyperlink: null, tableContext: {} as never };
+      submitted[0]!.settle({ status: 'applied', seq: 1 });
+      await waitForSubmitted(2);
+      expect(submitted.map(({ kind, payload }) => ({ kind, payload }))).toEqual([
+        { kind: 'insertText', payload: { text: 'a' } },
+        { kind: 'navigateCell', payload: { direction: tabDirection, extend: false, createLastRow } },
+      ]);
+      expect(submitted[1]!.options.after).toBe(submitted[0]!.ticket);
+      expect(submitted[1]!.options.fence).toBe(true);
+    } finally { admission.dispose(); }
+  }
+});
+
 test('mode_barriers_restart_dependencies_after_refused_input', async () => {
   const { admission, submitted } = lane();
   admitIntent(admission, { kind: 'insertText', payload: { text: 'refused' } });
