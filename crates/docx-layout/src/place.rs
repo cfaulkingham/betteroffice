@@ -1842,6 +1842,18 @@ fn layout_reserved(block: &ReservedBlock, measure: &ImageExtent, paginator: &mut
 /// Places anchored shapes at page coordinates.
 fn layout_shape(block: &ShapeBlock, measure: &ShapeExtent, paginator: &mut Paginator) {
     if block.position.is_some() {
+        if block.scene.is_some()
+            && shape_has_text(block)
+            && let Some(position) = &block.position
+            && !position.use_simple_pos.unwrap_or(false)
+            && let Some(vertical) = &position.vertical
+            && matches!(vertical.relative_to.as_deref(), Some("paragraph" | "line"))
+        {
+            let required = vertical.pos_offset.unwrap_or(0.0).max(0.0) + measure.height;
+            if required <= paginator.get_column_capacity() {
+                paginator.ensure_fits(required);
+            }
+        }
         let (x, y) = resolve_object_position(
             block.position.as_ref(),
             measure.width,
@@ -1887,6 +1899,14 @@ fn layout_shape(block: &ShapeBlock, measure: &ShapeExtent, paginator: &mut Pagin
         z_index: None,
     });
     paginator.add_fragment(fragment, measure.height, 0.0, 0.0);
+}
+
+fn shape_has_text(shape: &ShapeBlock) -> bool {
+    shape
+        .inner_text
+        .as_ref()
+        .is_some_and(|paragraphs| !paragraphs.is_empty())
+        || shape.children.iter().any(shape_has_text)
 }
 
 /// Charts use the same bbox placement rule as an in-flow image.

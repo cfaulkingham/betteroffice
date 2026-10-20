@@ -196,6 +196,32 @@ pub struct DrawingContext<'a> {
     pub smart_art: &'a mut SmartArtContext,
 }
 
+struct ComposedDrawingContext<'a> {
+    media: &'a MediaMap,
+    charts: &'a ChartPartsMap,
+    smart_art: &'a mut SmartArtContext,
+    group_text_boxes: Option<&'a mut GroupTextBoxParser<'a>>,
+}
+
+type GroupTextBoxParser<'a> = dyn FnMut(
+        &mut Shape,
+        &XmlElement,
+        &mut ParseBudget<'_>,
+        &mut SmartArtContext,
+    ) -> Result<(), ParseError>
+    + 'a;
+
+impl<'a> ComposedDrawingContext<'a> {
+    fn new(context: &'a mut DrawingContext<'_>) -> Self {
+        Self {
+            media: context.media,
+            charts: context.charts,
+            smart_art: &mut *context.smart_art,
+            group_text_boxes: None,
+        }
+    }
+}
+
 impl HexIdAllocator {
     pub fn from_sha256(seed: &str) -> Result<Self, ParseError> {
         if seed.len() != 64 || !seed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -308,6 +334,47 @@ pub fn parse_paragraph(
             .child("w", "sectPr")
             .map(|section| parse_section_properties(Some(section)));
     }
+    let resources = drawing
+        .as_ref()
+        .map(|context| (context.media, context.charts));
+    let mut enrich = |shape: &mut Shape,
+                      source: &XmlElement,
+                      budget: &mut ParseBudget<'_>,
+                      smart_art: &mut SmartArtContext|
+     -> Result<(), ParseError> {
+        let Some((media, charts)) = resources else {
+            return Ok(());
+        };
+        let warnings =
+            crate::shape::enrich_group_text_boxes(shape, source, budget, |container, budget| {
+                let mut parser = crate::block::StoryParser {
+                    relationships,
+                    theme,
+                    styles,
+                    doc_defaults,
+                    numbering,
+                    media,
+                    charts,
+                    smart_art: &mut *smart_art,
+                    budget,
+                    ids: &mut *ids,
+                    part,
+                };
+                parser.parse_text_box_content(container, depth)
+            })?;
+        for warning in warnings {
+            if !smart_art.warnings.iter().any(|known| known == warning) {
+                smart_art.warnings.push(warning.to_owned());
+            }
+        }
+        Ok(())
+    };
+    let mut drawing = drawing.map(|context| ComposedDrawingContext {
+        media: context.media,
+        charts: context.charts,
+        smart_art: &mut *context.smart_art,
+        group_text_boxes: Some(&mut enrich),
+    });
     paragraph.content = parse_paragraph_contents(
         element,
         relationships,
@@ -316,7 +383,7 @@ pub fn parse_paragraph(
         doc_defaults,
         part,
         budget,
-        drawing,
+        drawing.as_mut(),
         depth,
         false,
         false,
@@ -464,7 +531,7 @@ fn parse_paragraph_contents(
     doc_defaults: Option<&DocDefaults>,
     part: &str,
     budget: &mut ParseBudget<'_>,
-    mut drawing: Option<&mut DrawingContext<'_>>,
+    mut drawing: Option<&mut ComposedDrawingContext<'_>>,
     depth: usize,
     deletion: bool,
     in_control: bool,
@@ -492,7 +559,7 @@ fn parse_paragraph_contents(
         check_container_beyond_field_nesting(beyond_nesting, child, part)?;
         match child.local_name() {
             "r" => {
-                let run = parse_run_composed(
+                let run = parse_run_with_context(
                     child,
                     relationships,
                     theme,
@@ -771,7 +838,7 @@ fn parse_simple_field_composed(
     doc_defaults: Option<&DocDefaults>,
     part: &str,
     budget: &mut ParseBudget<'_>,
-    drawing: Option<&mut DrawingContext<'_>>,
+    drawing: Option<&mut ComposedDrawingContext<'_>>,
     depth: usize,
     in_header_footer: bool,
 ) -> Result<SimpleField, ParseError> {
@@ -838,7 +905,7 @@ fn parse_hyperlink_composed(
     doc_defaults: Option<&DocDefaults>,
     part: &str,
     budget: &mut ParseBudget<'_>,
-    mut drawing: Option<&mut DrawingContext<'_>>,
+    mut drawing: Option<&mut ComposedDrawingContext<'_>>,
     depth: usize,
     in_header_footer: bool,
 ) -> Result<Hyperlink, ParseError> {
@@ -856,7 +923,7 @@ fn parse_hyperlink_composed(
     let mut structured = Vec::new();
     for child in element.child_elements().take(10_000) {
         let node = match child.local_name() {
-            "r" => Some(InlineNode::Run(parse_run_composed(
+            "r" => Some(InlineNode::Run(parse_run_with_context(
                 child,
                 relationships,
                 theme,
@@ -929,7 +996,7 @@ fn parse_inline_sdt_composed(
     doc_defaults: Option<&DocDefaults>,
     part: &str,
     budget: &mut ParseBudget<'_>,
-    drawing: Option<&mut DrawingContext<'_>>,
+    drawing: Option<&mut ComposedDrawingContext<'_>>,
     depth: usize,
     property_theme: bool,
     in_header_footer: bool,
@@ -1062,7 +1129,31 @@ pub(crate) fn parse_run_composed(
     styles: Option<&StyleMap>,
     doc_defaults: Option<&DocDefaults>,
     budget: &mut ParseBudget<'_>,
-    mut drawing: Option<&mut DrawingContext<'_>>,
+    drawing: Option<&mut DrawingContext<'_>>,
+    in_header_footer: bool,
+) -> Result<Run, ParseError> {
+    let mut drawing = drawing.map(ComposedDrawingContext::new);
+    parse_run_with_context(
+        element,
+        relationships,
+        theme,
+        styles,
+        doc_defaults,
+        budget,
+        drawing.as_mut(),
+        in_header_footer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_run_with_context(
+    element: &XmlElement,
+    relationships: Option<&RelationshipMap>,
+    theme: Option<&Theme>,
+    styles: Option<&StyleMap>,
+    doc_defaults: Option<&DocDefaults>,
+    budget: &mut ParseBudget<'_>,
+    mut drawing: Option<&mut ComposedDrawingContext<'_>>,
     in_header_footer: bool,
 ) -> Result<Run, ParseError> {
     let mut run = parse_run(element, theme, styles, doc_defaults).run;
@@ -1123,7 +1214,7 @@ fn parse_drawing_owned(
     element: &XmlElement,
     relationships: Option<&RelationshipMap>,
     budget: &mut ParseBudget<'_>,
-    drawing: Option<&mut DrawingContext<'_>>,
+    mut drawing: Option<&mut ComposedDrawingContext<'_>>,
     in_header_footer: bool,
 ) -> Result<Vec<RunContent>, ParseError> {
     if matches!(element.local_name(), "pict" | "object") {
@@ -1207,6 +1298,12 @@ fn parse_drawing_owned(
     }
     if is_shape_drawing(element) {
         if let Some(mut shape) = parse_shape_from_drawing(element) {
+            if shape.scene.is_some()
+                && let Some(context) = drawing.as_deref_mut()
+                && let Some(enrich) = context.group_text_boxes.as_deref_mut()
+            {
+                enrich(&mut shape, element, budget, context.smart_art)?;
+            }
             let media = drawing.as_ref().map(|context| context.media);
             resolve_shape_fill_pictures(&mut shape, relationships, media);
             apply_shape_metadata(&mut shape, element);
@@ -1229,21 +1326,42 @@ fn parse_alternate_content(
     element: &XmlElement,
     relationships: Option<&RelationshipMap>,
     budget: &mut ParseBudget<'_>,
-    drawing: Option<&mut DrawingContext<'_>>,
+    drawing: Option<&mut ComposedDrawingContext<'_>>,
     in_header_footer: bool,
 ) -> Result<Vec<RunContent>, ParseError> {
-    Ok(
-        parse_alternate_content_branch(element, relationships, budget, drawing, in_header_footer)?
-            .map(|(_, parsed)| parsed)
-            .unwrap_or_default(),
-    )
+    Ok(parse_alternate_content_branch_with_context(
+        element,
+        relationships,
+        budget,
+        drawing,
+        in_header_footer,
+    )?
+    .map(|(_, parsed)| parsed)
+    .unwrap_or_default())
 }
 
 pub fn parse_alternate_content_branch<'a>(
     element: &'a XmlElement,
     relationships: Option<&RelationshipMap>,
     budget: &mut ParseBudget<'_>,
-    mut drawing: Option<&mut DrawingContext<'_>>,
+    drawing: Option<&mut DrawingContext<'_>>,
+    in_header_footer: bool,
+) -> Result<Option<(&'a XmlElement, Vec<RunContent>)>, ParseError> {
+    let mut drawing = drawing.map(ComposedDrawingContext::new);
+    parse_alternate_content_branch_with_context(
+        element,
+        relationships,
+        budget,
+        drawing.as_mut(),
+        in_header_footer,
+    )
+}
+
+fn parse_alternate_content_branch_with_context<'a>(
+    element: &'a XmlElement,
+    relationships: Option<&RelationshipMap>,
+    budget: &mut ParseBudget<'_>,
+    mut drawing: Option<&mut ComposedDrawingContext<'_>>,
     in_header_footer: bool,
 ) -> Result<Option<(&'a XmlElement, Vec<RunContent>)>, ParseError> {
     let has_media = drawing.is_some();
@@ -1763,6 +1881,20 @@ fn nonempty_attribute(element: &XmlElement, name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::xml::{ParseLimits, parse_xml};
+
+    #[test]
+    fn drawing_context_preserves_three_field_struct_literals() {
+        let media = MediaMap::new();
+        let charts = ChartPartsMap::new();
+        let mut smart_art = SmartArtContext::default();
+        let context = DrawingContext {
+            media: &media,
+            charts: &charts,
+            smart_art: &mut smart_art,
+        };
+        assert!(context.media.is_empty());
+        assert!(context.charts.is_empty());
+    }
 
     const ALTERNATE_PICTURE: &str = r#"<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdFallback"/></pic:blipFill><pic:spPr><a:prstGeom prst="rect"/></pic:spPr></pic:pic></a:graphicData>"#;
     const CHARTEX_CHOICE: &str = r#"<a:graphicData uri="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chart r:id="rIdChartEx"/></a:graphicData>"#;
