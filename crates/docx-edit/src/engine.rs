@@ -11272,6 +11272,9 @@ mod trigger_routing_tests;
 mod font_dependency_tests;
 
 #[cfg(test)]
+mod trailing_page_break_tests;
+
+#[cfg(test)]
 mod tests {
     use super::trigger_routing_tests::{OpenSwitch, PreviewSwitch};
     use super::*;
