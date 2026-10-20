@@ -1487,12 +1487,23 @@ fn backfill_table(
         && let Some(shape) = shapes
             .get(txn, &seeded_shape_id(slide_id, path))
             .and_then(|value| value.cast::<MapRef>().ok())
-        && matches!(
-            optional_json::<pptx_parse::GraphicFrameData, _>(&shape, txn, "graphicJson")?,
-            Some(pptx_parse::GraphicFrameData::Table(stored)) if stored.grid.is_empty()
-        )
+        && let Some(pptx_parse::GraphicFrameData::Table(mut stored)) =
+            optional_json(&shape, txn, "graphicJson")?
     {
-        insert_json(&shape, txn, "graphicJson", Some(&frame.data))?;
+        let changed = if stored.grid.is_empty() {
+            stored = table.clone();
+            true
+        } else {
+            merge_source_cell_pictures(&mut stored, table)
+        };
+        if changed {
+            insert_json(
+                &shape,
+                txn,
+                "graphicJson",
+                Some(&pptx_parse::GraphicFrameData::Table(stored)),
+            )?;
+        }
     }
     if let ShapeNode::Group(group) = node {
         for (index, child) in group.children.iter().enumerate() {
@@ -1511,6 +1522,7 @@ fn backfill_table(
 /// Restores the grid, spans and cell formatting a stored package dropped.
 fn merge_source_table(target: &mut pptx_parse::Table, source: &pptx_parse::Table) -> bool {
     let mut changed = target.grid != source.grid || target.properties != source.properties;
+    changed |= merge_source_cell_pictures(target, source);
     target.grid.clone_from(&source.grid);
     target.properties.clone_from(&source.properties);
     for (target, source) in target.rows.iter_mut().zip(&source.rows) {
@@ -1528,6 +1540,17 @@ fn merge_source_table(target: &mut pptx_parse::Table, source: &pptx_parse::Table
             target.fill.clone_from(&source.fill);
             target.borders.clone_from(&source.borders);
             changed |= merge_source_text_body(&mut target.text, &source.text);
+        }
+    }
+    changed
+}
+
+fn merge_source_cell_pictures(target: &mut pptx_parse::Table, source: &pptx_parse::Table) -> bool {
+    let mut changed = false;
+    for (target, source) in target.rows.iter_mut().zip(&source.rows) {
+        for (target, source) in target.cells.iter_mut().zip(&source.cells) {
+            changed |= target.picture_fill != source.picture_fill;
+            target.picture_fill.clone_from(&source.picture_fill);
         }
     }
     changed
