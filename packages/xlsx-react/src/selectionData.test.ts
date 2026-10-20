@@ -1,8 +1,8 @@
 import { describe, expect, it, mock } from 'bun:test';
 import { normalizeRange, selectionAt } from '@betteroffice/xlsx';
-import type { Selection, SelectionData } from '@betteroffice/xlsx';
+import type { KeyInput, Selection, SelectionData } from '@betteroffice/xlsx';
 import { deriveLimits } from './viewer/sessionGeometry';
-import { createSelectionDataNavigation, sameSelection, selectionHidden } from './selectionData';
+import { MAX_CLEAR_CELLS, clearedCells, createSelectionDataNavigation, sameSelection, selectionDataRequest, selectionHidden } from './selectionData';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -14,7 +14,7 @@ function deferred<T>() {
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 const right = { key: 'ArrowRight', ctrlKey: true };
 
-function navigation() {
+function navigation(anchorActive = false) {
   let current = { owner: {}, sheet: 0, navigation: 0, version: 'v1', selection: selectionAt({ row: 1, col: 1 }) };
   let open = true;
   const query = mock(async (_context: typeof current, _direction: string | undefined): Promise<SelectionData> => ({
@@ -30,7 +30,8 @@ function navigation() {
     update(next: Partial<typeof current>) { current = { ...current, ...next }; },
     setOpen(value: boolean) { open = value; },
     query, apply,
-    press: (key = right) => queue.enqueue(key, {
+    press: (key: KeyInput = right) => queue.enqueue(key, {
+      activeCell: anchorActive ? (selection) => selection.anchor : undefined,
       context: () => open ? current : null, limits: () => ({ rows: 100, cols: 20, rowsPerPage: 10 }), query, apply,
     }),
     defer: (task: () => void, behindActions?: boolean, cancel?: () => void) =>
@@ -38,7 +39,117 @@ function navigation() {
   };
 }
 
+describe('Ctrl+A sheet selection clears', () => {
+  const sheet = { top: 0, left: 0, bottom: 1_048_575, right: 16_383 };
+
+  it('refuses a sparse used range spanning A1:XFD1048576 before expanding it', () => {
+    expect(clearedCells(sheet, () => sheet)).toBeNull();
+  });
+
+  it('applies the host cell limit to the intersection with the used range', () => {
+    const column = { ...sheet, right: 0 };
+    expect(clearedCells(column, () => ({ ...sheet, bottom: MAX_CLEAR_CELLS - 1 })))
+      .toHaveLength(MAX_CLEAR_CELLS);
+    expect(clearedCells(column, () => ({ ...sheet, bottom: MAX_CLEAR_CELLS }))).toBeNull();
+    expect(clearedCells({ ...column, top: 1 }, () => ({ ...sheet, bottom: 0 }))).toEqual([]);
+  });
+
+  it('preserves clears larger than the limit when the selection does not reach a sheet edge', () => {
+    const used = mock(() => sheet);
+    expect(clearedCells({ top: 0, left: 0, bottom: MAX_CLEAR_CELLS, right: 0 }, used))
+      .toHaveLength(MAX_CLEAR_CELLS + 1);
+    expect(used).not.toHaveBeenCalled();
+  });
+});
+
 describe('selection data navigation', () => {
+  it('requests the used range for Ctrl/Meta End and leaves plain End synchronous', () => {
+    expect(selectionDataRequest({ key: 'End' })).toBeNull();
+    for (const modifier of [{ ctrlKey: true }, { metaKey: true }]) {
+      expect(selectionDataRequest({ key: 'End', ...modifier })).toBe('usedRange');
+      expect(selectionDataRequest({ key: 'End', shiftKey: true, ...modifier })).toBe('usedRange');
+    }
+  });
+
+  it('chains a used-range jump and a data-edge jump through one asynchronous batch', async () => {
+    const nav = navigation();
+    const first = deferred<SelectionData>();
+    nav.query.mockReturnValueOnce(first.promise).mockResolvedValueOnce({ edge: { row: 79, col: 0 } });
+    nav.press({ key: 'End', ctrlKey: true });
+    nav.press({ key: 'ArrowLeft', ctrlKey: true });
+    expect(nav.query.mock.calls[0]![1]).toBe('usedRange');
+    first.resolve({ usedRange: { top: 0, left: 0, bottom: 79, right: 15 }, region: null });
+    await tick();
+    expect(nav.apply.mock.calls[0]![0]).toEqual(selectionAt({ row: 79, col: 15 }));
+    expect(nav.query.mock.calls[1]![0].selection.focus).toEqual({ row: 79, col: 15 });
+    expect(nav.query.mock.calls[1]![1]).toBe('left');
+    expect(nav.current.selection).toEqual(selectionAt({ row: 79, col: 0 }));
+  });
+
+  it('refreshes a pending used-range answer after edits and preserves Shift extension', async () => {
+    const nav = navigation(true);
+    const first = deferred<SelectionData>();
+    nav.query.mockReturnValueOnce(first.promise).mockResolvedValueOnce({
+      usedRange: { top: 0, left: 0, bottom: 99, right: 19 },
+    });
+    nav.press({ key: 'End', metaKey: true, shiftKey: true });
+    nav.update({ version: 'v2' });
+    first.resolve({ usedRange: { top: 0, left: 0, bottom: 79, right: 15 } });
+    await tick();
+    expect(nav.query).toHaveBeenCalledTimes(2);
+    expect(nav.apply).toHaveBeenCalledTimes(1);
+    expect(nav.current.selection).toEqual({ anchor: { row: 1, col: 1 }, focus: { row: 99, col: 19 } });
+  });
+
+  it('leaves selection unchanged after a failed or unavailable used-range query', async () => {
+    for (const answer of [Promise.reject(new Error('Query failed')), Promise.resolve({ region: null })]) {
+      const nav = navigation();
+      nav.query.mockReturnValueOnce(answer);
+      nav.press({ key: 'End', ctrlKey: true });
+      await tick();
+      expect(nav.apply).not.toHaveBeenCalled();
+      expect(nav.current.selection).toEqual(selectionAt({ row: 1, col: 1 }));
+    }
+  });
+
+  it('returns to A1 only after a successful empty used-range query', async () => {
+    const nav = navigation();
+    nav.query.mockResolvedValueOnce({ usedRange: null });
+    nav.press({ key: 'End', ctrlKey: true });
+    await tick();
+    expect(nav.current.selection).toEqual(selectionAt({ row: 0, col: 0 }));
+  });
+
+  it('extends from the focus then jumps from the active anchor in one queued batch', async () => {
+    const nav = navigation(true);
+    nav.update({ selection: { anchor: { row: 1, col: 1 }, focus: { row: 4, col: 3 } } });
+    nav.query.mockImplementation(async (context) => ({
+      edge: { row: context.selection.focus.row, col: context.selection.focus.col + 2 },
+    }));
+    nav.press({ ...right, shiftKey: true });
+    nav.press(right);
+    await tick();
+    expect(nav.query.mock.calls[0]![0].selection.focus).toEqual({ row: 4, col: 3 });
+    expect(nav.apply.mock.calls[0]![0]).toEqual({ anchor: { row: 1, col: 1 }, focus: { row: 4, col: 5 } });
+    expect(nav.query.mock.calls[1]![0].selection.focus).toEqual({ row: 1, col: 1 });
+    expect(nav.current.selection).toEqual(selectionAt({ row: 1, col: 3 }));
+  });
+
+  it('preserves the active anchor and range comparison across select-all presses', async () => {
+    const nav = navigation(true);
+    const anchor = { row: 2, col: 2 };
+    nav.update({ selection: { anchor, focus: { row: 4, col: 4 } } });
+    const region = { top: 0, left: 0, bottom: 4, right: 4 };
+    nav.query.mockResolvedValue({ region });
+    nav.press({ key: 'a', ctrlKey: true });
+    nav.press({ key: 'a', ctrlKey: true });
+    await tick();
+    expect(nav.query.mock.calls[0]![0].selection.focus).toEqual(anchor);
+    expect(normalizeRange(nav.apply.mock.calls[0]![0])).toEqual(region);
+    expect(normalizeRange(nav.current.selection)).toEqual({ top: 0, left: 0, bottom: 99, right: 19 });
+    expect(nav.current.selection.anchor).toEqual(anchor);
+  });
+
   it('chains rapid repeated jumps from each accepted target', async () => {
     const nav = navigation();
     const first = deferred<SelectionData>();
@@ -256,6 +367,6 @@ it('keeps sheet indices reachable when hidden spans collapse the pixel extent', 
   const limits = deriveLimits({ width: 96, height: 48, commands: [], grid: {
     startRow: 0, startCol: 0, rowOffsets: [0, 24, 48], colOffsets: [0, 96],
     hiddenRowSpans: [[1, 899_999], [900_001, 1_048_575]], hiddenColSpans: [[1, 16_383]],
-  } }, { contentHeight: 48, contentWidth: 96 }, 48);
+  } }, 48);
   expect(limits).toEqual({ rows: 1_048_576, cols: 16_384, rowsPerPage: 2 });
 });

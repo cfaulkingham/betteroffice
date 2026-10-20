@@ -1,4 +1,4 @@
-import { createSelectionDataNavigation, selectionDataRequest, selectionHidden } from '../selectionData';
+import { clearedCells, copiedRange, createSelectionDataNavigation, reachesSheetEdge, selectionDataRequest, selectionHidden } from '../selectionData';
 import {
   buildA11yGrid, cellAtPoint, cellRect, chartRegionAtPoint, createWorkbookRecoveryMutators,
   extendTo, fromTsv, hyperlinkAtCell, isProposalsAvailable, localNowSerial, moveFocus, normalizeRange,
@@ -7,7 +7,7 @@ import {
   workbookEditPeerOperations, workbookSessionInternals,
 } from '@betteroffice/xlsx';
 import type {
-  CapturedFormat, CellAddr, CellEdit, CellInputEdit, Direction, EditResult, Proposal, Selection,
+  CapturedFormat, CellAddr, CellEdit, CellInputEdit, CellRange, Direction, EditResult, Proposal, Rect, Selection,
   WorkbookFrame, WorkbookHandle, WorkbookReplayOp, WorkbookSheetView, XlsxEditResult,
 } from '@betteroffice/xlsx';
 import { Component, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
@@ -39,7 +39,7 @@ import { frozenGridExtent } from '../plugins/geometry';
 import { PluginDock, useDockArea, type DockPlacement } from '../plugins/PluginPanels';
 import { useXlsxPluginHost } from '../plugins/useXlsxPluginHost';
 import { ProposalsPanel } from '../proposals/ProposalsPanel';
-import { deriveLimits, expandRangeToMergedCells, positionAtPoint, scaledRect } from '../viewer/sessionGeometry';
+import { cellInViewport, deriveLimits, expandRangeToMergedCells, extendScrollExtent, laidOutCellRect, nearestCellScroll, positionAtPoint, scaledRect } from '../viewer/sessionGeometry';
 import type { WorkerEditorApiBridge } from './createWorkerEditorApi';
 
 import { asError, useLegacySessionWorkbook, EditableWorkbookSession, type EditableSessionWorkbookProps } from './useEditableSessionWorkbook';
@@ -69,9 +69,12 @@ function address(cell: CellAddr): string {
   return `${column}${cell.row + 1}`;
 }
 
-function selectedRange(selection: Selection): string {
-  const range = normalizeRange(selection);
+function rangeA1(range: CellRange): string {
   return `${address({ row: range.top, col: range.left })}:${address({ row: range.bottom, col: range.right })}`;
+}
+
+function selectedRange(selection: Selection): string {
+  return rangeA1(normalizeRange(selection));
 }
 
 function fromPlugin(event: SyntheticEvent): boolean {
@@ -864,7 +867,7 @@ function LegacyXlsxWorkerEditor(props: EditableSessionWorkbookProps) {
   }, [run, run?.peer, selection, active, selectedChart, painted]);
 
   const hidden = () => selectionHidden(sourceRef.current?.painted?.displayList.grid);
-  const limits = () => deriveLimits(sourceRef.current?.painted?.displayList ?? null, viewRef.current!,
+  const limits = () => deriveLimits(sourceRef.current?.painted?.displayList ?? null,
     (scrollRef.current?.clientHeight ?? 0) / zoomRef.current);
   const draftFor = (source: InputDraft['source'], cell: CellAddr, value: string): WorkerCellDraft => ({
     generation: runRef.current!.generation, sheet: activeRef.current, ...cell, source, value,
@@ -952,7 +955,7 @@ function LegacyXlsxWorkerEditor(props: EditableSessionWorkbookProps) {
         const operations = workbookEditPeerOperations(owner.recovering ? operationPeer.current! : owner.editPeer);
         let result: EditResult;
         try {
-          result = op ? (owner.recovering ? operations.applyRecoveryOp(op) : operations.applyQueuedOp(op)) as EditResult :
+          result = op ? (run!.recovering ? operations.applyRecoveryOp(op) : operations.applyQueuedOp(op)) as EditResult :
             owner.editPeer.editCell(draft.sheet, draft.row, draft.col, draft.value);
         } catch (error) {
           if (inputRefusal(error)) draftDiscards.get(draft)?.();
@@ -1022,6 +1025,7 @@ function LegacyXlsxWorkerEditor(props: EditableSessionWorkbookProps) {
     if (!owner?.current || owner.failure || !selected || kind !== 'copy' && !acceptInput()) return;
     const sheet = activeRef.current;
     const range = normalizeRange(selected);
+    const usedRange = () => run!.peer?.selectionData(sheet, 0, 0, 'usedRange').usedRange;
     let clipboardWrite: { resolve(payload: Blob): void; reject(error: unknown): void; done: Promise<boolean> } | undefined;
     if (kind !== 'paste') {
       if (typeof ClipboardItem !== 'function' || typeof navigator.clipboard.write !== 'function') {
@@ -1049,26 +1053,27 @@ function LegacyXlsxWorkerEditor(props: EditableSessionWorkbookProps) {
       if (kind === 'cut' && discardPreview) void discardPreview().catch(reportInputError);
       reportInputError(error);
     });
-    const prepareMutation = async (text: string) => {
+    const prepareMutation = async (text: string, queued = false) => {
+      if (kind === 'cut' && reachesSheetEdge(range) && !queued) return;
       if (kind !== 'copy' && !mutation) {
-        const edits: CellInputEdit[] = [];
+        const data = kind === 'cut' && reachesSheetEdge(range) ?
+          await (run!.peer ?? run!.session.call).selectionData?.(sheet, 0, 0, 'usedRange') : undefined;
+        const edits = kind === 'paste' ? [] : clearedCells(range, () => data?.usedRange);
+        if (!edits) throw new WorkerInputRefusal('Clear exceeds the cell limit');
+        if (kind === 'cut' && edits.length === 0) return;
         if (kind === 'paste') {
           fromTsv(text).forEach((row, dr) => row.forEach((input, dc) =>
             edits.push({ row: range.top + dr, col: range.left + dc, input })));
-        } else {
-          for (let row = range.top; row <= range.bottom; row++) {
-            for (let col = range.left; col <= range.right; col++) edits.push({ row, col, input: '' });
-          }
         }
         mutation = { method: 'editCells', args: [sheet, edits] };
       }
-      if (mutation) discardPreview = await previewEdits(sheet, mutation.args[1], mutation);
+      if (mutation && !queued) discardPreview = await previewEdits(sheet, mutation.args[1], mutation);
       if (clipboardRefusal) { await discardPreview?.(); throw clipboardRefusal; }
     };
     void coordinator.clipboard(captureClipboard, async (text, _, markApplied) => {
-      if (kind !== 'copy' && !mutation) await prepareMutation(text);
+      if (kind !== 'copy' && !mutation) await prepareMutation(text, true);
       if (kind !== 'paste') {
-        const copied = toTsv(owner.peer!.rangeCells(sheet, selectedRange(selected)));
+        const copied = toTsv(owner.peer!.rangeCells(sheet, rangeA1(copiedRange(range, usedRange))));
         let written: boolean;
         if (clipboardWrite) {
           clipboardWrite.resolve(new Blob([copied], { type: 'text/plain' }));
@@ -1082,12 +1087,13 @@ function LegacyXlsxWorkerEditor(props: EditableSessionWorkbookProps) {
         if (!written) throw new WorkerInputRefusal('Clipboard write was refused', kind === 'cut');
         if (kind === 'copy') return;
       }
-      const op = mutation!;
+      if (!mutation) return;
+      const op = mutation;
       const edits = op.args[1];
       if (edits.length === 0) return;
       markApplied.check();
-      const operations = workbookEditPeerOperations(owner.recovering ? operationPeer.current! : owner.editPeer!);
-      const result = (owner.recovering ? operations.applyRecoveryOp(op) : operations.applyQueuedOp(op)) as EditResult;
+      const operations = workbookEditPeerOperations(run!.recovering ? operationPeer.current! : run!.editPeer!);
+      const result = (run!.recovering ? operations.applyRecoveryOp(op) : operations.applyQueuedOp(op)) as EditResult;
       markApplied();
       apply(result, op);
       if (kind === 'paste' && selectionRef.current === selected && activeRef.current === sheet) {
@@ -1106,19 +1112,26 @@ function LegacyXlsxWorkerEditor(props: EditableSessionWorkbookProps) {
     if (!acceptInput() || !selectionRef.current) return;
     const sheet = activeRef.current;
     const range = normalizeRange(selectionRef.current);
-    const edits: CellInputEdit[] = [];
-    for (let row = range.top; row <= range.bottom; row++) {
-      for (let col = range.left; col <= range.right; col++) edits.push({ row, col, input: '' });
-    }
-    const op: WorkbookReplayOp = { method: 'editCells', args: [sheet, edits] };
+    let op: WorkbookReplayOp | undefined;
     let discardPreview: (() => Promise<void>) | undefined;
+    const prepareClear = async () => {
+      const data = reachesSheetEdge(range) ?
+        await (run!.peer ?? run!.session.call).selectionData?.(sheet, 0, 0, 'usedRange') : undefined;
+      const edits = clearedCells(range, () => data?.usedRange);
+      if (!edits) throw new WorkerInputRefusal('Clear exceeds the cell limit');
+      if (edits.length === 0) return;
+      op = { method: 'editCells', args: [sheet, edits] };
+      if (!reachesSheetEdge(range)) discardPreview = await previewEdits(sheet, edits, op);
+    };
     void coordinator.runAfterPendingInput(async (_, markApplied) => {
+      if (!op) await prepareClear();
+      if (!op) return;
       markApplied.check();
       const operations = workbookEditPeerOperations(run!.recovering ? operationPeer.current! : run!.editPeer!);
       const result = (run!.recovering ? operations.applyRecoveryOp(op) : operations.applyQueuedOp(op)) as EditResult;
       markApplied(); apply(result, op);
     }, { kind: 'input', target: { sheet, target: JSON.stringify(range) },
-      prepare: async () => { discardPreview = await previewEdits(sheet, edits, op); } }).catch(async (error) => {
+      prepare: async () => { if (!reachesSheetEdge(range)) await prepareClear(); } }).catch(async (error) => {
       if (inputRefusal(error)) await discardPreview?.();
       reportInputError(error);
     });
@@ -1304,24 +1317,17 @@ function LegacyXlsxWorkerEditor(props: EditableSessionWorkbookProps) {
           context.selection.focus.row, context.selection.focus.col, direction),
         apply: (next) => {
           setSelection(next);
-          if (owner.peer) reveal(owner.peer, sheet, next.focus.row, next.focus.col,
-            'nearest', () => owner.current && runRef.current === owner);
-          else void owner.session.call.cellGeometry(sheet, next.focus.row, next.focus.col)
-            .then((geometry) => {
-              const scroll = scrollRef.current;
-              if (!owner.current || runRef.current !== owner || activeRef.current !== sheet ||
-                selectionRef.current !== next || !scroll) return;
-              scroll.scrollLeft = geometry.scrollPosition.x * zoomRef.current;
-              scroll.scrollTop = geometry.scrollPosition.y * zoomRef.current;
-              sourceRef.current?.schedule();
-            }).catch(reportInputError);
+          revealSelection(sheet, next);
           return true;
         },
       });
       return;
     }
     const action = selectionKeyReducer(selectionRef.current, event, limits(), undefined, hidden());
-    if (action.type === 'move') setSelection(action.selection);
+    if (action.type === 'move') {
+      setSelection(action.selection);
+      revealSelection(activeRef.current, action.selection);
+    }
     else if (action.type === 'startEdit') openEditor(action.initialInput);
     else if (action.type === 'clear') clearCells();
     if (action.type !== 'none') event.preventDefault();
@@ -1334,18 +1340,67 @@ function LegacyXlsxWorkerEditor(props: EditableSessionWorkbookProps) {
     if (!owner?.current || !live() || !scroll || activeRef.current !== sheet) return;
     const info = peer.sheetInfo();
     const at = peer.cellPosition(sheet, row, col);
-    const next = peer.cellPosition(sheet, Math.min(row + 1, 1_048_575), Math.min(col + 1, 16_383));
+    const rect = peer.cellRect(sheet, row, col);
     const zoom = zoomRef.current;
+    if (viewRef.current) setView(extendScrollExtent(scroll, viewRef.current, rect, zoom));
     const frozen = frozenGridExtent(sourceRef.current?.painted?.displayList.grid,
       info.frozenRows, info.frozenCols);
-    const x = revealAxis(at.x, next.x - at.x, col < info.frozenCols, scroll.scrollLeft / zoom,
+    const x = revealAxis(at.x, rect.w, col < info.frozenCols, scroll.scrollLeft / zoom,
       scroll.clientWidth / zoom - frozen.width, align);
-    const y = revealAxis(at.y, next.y - at.y, row < info.frozenRows, scroll.scrollTop / zoom,
+    const y = revealAxis(at.y, rect.h, row < info.frozenRows, scroll.scrollTop / zoom,
       scroll.clientHeight / zoom - frozen.height, align);
     if (x !== null) scroll.scrollLeft = x * zoom;
     if (y !== null) scroll.scrollTop = y * zoom;
     if (!owner.recovering) sourceRef.current?.schedule();
   };
+  const revealSelection = (sheet: number, selected: Selection, previousZoom?: number) => {
+    const owner = runRef.current;
+    if (!owner?.current) return;
+    const live = () => owner.current && runRef.current === owner && activeRef.current === sheet &&
+      selectionRef.current === selected;
+    if (owner.peer) {
+      const scroll = scrollRef.current;
+      if (previousZoom !== undefined && (!scroll ||
+        !cellInViewport(scroll, owner.peer.cellRect(sheet, selected.focus.row, selected.focus.col), previousZoom))) return;
+      reveal(owner.peer, sheet, selected.focus.row, selected.focus.col, 'nearest', live);
+      return;
+    }
+    const apply = (rect: Rect) => {
+      const scroll = scrollRef.current;
+      const view = viewRef.current;
+      if (!live() || !scroll || !view || view.sheet !== sheet) return;
+      if (previousZoom !== undefined && !cellInViewport(scroll, rect, previousZoom)) return;
+      const scale = zoomRef.current;
+      if (rect.x + rect.w > view.contentWidth || rect.y + rect.h > view.contentHeight) {
+        setView(extendScrollExtent(scroll, view, rect, scale));
+      }
+      const target = nearestCellScroll(rect, selected.focus, view, {
+        x: scroll.scrollLeft / scale, y: scroll.scrollTop / scale,
+        width: scroll.clientWidth / scale, height: scroll.clientHeight / scale,
+      });
+      const moved = scroll.scrollLeft !== target.x * scale || scroll.scrollTop !== target.y * scale;
+      if (moved) {
+        scroll.scrollLeft = target.x * scale;
+        scroll.scrollTop = target.y * scale;
+        sourceRef.current?.schedule();
+      }
+    };
+    const painted = sourceRef.current?.painted;
+    const view = viewRef.current;
+    const rect = painted?.request.sheet === sheet && view
+      ? laidOutCellRect(painted.displayList, painted.request.viewport, view, selected.focus) : null;
+    if (rect) apply(rect);
+    else void owner.session.call.cellGeometry(sheet, selected.focus.row, selected.focus.col)
+      .then((geometry) => apply(geometry.rect)).catch(reportInputError);
+  };
+  const revealedZoom = useRef(zoom);
+  useLayoutEffect(() => {
+    if (revealedZoom.current === zoom) return;
+    const previousZoom = revealedZoom.current;
+    revealedZoom.current = zoom;
+    const selected = selectionRef.current;
+    if (selected && !chartRef.current) revealSelection(activeRef.current, selected, previousZoom);
+  }, [zoom]);
   const validCell = (peer: WorkbookHandle, sheet: number, cell: CellAddr | undefined) => {
     if (!cell || !Number.isInteger(cell.row) || !Number.isInteger(cell.col) || cell.row < 0 || cell.col < 0 ||
       cell.row > 1_048_575 || cell.col > 16_383) return false;

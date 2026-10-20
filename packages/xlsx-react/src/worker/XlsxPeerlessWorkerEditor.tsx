@@ -1,11 +1,11 @@
-import { createSelectionDataNavigation, sameSelection, selectionDataRequest, selectionHidden } from '../selectionData';
+import { copiedSelection, createSelectionDataNavigation, sameSelection, selectionDataRequest, selectionHidden } from '../selectionData';
 import {
   cellAtPoint, cellRect, chartRegionAtPoint, extendTo, hyperlinkAtCell, isProposalsAvailable,
   moveFocus, normalizeRange, paintDisplayList, parseHyperlinkLocation, safeExternalHyperlink, selectionAt,
   selectionKeyReducer, toTsv,
 } from '@betteroffice/xlsx';
 import type {
-  CellAddr, CellInputEdit, Proposal, Selection, WorkbookSheetView, WorkbookCommandSelection,
+  CellAddr, CellInputEdit, CellRange, Proposal, Selection, WorkbookSheetView, WorkbookCommandSelection,
   WorkbookSheetSummary,
 } from '@betteroffice/xlsx';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
@@ -42,7 +42,7 @@ import { PluginOverlays } from '../plugins/PluginOverlays';
 import { PluginDock, useDockArea, type DockPlacement } from '../plugins/PluginPanels';
 import { useXlsxPluginHost, type XlsxPluginHostBinding } from '../plugins/useXlsxPluginHost';
 import { ProposalsPanel } from '../proposals/ProposalsPanel';
-import { deriveLimits } from '../viewer/sessionGeometry';
+import { cellInViewport, deriveLimits, extendScrollExtent, nearestCellScroll } from '../viewer/sessionGeometry';
 import type { WorkerEditorApiBridge } from './createWorkerEditorApi';
 import type { XlsxAsyncExportBridge } from './createAsyncEditorApi';
 import { PeerlessWorkbookSession, type PeerlessSessionWorkbookProps } from './usePeerlessSessionWorkbook';
@@ -86,22 +86,22 @@ function commandSelection(target: WorkbookCommandSelection, previous?: Selection
     start = cell(match[1], match[2]);
     end = cell(match[3] ?? match[1], match[4] ?? match[2]);
   }
-  const focus = target.activeCell ?? end;
-  if (previous?.range && previous.focus.row === focus.row && previous.focus.col === focus.col &&
-    previous.range.top === start.row && previous.range.left === start.col &&
-    previous.range.bottom === end.row && previous.range.right === end.col) return previous;
-  if ((focus.row !== start.row && focus.row !== end.row) ||
-    (focus.col !== start.col && focus.col !== end.col)) {
-    return { ...selectionAt(focus), range: { top: start.row, left: start.col, bottom: end.row, right: end.col } };
+  const anchor = target.activeCell ?? start;
+  const range = previous ? normalizeRange(previous) : null;
+  if (previous && previous.anchor.row === anchor.row && previous.anchor.col === anchor.col &&
+    range?.top === start.row && range.left === start.col &&
+    range.bottom === end.row && range.right === end.col) return previous;
+  if ((anchor.row !== start.row && anchor.row !== end.row) ||
+    (anchor.col !== start.col && anchor.col !== end.col)) {
+    return { ...selectionAt(anchor), range: { top: start.row, left: start.col, bottom: end.row, right: end.col } };
   }
-  return { focus: { ...focus }, anchor: {
-    row: focus.row === start.row ? end.row : start.row,
-    col: focus.col === start.col ? end.col : start.col,
+  return { anchor: { ...anchor }, focus: {
+    row: anchor.row === start.row ? end.row : start.row,
+    col: anchor.col === start.col ? end.col : start.col,
   } };
 }
 
-function selectedRange(selection: Selection): string {
-  const range = normalizeRange(selection);
+function rangeA1(range: CellRange): string {
   return `${address({ row: range.top, col: range.left })}:${address({ row: range.bottom, col: range.right })}`;
 }
 
@@ -251,7 +251,7 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
     if (!sheetId) throw new XlsxCommandAdmissionError('editor-unavailable');
     const range = normalizeRange(selected);
     return { sheetId, range: { kind: 'rowCol', start: { row: range.top, col: range.left },
-      end: { row: range.bottom, col: range.right } }, activeCell: { ...selected.focus } };
+      end: { row: range.bottom, col: range.right } }, activeCell: { ...selected.anchor } };
   };
   const selectedTarget = () => {
     const owner = ownerRef.current;
@@ -260,7 +260,7 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
       ? rangeTarget(activeRef.current, selectionRef.current) : undefined;
   };
   const hidden = () => selectionHidden(sourceRef.current?.painted?.displayList.grid);
-  const limits = () => deriveLimits(sourceRef.current?.painted?.displayList ?? null, viewRef.current!,
+  const limits = () => deriveLimits(sourceRef.current?.painted?.displayList ?? null,
     (scrollRef.current?.clientHeight ?? 0) / zoomRef.current);
   const predict = (sheet: number, next: Selection) => {
     const nextId = sheetId(sheet);
@@ -285,11 +285,19 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
     draftController.selectionChanged();
     commands.refresh();
   };
-  const reveal = (sheet: number, cell: CellAddr) => {
+  const reveal = (sheet: number, cell: CellAddr, previousZoom?: number) => {
     const owner = ownerRef.current;
     const frame = sourceRef.current?.painted;
-    if (!owner?.current || owner.failure || frame?.geometry && frame.request.sheet === sheet &&
-      cellRect(frame.geometry, cell.row, cell.col)) return;
+    if (!owner?.current || owner.failure) return;
+    const scroll = scrollRef.current;
+    const rect = frame?.geometry && frame.request.sheet === sheet ? cellRect(frame.geometry, cell.row, cell.col) : null;
+    const scale = zoomRef.current;
+    const padding = 2 / scale;
+    if (previousZoom === undefined && rect && scroll && frame?.request.zoom === scale &&
+      frame.request.viewport.x === scroll.scrollLeft / scale && frame.request.viewport.y === scroll.scrollTop / scale &&
+      (rect.x === 0 || rect.x >= padding) && (rect.y === 0 || rect.y >= padding) &&
+      rect.x + rect.w + padding <= scroll.clientWidth / scale &&
+      rect.y + rect.h + padding <= scroll.clientHeight / scale) return;
     const at = navigation.current;
     if (revealing.current?.generation === owner.generation && revealing.current.navigation === at) return;
     const request = { generation: owner.generation, navigation: at };
@@ -297,15 +305,43 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
     void owner.session.call.cellGeometry(sheet, cell.row, cell.col).then((geometry) => {
       const scroll = scrollRef.current;
       if (!owner.current || ownerRef.current !== owner || navigation.current !== at || !scroll) return;
+      if (previousZoom !== undefined && !cellInViewport(scroll, geometry.rect, previousZoom)) return;
+      const view = viewRef.current;
       const id = sheetId(sheet);
-      if (id) sheetScrolls.set(id, geometry.scrollPosition);
-      scroll.scrollLeft = geometry.scrollPosition.x * zoomRef.current;
-      scroll.scrollTop = geometry.scrollPosition.y * zoomRef.current;
+      if (!view || view.sheet !== sheet) {
+        if (id) sheetScrolls.set(id, geometry.scrollPosition);
+        scroll.scrollLeft = geometry.scrollPosition.x * zoomRef.current;
+        scroll.scrollTop = geometry.scrollPosition.y * zoomRef.current;
+        sourceRef.current?.schedule();
+        return;
+      }
+      const scale = zoomRef.current;
+      const padding = 2 / scale;
+      const extended = extendScrollExtent(scroll, view, {
+        ...geometry.rect, w: geometry.rect.w + padding, h: geometry.rect.h + padding,
+      }, scale);
+      revealedExtent.current = { sheet, contentWidth: extended.contentWidth, contentHeight: extended.contentHeight };
+      setView(extended);
+      const target = nearestCellScroll(geometry.rect, cell, view, {
+        x: scroll.scrollLeft / scale, y: scroll.scrollTop / scale,
+        width: scroll.clientWidth / scale, height: scroll.clientHeight / scale,
+      }, padding);
+      if (id) sheetScrolls.set(id, target);
+      scroll.scrollLeft = target.x * scale;
+      scroll.scrollTop = target.y * scale;
       sourceRef.current?.schedule();
     }).catch((error) => {
       if (owner.current && ownerRef.current === owner && navigation.current === at) owner.fail(error);
     }).finally(() => { if (revealing.current === request) revealing.current = null; });
   };
+  const revealedZoom = useRef(zoom);
+  useLayoutEffect(() => {
+    if (revealedZoom.current === zoom) return;
+    const previousZoom = revealedZoom.current;
+    revealedZoom.current = zoom;
+    const selected = selectionRef.current;
+    if (selected && !chartRef.current) reveal(activeRef.current, selected.anchor, previousZoom);
+  }, [zoom]);
   const requests = useMemo(() => new Map<number, WorkerPaintRequest>(), [run]);
   const selectionCommands = useMemo(() => new Set<number>(), [run]);
   const selectionRevisions = useMemo(() => new Map<number, number>(), [run]);
@@ -461,6 +497,7 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
     });
   };
   const geometryRevision = useRef(0);
+  const revealedExtent = useRef<{ sheet: number; contentWidth: number; contentHeight: number } | null>(null);
   const refreshSheetGeometry = useCallback((paint = false) => {
     const owner = ownerRef.current;
     if (!owner?.ready || owner.failure) return;
@@ -470,8 +507,15 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
       if (ownerRef.current !== owner || !owner.current || owner.failure ||
         revision !== geometryRevision.current || activeRef.current !== next.sheet) return;
       const changedSheet = viewRef.current?.sheet !== next.sheet;
-      setView(next);
-      if (changedSheet) restoreSheetScroll(next);
+      const revealed = revealedExtent.current;
+      if (revealed?.sheet !== next.sheet) revealedExtent.current = null;
+      const view = revealed?.sheet === next.sheet ? {
+        ...next,
+        contentWidth: Math.max(next.contentWidth, revealed.contentWidth),
+        contentHeight: Math.max(next.contentHeight, revealed.contentHeight),
+      } : next;
+      setView(view);
+      if (changedSheet) restoreSheetScroll(view);
       if (paint || changedSheet) sourceRef.current?.schedule();
     }).catch((error) => {
       if (ownerRef.current === owner && owner.current && !owner.failure) owner.fail(error);
@@ -647,10 +691,10 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
     const owner = ownerRef.current;
     if (!owner || owner !== identity || !owner.current || owner.failure || !live()) return 'unsupported';
     const sheet = (owner.session.editState.sheets ?? owner.session.state.sheets).find((entry) => entry.id === target?.sheetId);
-    const cell = target?.selection?.focus ?? { row: target?.row!, col: target?.col! };
+    const cell = target?.selection?.anchor ?? { row: target?.row!, col: target?.col! };
     const valid = (value: CellAddr | undefined) => value && Number.isInteger(value.row) && Number.isInteger(value.col) &&
       value.row >= 0 && value.row < 1_048_576 && value.col >= 0 && value.col < 16_384;
-    if (!sheet || !valid(cell) || target.selection && !valid(target.selection.anchor)) return 'missing-target';
+    if (!sheet || !valid(cell) || target.selection && !valid(target.selection.focus)) return 'missing-target';
     let pendingNavigation: typeof pluginNavigation.current = null;
     try {
       if (target.selection || sheet.index !== activeRef.current) {
@@ -752,6 +796,7 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
     setProposalsPanelOpen(false); formatSource.current = null;
     setCatalog(run?.session.editState.sheets ?? run?.session.state.sheets ?? []);
     navigation.current += 1;
+    revealedExtent.current = null;
     causalSelection.current = null;
     proposalsRevision.current++;
     proposalsMutation.current = 0;
@@ -955,11 +1000,12 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
     const token = cellClipboard.begin(undefined, marker);
     const copied = coordinator.runAfterPendingInput(async () => {
       checkOwner();
-      const result = await owner.session.call.cellInputs(sheet, selectedRange(selected));
+      const range = await copiedSelection(owner.session, sheet, selected);
+      const result = await owner.session.call.cellInputs(sheet, rangeA1(range));
       checkOwner();
-      return result.cells;
+      return { range, cells: result.cells };
     }, kind === 'cut' ? true : 'posted');
-    const written = copied.then(async (cells) => {
+    const written = copied.then(async ({ range, cells }) => {
       checkOwner();
       const text = toTsv(cells);
       if (write) { resolve!(new Blob([text], { type: 'text/plain' })); await write; }
@@ -981,7 +1027,7 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
     const selected = next ?? sheetSelection(sheet);
     const target = rangeTarget(sheet, selected);
     predict(sheet, selected);
-    if (next) reveal(sheet, selected.focus);
+    if (next) reveal(sheet, selected.anchor);
     command({ kind: 'setActiveSheet', payload: { args: [sheet], target, selection: target } });
   };
   const moveChart = (sheet: number, id: string, dx: number, dy: number, retained = false, generation = run?.generation) => {
@@ -1099,7 +1145,7 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
   const openCell = (seed?: string) => {
     const selected = selectionRef.current;
     if (!run?.ready || !editable() || !selected) return;
-    reveal(activeRef.current, selected.focus);
+    reveal(activeRef.current, selected.anchor);
     draftController.open(seed);
   };
   const onMouseDown = (event: MouseEvent) => {
@@ -1220,6 +1266,7 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
     if (request) {
       event.preventDefault();
       selectionNavigation.enqueue(event, {
+        activeCell: (selected) => selected.anchor,
         context: navigationContext,
         limits,
         hidden,
@@ -1236,6 +1283,8 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
     }
     const key = { key: event.key, shiftKey: event.shiftKey, metaKey: event.metaKey, ctrlKey: event.ctrlKey,
       altKey: event.altKey };
+    const extending = key.shiftKey && key.key !== 'Tab' && key.key !== 'Enter';
+    const from = (selected: Selection) => extending ? selected : selectionAt(selected.anchor);
     const act = () => {
       const selected = selectionRef.current;
       if (!selected || chartRef.current) return;
@@ -1246,7 +1295,7 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
         else if (key.key === 'Escape') draftController.cancel();
         return;
       }
-      const action = selectionKeyReducer(selected, key, limits(), undefined, hidden());
+      const action = selectionKeyReducer(from(selected), key, limits(), undefined, hidden());
       if (action.type === 'move') {
         predict(activeRef.current, action.selection);
         reveal(activeRef.current, action.selection.focus);
@@ -1254,7 +1303,7 @@ export function XlsxPeerlessWorkerEditor(props: PeerlessSessionWorkbookProps) {
       } else if (action.type === 'startEdit') openCell(action.initialInput);
       else if (action.type === 'clear') clear();
     };
-    const type = selectionKeyReducer(selectionRef.current, key, limits(), undefined, hidden()).type;
+    const type = selectionKeyReducer(from(selectionRef.current), key, limits(), undefined, hidden()).type;
     if (type === 'none') {
       if (key.key === 'Escape' && selectionNavigation.defer(navigationContext(), act, true)) event.preventDefault();
       return;

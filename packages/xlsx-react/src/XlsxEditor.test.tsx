@@ -316,6 +316,39 @@ describe('XlsxEditor grid pointer handling', () => {
     expect(view.workbook().cell(0, 2, 0).input).toBe('Edited item');
   });
 
+  it('uses synchronous model bounds for Ctrl+End and reveals an empty used-range corner', async () => {
+    const view = await mountEditor();
+    const workbook = view.workbook();
+    workbook.editCell(0, 9_999, 0, 'Far row');
+    workbook.editCell(0, 0, 701, 'Far column');
+    const before = workbook.save();
+    const query = spyOn(workbook, 'selectionData');
+    fireEvent.keyDown(view.surface, { key: 'End', ctrlKey: true });
+    expect(query).toHaveBeenCalledWith(0, 0, 0, 'usedRange');
+    query.mockRestore();
+    expect(view.nameBox().value).toBe('ZZ10000');
+    expect(view.formula()).toBe('');
+    await waitFor(() => {
+      expect(view.surface.scrollLeft).toBeGreaterThan(0);
+      expect(view.surface.scrollTop).toBeGreaterThan(0);
+    });
+    fireEvent.keyDown(view.surface, { key: 'Home', ctrlKey: true });
+    expect(view.nameBox().value).toBe('A1');
+    expect(workbook.save()).toEqual(before);
+  });
+
+  it('preserves the selection when a synchronous used-range query fails', async () => {
+    const view = await mountEditor();
+    fireEvent.keyDown(view.surface, { key: 'ArrowRight' });
+    fireEvent.keyDown(view.surface, { key: 'ArrowDown' });
+    const query = spyOn(view.workbook(), 'selectionData').mockImplementationOnce(() => {
+      throw new Error('Query unavailable');
+    });
+    fireEvent.keyDown(view.surface, { key: 'End', ctrlKey: true });
+    expect(view.nameBox().value).toBe('B2');
+    query.mockRestore();
+  });
+
   it('commits and reopens on the target when another cell is double-clicked', async () => {
     const view = await mountEditor();
 
@@ -1815,6 +1848,39 @@ describe('XlsxEditor commands', () => {
         fireEvent.keyDown(surface, { key: 'c', ctrlKey: true });
       });
       expect(clipboard.writes.map((write) => write.text)).toEqual(['Second']);
+    } finally {
+      clipboard.restore();
+    }
+  });
+
+  for (const key of ['c', 'Delete'] as const) it(`${key === 'c' ? 'copies' : 'clears'} a Ctrl+A sheet selection through its used cells`, async () => {
+    const clipboard = holdClipboardWrite();
+    try {
+      const editor = await mountCommands();
+      const api = editor.api();
+      const surface = editor.view.getByTestId('xlsx-scroll');
+      api.handle.editCells(0, [
+        { row: 0, col: 0, input: 'First' },
+        { row: 3, col: 1, input: 'Second' },
+      ]);
+      await act(async () => {
+        api.selectCells(0, selectionAt({ row: 40, col: 20 }));
+      });
+      await act(async () => {
+        fireEvent.keyDown(surface, { key: 'a', ctrlKey: true });
+      });
+      await act(async () => {
+        fireEvent.keyDown(surface, key === 'c' ? { key, ctrlKey: true } : { key });
+      });
+      if (key === 'Delete') {
+        await waitFor(() => expect(api.handle.cell(0, 3, 1).input).toBe(''));
+        expect(api.handle.cell(0, 0, 0).input).toBe('');
+        return;
+      }
+      const rows = clipboard.writes[0]!.text.split(/\r?\n/).map((row) => row.split('\t'));
+      expect(rows[0]![0]).toBe('First');
+      expect(rows[3]![1]).toBe('Second');
+      expect(rows.length).toBeLessThan(1_000);
     } finally {
       clipboard.restore();
     }
