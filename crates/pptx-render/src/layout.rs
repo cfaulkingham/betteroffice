@@ -10810,6 +10810,7 @@ mod tests {
             flip_v: false,
             inherited: None,
             hidden: false,
+            text_box: false,
             geometry: "rect".to_owned(),
             adjust_values: BTreeMap::new(),
             placeholder: Some(title.clone()),

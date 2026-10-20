@@ -161,6 +161,7 @@ export interface ShapeSnapshot {
   inherited?: InheritedGeometry | null;
   /** Hides this shape and its descendants; omitted when false. */
   hidden?: boolean;
+  textBox?: boolean;
   aspectRatioLocked?: boolean;
   geometry: string;
   adjustValues: Record<string, number>;
