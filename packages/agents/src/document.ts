@@ -1,5 +1,5 @@
 import { createYrsSession, saveYrsDocx, type DocxParagraphTarget, type YrsSession, type YrsStorySegment } from '@betteroffice/docx/yrs';
-import { cellPosition, continueList, deleteParagraph, deleteTableRow, hostEdit, insertTableRow, lineText, listLevel, notInTable, requireParagraph, resolveStyle, tableCells, type ParagraphStyle } from './docx-edits';
+import { cellPosition, continueList, deleteParagraph, deleteTableRow, hostEdit, insertParagraphsWithAnchorFormat, insertTableRow, lineText, listLevel, notInTable, requireParagraph, resolveStyle, tableCells, type ParagraphStyle } from './docx-edits';
 import { docxBatchSchema, type DocxAgentBatch, type DocxAgentEdit, type DocxEditOutcome } from './docx-schema';
 import {
   DocumentToolError,
@@ -526,6 +526,9 @@ export class DocxAgentDocument {
       }
       case 'insert_paragraphs': {
         const fallback = this.styles().find(style => style.isDefault)?.id;
+        if (edit.list && edit.runFormat !== undefined) {
+          throw new DocumentToolError('INVALID_ARGUMENT', 'runFormat cannot be combined with list: continue. Omit runFormat.');
+        }
         if (edit.list && edit.paragraphs.some(({ style }) => style)) {
           throw new DocumentToolError('INVALID_ARGUMENT', 'list: continue takes the style of the anchor list item. Omit style.');
         }
@@ -542,6 +545,7 @@ export class DocxAgentDocument {
         return draft => {
           requireParagraph(draft, target);
           if (edit.list) return { result: {}, created: continueList(draft, target, paragraphs) };
+          if (edit.runFormat === 'anchor') return { result: {}, created: insertParagraphsWithAnchorFormat(draft, target, paragraphs) };
           return { result: {}, created: hostEdit(draft, { op: 'insertParagraphs', target, at: 'end', paragraphs }).newParagraphs };
         };
       }
