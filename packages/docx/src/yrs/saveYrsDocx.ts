@@ -320,9 +320,18 @@ export async function writeSessionSave(
     if (sourceSeparators === undefined) sourceSeparators = sessionSourceNoteSeparators(session);
     return sourceSeparators?.[kind] !== separators[kind];
   };
-  const spliced = (capture.plan.splicedParts ?? []).filter(
-    ({ part }) => splices(part) && !rewritten(part)
-  );
+  const spliced: NonNullable<DocxParagraphSavePlan['splicedParts']> = [];
+  const unspliced: Array<{ part: string; ordinals: number[] }> = [];
+  for (const entry of capture.plan.splicedParts ?? []) {
+    if (splices(entry.part) && !rewritten(entry.part)) {
+      spliced.push(entry);
+    } else if (entry.paragraphPatches?.length || entry.legacyParagraphs?.length) {
+      unspliced.push({ part: entry.part, ordinals: entry.changed });
+    }
+  }
+  if (unspliced.length) {
+    console.debug('DOCX_MINIMAL_PATCH unspliced paragraphs', unspliced);
+  }
   const plan: RustParagraphIds = {
     assignments: capture.plan.assignments,
     patchedParts: capture.plan.patchedParts.filter(
@@ -331,19 +340,23 @@ export async function writeSessionSave(
     ...(spliced.length === 0
       ? {}
       : {
-          splicedParts: spliced.map(({ part, sha256, paragraphs, changed, inserted, removed }) => ({
-            part,
-            sha256,
-            paragraphs: paragraphs.map(([ordinal]) => ordinal),
-            changed,
-            ...(inserted?.length ? { inserted } : {}),
-            ...(removed?.length ? { removed } : {}),
-          })),
+          splicedParts: spliced.map(
+            ({ part, sha256, paragraphs, changed, inserted, removed, paragraphPatches, legacyParagraphs }) => ({
+              part,
+              sha256,
+              paragraphs: paragraphs.map(([ordinal]) => ordinal),
+              changed,
+              ...(inserted?.length ? { inserted } : {}),
+              ...(removed?.length ? { removed } : {}),
+              ...(paragraphPatches === undefined ? {} : { paragraphPatches }),
+              ...(legacyParagraphs === undefined ? {} : { legacyParagraphs }),
+            })
+          ),
         }),
   };
   const output = withoutSyntheticParagraphs(document, capture.identities);
   const paragraphs = savedParagraphs(output, capture.identities);
-  const { buffer } = await writeDocumentWithRust(
+  const { buffer, warnings } = await writeDocumentWithRust(
     withSourceOrdinals(output, spliced),
     originalBuffer,
     options,
@@ -352,6 +365,11 @@ export async function writeSessionSave(
     plan,
     skipMutations
   );
+  for (const warning of warnings) {
+    if (warning.startsWith('DOCX_MINIMAL_PATCH replace counts')) {
+      console.debug(warning);
+    }
+  }
   const bytes = new Uint8Array(buffer);
   const held = session.writtenParagraphIds(bytes);
   const isWritten = (partUri: string, paraId: string) =>
