@@ -44,7 +44,6 @@ export function TrackMenu({
   left,
   top,
   onAction,
-  onResize,
   onClose,
 }: {
   target: TrackTarget;
@@ -53,7 +52,6 @@ export function TrackMenu({
   left: number;
   top: number;
   onAction: (action: TrackAction) => boolean;
-  onResize: () => void;
   onClose: () => void;
 }) {
   const menu = useRef<HTMLDivElement>(null);
@@ -161,18 +159,6 @@ export function TrackMenu({
           {trackActionLabel({ ...hidden, type: "unhide" })}
         </button>
       )}
-      <div
-        role="separator"
-        style={{ borderTop: "1px solid #e2e8f0", margin: "4px 0" }}
-      />
-      <button
-        type="button"
-        role="menuitem"
-        style={itemStyle}
-        onClick={onResize}
-      >
-        {target.axis === "row" ? "Row height…" : "Column width…"}
-      </button>
     </div>
   );
 }
