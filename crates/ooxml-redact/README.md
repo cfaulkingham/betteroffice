@@ -49,6 +49,13 @@ relationship targets are preserved.
   match text, scenario names and comments, web-publish titles and destinations,
   OLE program IDs and links, control names.
 - Rich data and metadata: rich-value strings and key names, metadata values.
+- Styles: custom DOCX style IDs, names, and aliases become `RedactedStyleN`
+  across styles, numbering, `STYLEREF`, and `TOC \t`; custom XLSX cell, table,
+  pivot, slicer, and timeline style names likewise. Built-in styles are kept.
+- Custom XML: DOCX, XLSX, and PPTX redaction always removes data items,
+  `itemProps`, their relationships and content-type overrides. DOCX data bindings
+  are removed; SDTs keep their redacted cached content. Removed parts are counted
+  in `RedactionReport::custom_xml_parts` and the CLI summary.
 - Document properties and custom properties; external-relationship targets
   become `https://example.com`.
 
