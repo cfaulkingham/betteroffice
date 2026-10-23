@@ -1,9 +1,9 @@
 import { expect, mock, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { createDocxWorkerEditSession } from '@betteroffice/docx/peerless';
+import { createDocxWorkerEditSession } from '@betteroffice/docx/worker';
 import type { ResidentEngineWorkerClient, YrsResidentFontRegistration } from '@betteroffice/docx/yrs';
 import { applyFrameDelta, decodeFrameDelta } from '@betteroffice/docx/layout/render';
-import type { DocxCommandAck, DocxCommandEnvelope, ResidentCommandConnection } from '@betteroffice/docx/peerless';
+import type { DocxCommandAck, DocxCommandEnvelope, ResidentCommandConnection } from '@betteroffice/docx/worker';
 import type { RustTextEngine } from '@betteroffice/docx/layout/measure/rustMeasureSource';
 import { buildCommandFrame } from '../../../../../docx/src/yrs/residentCommandFrame';
 import { registerCommandFonts } from '../../../../../docx/src/yrs/residentCommandFonts';
@@ -23,10 +23,10 @@ type ResidentCommandInitRequest = Parameters<ResidentEngineWorkerClient['command
 
 async function openFontConnection(hold = false, fontKeys: readonly string[] = ['face'], getRasterScale?: () => number) {
   const source = readFileSync(`${import.meta.dir}/PeerlessDocxEditor.tsx`, 'utf8');
-  const start = source.indexOf('    signal.throwIfAborted();', source.indexOf('const openConnection ='));
-  const end = source.indexOf('\n  }, [controller]);', start);
+  const start = source.indexOf('    signal.throwIfAborted();', source.indexOf('const openResident ='));
+  const end = source.indexOf('\n  }, [', start);
   const transpiler = new Bun.Transpiler({ loader: 'tsx' });
-  const body = transpiler.transformSync(`async function open(input, signal, getRasterScale) {${source.slice(start, end).replace(
+  const body = transpiler.transformSync(`async function open(input, signal, getRasterScale, resume) {${source.slice(start, end).replace(
     'const fonts: YrsResidentFontRegistration[] = [];',
     'const fonts: YrsResidentFontRegistration[] = []; observeFonts(fonts);',
   )} }`);
@@ -61,7 +61,9 @@ async function openFontConnection(hold = false, fontKeys: readonly string[] = ['
     return connection;
   });
   const dependencies = {
+    workerCollaboration: { begin() {}, openOptions: undefined },
     active: { current: null },
+    releaseResident: { current: null },
     takePreloadedResidentEngineWorker: () => null,
     controller: { fontChoices() {} }, fontSource: { current: null }, fontAbort: { current: null }, fontJob: { current: null },
     fontEnvironmentForRegistrations,

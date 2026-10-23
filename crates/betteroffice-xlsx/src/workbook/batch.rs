@@ -22,6 +22,7 @@ use super::target::{CellTarget, FindRequest, RangeTarget, ReadRequest, Resolved,
 use super::{
     StagedApply, Workbook, authority_error, calculation_result, cell_states_semantically_equal,
     current_cell_state, edit_cell_state, validate_cell_state, validate_model_sheets, validate_op,
+    written_cell_style,
 };
 use crate::authority::{SyncOrigin, cell_format_fits};
 use crate::{CalculationOptions, Error, Result};
@@ -457,7 +458,7 @@ impl Claims {
 
 enum Effect {
     /// The cells whose content changes, with their new state.
-    Content(Vec<(CellRef, CellState)>),
+    Content(Vec<(CellRef, CellState, Option<Op>)>),
     NumberFormat(NumberFormatMutation),
     /// `None` for a patch that writes nothing.
     Style(Option<StylePatch>),
@@ -590,9 +591,10 @@ impl Workbook {
         step: &EditStep,
         keys: &[String],
         planned: &[Planned],
-        visits: &mut u64,
-        units: &mut u64,
+        budget: (&mut u64, &mut u64),
+        now_serial: Option<f64>,
     ) -> std::result::Result<Planned, EditFailure> {
+        let (visits, units) = budget;
         let requested = step.operation.target();
         let at = |code, message: String| failure(code, message, Some(requested.clone()));
         let resolved = self.resolve_target(keys, requested)?;
@@ -608,7 +610,7 @@ impl Workbook {
                 format!("a batch addresses at most {MAX_CELL_VISITS} target and guard cells"),
             ));
         }
-        if let Some((code, message)) = self.sheet_write_refusal(resolved.sheet) {
+        if let Some((code, message)) = self.step_write_refusal(&step.operation, resolved) {
             return Err(at(code, message));
         }
         let mut text = step
@@ -746,18 +748,21 @@ impl Workbook {
             EditOperation::SetCellInputs { inputs, .. } => {
                 let mut states = Vec::new();
                 for (cell, input) in resolved.iter().zip(inputs.iter().flatten()) {
-                    let state = edit_cell_state(&self.model, resolved.sheet, cell, input);
+                    let (state, format) =
+                        edit_cell_state(&self.model, resolved.sheet, cell, input, now_serial);
                     validate_cell_state(&state).map_err(|error| {
                         at(
                             EditFailureCode::InvalidStep,
                             format!("the input for {}: {error}", cell.to_a1()),
                         )
                     })?;
-                    if !cell_states_semantically_equal(
-                        &current_cell_state(&self.model, resolved.sheet, cell),
-                        &state,
-                    ) {
-                        states.push((cell, state));
+                    if format.is_some()
+                        || !cell_states_semantically_equal(
+                            &current_cell_state(&self.model, resolved.sheet, cell),
+                            &state,
+                        )
+                    {
+                        states.push((cell, state, format));
                     }
                 }
                 Effect::Content(states)
@@ -769,7 +774,12 @@ impl Workbook {
                     let state = CellState {
                         value: value.clone(),
                         formula: None,
-                        style: current.style,
+                        style: written_cell_style(
+                            &self.model,
+                            resolved.sheet,
+                            cell,
+                            matches!(value, CellValue::Empty),
+                        ),
                     };
                     validate_cell_state(&state).map_err(|error| {
                         at(
@@ -778,7 +788,7 @@ impl Workbook {
                         )
                     })?;
                     if !cell_states_semantically_equal(&current, &state) {
-                        states.push((cell, state));
+                        states.push((cell, state, None));
                     }
                 }
                 Effect::Content(states)
@@ -790,10 +800,10 @@ impl Workbook {
                     let state = CellState {
                         value: CellValue::Empty,
                         formula: Some(source.clone()),
-                        style: current.style,
+                        style: written_cell_style(&self.model, resolved.sheet, cell, false),
                     };
                     if !cell_states_semantically_equal(&current, &state) {
-                        states.push((cell, state));
+                        states.push((cell, state, None));
                     }
                 }
                 Effect::Content(states)
@@ -843,7 +853,14 @@ impl Workbook {
         let mut steps: Vec<Planned> = Vec::with_capacity(request.steps.len());
         for (index, step) in request.steps.iter().enumerate() {
             let index = index as u32;
-            match self.plan_step(index, step, &keys, &steps, &mut visits, &mut units) {
+            match self.plan_step(
+                index,
+                step,
+                &keys,
+                &steps,
+                (&mut visits, &mut units),
+                request.calculation.now_serial,
+            ) {
                 Ok(planned) => steps.push(planned),
                 Err(failure) => return refuse(failure.at(index)),
             }
@@ -851,16 +868,19 @@ impl Workbook {
         let mut ops = Vec::new();
         for planned in &steps {
             if let Effect::Content(states) = &planned.effect {
-                ops.extend(states.iter().map(|(at, state)| {
-                    (
+                for (at, state, format) in states {
+                    ops.push((
                         planned.index,
                         Op::SetCell {
                             sheet: planned.resolved.sheet,
                             at: *at,
                             cell: state.clone(),
                         },
-                    )
-                }));
+                    ));
+                    if let Some(format) = format {
+                        ops.push((planned.index, format.clone()));
+                    }
+                }
             }
         }
         for planned in &steps {

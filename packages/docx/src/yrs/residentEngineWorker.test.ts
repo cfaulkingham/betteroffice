@@ -22,7 +22,7 @@ import { preloadEditWasm } from './wasm/index';
 import * as editWasm from './wasm/index';
 import { preloadOpcWasm } from '../wasm/opc';
 import { PeerMetadataError } from './peerMetadata';
-import { ResidentEngineWorkerClient, type ResidentEngineWorkerPort } from './residentEngineWorkerClient';
+import { RESIDENT_WORKER_SILENCE_MS, ResidentEngineWorkerClient, type ResidentEngineWorkerPort } from './residentEngineWorkerClient';
 import { createResidentCommandConnection } from './residentCommandConnection';
 import { createDocxWorkerEditSession } from './createDocxWorkerEditSession';
 import type {
@@ -247,6 +247,7 @@ function worker() {
     failPresent: null as number | null,
     memories: [{ label: 'docx-edit', bufferBytes: 65536, liveBytes: 100, peakBytes: 100, failedAllocationBytes: 0 }],
     session: {
+      initializeComments() {},
       partGeometry: () => [],
       proposalEngine: { version: () => 'v' },
       geometryReader: { storyIds: () => ['body'] },
@@ -611,6 +612,76 @@ function commandEnvelope(seq: number, text = '!'): DocxCommandEnvelope {
     basis: { epoch: COMMAND_INIT.epoch, version: 0 }, seq, kind: 'insertText', payload: { text },
   };
 }
+
+test('selection noop sends its retained echo context before building the deferred frame', async () => {
+  const arm = await commandWorker();
+  const { client, w } = arm;
+  const at = { story: 'body', paraId: 'p', offset: 1 };
+  Object.assign(w.harness.session.geometryReader, {
+    version: () => w.harness.session.proposalEngine.version(),
+    hasStory: (story: string) => story === 'body',
+    paragraphSpans: () => [{ paraId: 'p', length: 2 }],
+    locateParagraph: () => ({ start: 0, end: 2 }),
+    storySegments: () => [
+      { kind: 'text', text: 'ab', attributes: {} },
+      { kind: 'pilcrow', paraId: 'p', properties: {}, attributes: {} },
+    ],
+  });
+  const state: DocxEditState = { readOnly: false, toolbar: null, effectiveFormatting: null, storedMarks: null,
+    canUndo: false, canRedo: false, hyperlink: null, tableContext: null };
+  w.harness.installCommands!(() => ({
+    preflight: command => ({ status: 'ready', prepared: {
+      command: { ...command, kind: 'select', payload: { selection: { anchor: at, focus: at } } },
+      selection: { anchor: at, focus: at }, range: null,
+    } }),
+    apply: () => ({ status: 'noop' }), selection: () => ({ anchor: at, focus: at }), editState: () => state,
+  }));
+  const page = { pageId: '1', pageIndex: 0 };
+  const projected: number[] = [];
+  w.harness.projectEchoContext = ({ layout }) => {
+    projected.push(layout.frame.frameEpoch);
+    return { page, frameEpoch: layout.frame.frameEpoch, layoutRevision: 1, serializedBytes: 100, text: 'ab',
+      styleRuns: [], boundaries: [], damage: [], selection: { anchorGrapheme: 1, focusGrapheme: 1 },
+      transform: [1, 0, 0, 1, 0, 0], shaping: 'simple-ltr', glyphs: {
+        glyphSet: 'set', fontId: 1, size: 12, color: '#000', x: 0, y: 14, next: '', right: 100,
+        device: { x: 0, y: 0, width: 100, height: 20 }, pixelRatio: 1,
+      } };
+  };
+  try {
+    const initial = await client.commandInit(COMMAND_INIT);
+    projected.length = 0;
+    let ackSent = false;
+    let builds = 0;
+    const build = w.harness.session.buildDisplayListFrame;
+    w.harness.session.buildDisplayListFrame = (...args: Parameters<typeof build>) => {
+      expect(ackSent).toBe(true);
+      builds += 1;
+      return build(...args);
+    };
+    w.harness.session.buildDisplayPagesFrame = (pages: number[]) => {
+      expect(ackSent).toBe(true);
+      builds += 1;
+      const { docEpoch, layoutEpoch } = w.harness.delta!;
+      w.delta(pages.map(index => index + 1), false, 100, 1);
+      Object.assign(w.harness.delta!, { docEpoch, layoutEpoch });
+      return new Uint8Array([w.harness.delta!.frameEpoch]);
+    };
+    const post = w.scope.postMessage;
+    w.scope.postMessage = (response, transfer) => {
+      if (response.ok && response.commandAck) {
+        expect(projected).toEqual([initial.frame.revision]);
+        ackSent = true;
+      }
+      post(response, transfer);
+    };
+    const pushed = new Promise<DocxCommandFrame>(resolve => client.onFrame(resolve));
+    const ack = await client.edit({ ...commandEnvelope(1), kind: 'selectPoint', payload: {} });
+    expect(ack.frame).toBeUndefined();
+    expect(ack.echoContext).toMatchObject({ frameEpoch: initial.frame.revision, selection: { focusGrapheme: 1 } });
+    expect((await pushed).coversThroughSeq).toBe(1);
+    expect(builds).toBe(1);
+  } finally { client.destroy(); }
+});
 
 test('command raster scale sizes the initial bitmaps before presentation', async () => {
   const { client, w } = await commandWorker();
@@ -1704,7 +1775,7 @@ test('d0_command_input_renews_scheduler_budget_and_idle_hold', async () => {
     let now = 2000;
     w.harness.now = () => now;
     const kinds = ['insertText', 'select', 'replaceSelection', 'deleteBackward', 'deleteForward',
-      'paragraphBreak', 'toggleMark', 'formatRange', 'clearFormatting', 'setParagraphAttrs', 'applyParagraphStyle'];
+      'paragraphBreak', 'lineBreak', 'toggleMark', 'formatRange', 'clearFormatting', 'setParagraphAttrs', 'applyParagraphStyle'];
     for (const [index, kind] of kinds.entries()) {
       expect(w.harness.scheduler!.budget()).toBe(24);
       await client.edit({ ...commandEnvelope(index + 1), kind });
@@ -4380,6 +4451,46 @@ describe('worker proposals during sliced completion', () => {
     };
   }
 
+  test('viewer reservation carried sets preserve one owner and remove absent owners', async () => {
+    const { w, engine, snapshot } = await proposalWorker();
+    try {
+      let epoch = w.harness.delta!.frameEpoch;
+      let frame = applyFrameDeltaOwned(null, w.harness.delta!);
+      let revision = snapshot.layoutRevision;
+      const oldVersion = engine.proposalEngine.version();
+      const item = (id: string, version: string, width: number) => ({ id, kind: 'inline', width, height: 10,
+        anchor: { kind: 'range', version, range: { story: 'body', view: 'accepted',
+          start: { paraId: '00000001', offset: 0 }, end: { paraId: '00000001', offset: 0 },
+        } },
+      });
+      const sync = async (sets: unknown[]) => {
+        const reply = await w.send({ type: 'sync', expectedFrameEpoch: epoch, paintCaret: false,
+          extras: '', layoutExtras: '{}', snapshot: { ...snapshot, fonts: [], layoutRevision: ++revision,
+            layoutInput: JSON.stringify({ ...JSON.parse(layoutInput), renderEnv: {
+              reservationSets: { version: engine.proposalEngine.version(), sets },
+            } }),
+          },
+        });
+        if (!reply.ok || !reply.frame) throw new Error('expected viewer frame');
+        epoch = reply.caret!.frameEpoch;
+        frame = applyFrameDeltaOwned(frame, decodeFrameDelta(reply.frame));
+        return frame.displayList.pages.flatMap((page) => page.reservations ?? []);
+      };
+      expect(await sync([
+        { owner: 'a', items: [item('a', oldVersion, 35)] },
+        { owner: 'removed', items: [item('removed', oldVersion, 20)] },
+      ])).toEqual(expect.arrayContaining([expect.objectContaining({ owner: 'a', width: 35 })]));
+      engine.applyRawOps('body', [{ op: 'insert', index: 2, text: 'X' }]);
+      const boxes = await sync([
+        { owner: 'a', version: oldVersion, items: [item('a', oldVersion, 99)] },
+        { owner: 'fresh', items: [item('fresh', engine.proposalEngine.version(), 75)] },
+      ]);
+      expect(boxes.map(({ owner, width }) => ({ owner, width }))).toEqual([
+        { owner: 'a', width: 35 }, { owner: 'fresh', width: 75 },
+      ]);
+    } finally { engine.destroy(); }
+  });
+
   test('meta and JSON replies preserve decisions, frame bytes, sizes and header epochs', async () => {
     const run = async (mode: 'json' | 'meta') => {
       const { w, engine, proposal, snapshot, calls } = await proposalWorker('', undefined, undefined, {
@@ -5341,6 +5452,38 @@ describe('resident worker opening', () => {
     expect(calls).toEqual(['apply:1', 'apply:2', 'repair:2', 'apply:3', 'save:3']);
   });
 
+  test('a long save reports progress at most once a second, and only while it runs', async () => {
+    const { w } = openingWorker();
+    let clock = 0;
+    const notices: Array<{ progress: number; at: number }> = [];
+    const post = w.scope.postMessage.bind(w.scope);
+    w.scope.postMessage = (reply: ResidentEngineWorkerResponse, transfer?: Transferable[]) => {
+      if (reply.ok && reply.progress !== undefined) notices.push({ progress: reply.progress, at: clock });
+      post(reply, transfer);
+    };
+    const engineProgress = () => (globalThis as { __betterofficeEngineProgress?: () => void }).__betterofficeEngineProgress?.();
+    Object.assign(w.harness.session, {
+      save: async () => {
+        for (let step = 0; step < 50; step++) {
+          clock += 250;
+          engineProgress();
+        }
+        return new ArrayBuffer(4);
+      },
+    });
+    expect((await w.send({ type: 'open', bytes: new ArrayBuffer(1) })).ok).toBe(true);
+    w.harness.now = () => clock;
+    expect(notices).toEqual([]);
+    const saved = await w.send({ type: 'save', comments: [] });
+    expect(saved.ok).toBe(true);
+    const saveId = w.answered.at(-1)!;
+    expect(notices).toEqual(Array.from({ length: 12 }, (_, index) => ({ progress: saveId, at: (index + 1) * 1_000 })));
+    await new Promise((settled) => setTimeout(settled, 0));
+    clock += 5_000;
+    engineProgress();
+    expect(notices).toHaveLength(12);
+  });
+
   test('syncUpdate acknowledges an empty diff and a deletion with an unchanged state vector', async () => {
     const { w } = openingWorker();
     const vector = new Uint8Array([1, 2]);
@@ -5844,3 +5987,67 @@ test('package_image_remains_decodable_after_edit_on_its_page', async () => {
     for (const engine of engines) engine.destroy();
   }
 }, 15_000);
+
+describe('slow saves on a slow host', () => {
+  async function slowSave(stageMs: number[], reports: boolean) {
+    const arm = await commandWorker();
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const budgets = new Map<number, number>();
+    const callbacks = new Map<number, () => void>();
+    let nextBudget = -1;
+    globalThis.setTimeout = ((callback: () => void, ms?: number, ...rest: unknown[]) => {
+      if (ms !== RESIDENT_WORKER_SILENCE_MS) return realSetTimeout(callback, ms, ...rest);
+      const id = nextBudget--;
+      budgets.set(id, ms);
+      callbacks.set(id, callback);
+      return id;
+    }) as typeof setTimeout;
+    globalThis.clearTimeout = ((id: number) => {
+      if (budgets.delete(id)) callbacks.delete(id);
+      else realClearTimeout(id);
+    }) as typeof clearTimeout;
+    let clock = 0;
+    arm.w.harness.now = () => clock;
+    const elapse = (ms: number) => {
+      clock += ms;
+      for (const [id, left] of [...budgets]) {
+        if (left > ms) { budgets.set(id, left - ms); continue; }
+        const callback = callbacks.get(id)!;
+        budgets.delete(id);
+        callbacks.delete(id);
+        callback();
+      }
+    };
+    Object.assign(arm.w.harness.session, {
+      encodeStateVector: () => new Uint8Array([1]),
+      save: async () => {
+        for (const ms of stageMs) {
+          elapse(ms);
+          if (reports) (globalThis as { __betterofficeEngineProgress?: () => void }).__betterofficeEngineProgress?.();
+          await Promise.resolve();
+        }
+        return new ArrayBuffer(4);
+      },
+    });
+    try {
+      return { arm, saved: await arm.client.save({ comments: [] }).then((value) => value, (error: Error) => error) };
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    }
+  }
+
+  test('a save past the silence window resolves while every stage reports progress', async () => {
+    const { arm, saved } = await slowSave([20_000, 45_000, 30_000, 55_000, 10_000], true);
+    expect(saved).toMatchObject({ bytes: expect.any(ArrayBuffer) });
+    expect(arm.terminated).toBe(false);
+  });
+
+  test('a save that goes silent past the window still fails', async () => {
+    const { arm, saved } = await slowSave([20_000, 45_000, 30_000, 55_000, 10_000], false);
+    expect(saved).toBeInstanceOf(Error);
+    expect((saved as Error).message).toContain('did not answer save');
+    expect(arm.terminated).toBe(true);
+  });
+});

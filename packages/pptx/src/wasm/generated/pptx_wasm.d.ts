@@ -67,7 +67,6 @@ export class PptxDocument {
     moveShapeJson(args: string): string;
     moveShapeProfiledJson(args: string): string;
     moveSlideJson(args: string): string;
-    static openCollaborative(bytes: Uint8Array, client_id: number): PptxDocument;
     /**
      * `source` is the file the update was seeded from; when it matches the
      * recorded fingerprint the session keeps its part bytes and can save, and
@@ -76,6 +75,7 @@ export class PptxDocument {
      * fails — joining a room must not depend on carrying the right file.
      */
     static openCollaborativeFromUpdate(update: Uint8Array, client_id: number, source?: Uint8Array | null): PptxDocument;
+    static openCollaborative(bytes: Uint8Array, client_id: number): PptxDocument;
     static openPeerDeckJson(source: Uint8Array, identity_json: string, initial_update?: Uint8Array | null): PptxDocument;
     static openReplayBaseline(source: Uint8Array, client_id?: number | null, initial_update?: Uint8Array | null): PptxDocument;
     peerHydrationJson(fonts_json: string): string;
@@ -115,6 +115,7 @@ export class PptxDocument {
     setShapeFillJson(args: string): string;
     setShapeRectJson(args: string): string;
     setShapeStrokeJson(args: string): string;
+    setSlideLayoutJson(args: string): string;
     setSlideNotesJson(args: string): string;
     setStoryParagraphsJson(args: string): string;
     setUndoCaptureMode(mode: string): void;
@@ -155,6 +156,7 @@ export class PptxRenderer {
     constructor();
     registerFallbackFont(family: string, bold: boolean, italic: boolean, bytes: Uint8Array): number;
     registerFont(family: string, bold: boolean, italic: boolean, bytes: Uint8Array): number;
+    saveBytes(document: PptxDocument): Uint8Array;
     setActiveSlide(document: PptxDocument, id: string, key: string): boolean;
     slideLayoutKey(document: PptxDocument, slide_index: number): string;
     snapshotWithLayoutKeysJson(document: PptxDocument): string;
@@ -280,6 +282,7 @@ export interface InitOutput {
     readonly pptxdocument_setShapeFillJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly pptxdocument_setShapeRectJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly pptxdocument_setShapeStrokeJson: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly pptxdocument_setSlideLayoutJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly pptxdocument_setSlideNotesJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly pptxdocument_setStoryParagraphsJson: (a: number, b: number, c: number) => [number, number, number, number];
     readonly pptxdocument_setUndoCaptureMode: (a: number, b: number, c: number) => [number, number];
@@ -302,6 +305,7 @@ export interface InitOutput {
     readonly pptxrenderer_new: () => number;
     readonly pptxrenderer_registerFallbackFont: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
     readonly pptxrenderer_registerFont: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
+    readonly pptxrenderer_saveBytes: (a: number, b: number) => [number, number, number, number];
     readonly pptxrenderer_setActiveSlide: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
     readonly pptxrenderer_slideLayoutKey: (a: number, b: number, c: number) => [number, number, number, number];
     readonly pptxrenderer_snapshotWithLayoutKeysJson: (a: number, b: number) => [number, number, number, number];

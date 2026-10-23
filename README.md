@@ -27,7 +27,7 @@ This fork maintains the editor and engine changes used by [Field Station](https:
 
 - **Agent editing with human review.** Review attributed agent edits through
   tracked changes, inline diffs, and before-and-after previews. Accept or
-  reject changes directly in the editor.
+  reject DOCX proposals in the optional proposal sidebar.
 
 - **Real-time collaboration.** People and agents edit the same file together,
   with live cursors and selections. Concurrent changes merge automatically,
@@ -81,27 +81,24 @@ VSDX packages build from this repository; see the [VSDX guide](https://docs.bett
 
 ### Agent tools
 
-[`@betteroffice/agents`](packages/agents) lets agents search, read, edit and preview DOCX, XLSX
-and PPTX files through a TypeScript SDK or the `betteroffice-mcp` server.
+| package | registry | what it does |
+|---|---|---|
+| [`@betteroffice/agents`](https://www.npmjs.com/package/@betteroffice/agents) | npm | TypeScript SDK and `betteroffice-mcp` server for agents to search, read, edit and preview DOCX, XLSX and PPTX files |
+
+### Fonts and localization
+
+| package | registry | what it does |
+|---|---|---|
+| [`@betteroffice/fonts`](https://www.npmjs.com/package/@betteroffice/fonts) | npm | metric-compatible substitutes for common Office fonts, plus Hebrew and Arabic coverage |
+| [`@betteroffice/fonts-cjk`](https://www.npmjs.com/package/@betteroffice/fonts-cjk) | npm | optional Chinese, Japanese and Korean faces |
+| [`@betteroffice/docx-i18n`](https://www.npmjs.com/package/@betteroffice/docx-i18n) | npm | UI translations for the React DOCX editor |
+| [`@betteroffice/xlsx-i18n`](https://www.npmjs.com/package/@betteroffice/xlsx-i18n) | npm | UI translations for the React XLSX editor |
+| [`@betteroffice/pptx-i18n`](https://www.npmjs.com/package/@betteroffice/pptx-i18n) | npm | UI translations for the React PPTX editor |
 
 What to install for which language, with a first example each:
 [npm](https://docs.betteroffice.dev/docs/javascript),
 [crates.io](https://docs.betteroffice.dev/docs/rust),
 [PyPI](https://docs.betteroffice.dev/docs/python).
-
-## Evals
-
-`gpt-6-luna` via `codex exec`, one run per task, on the [format eval suite](eval/README.md): 10 DOCX, 10 XLSX and 10 PPTX edits. A task passes only if the edit is correct and the rest of the file is untouched.
-
-| | Generic file tools | BetterOffice MCP |
-|---|---|---|
-| DOCX | 6/10 | **10/10** |
-| XLSX | 0/10 | **10/10** |
-| PPTX | 8/10 | **10/10** |
-
-Generic: shell and Python with python-docx, openpyxl and python-pptx, no network. BetterOffice: only the `@betteroffice/agents` MCP server.
-
-[Per-task results and methodology](https://evals.betteroffice.dev).
 
 <!-- BEGIN GENERATED VISUAL FIDELITY -->
 ## Benchmarks
@@ -148,6 +145,24 @@ For how scores, timings and coverage are measured, see the [benchmark methodolog
 
 <!-- END GENERATED VISUAL FIDELITY -->
 
+## Evals
+
+`gpt-6-luna` via `codex exec`, three runs per task, on the v3 [format eval suite](eval/README.md): 96 basic editing tasks on pinned public real-world documents. A run passes only if the requested edit is correct, the rest of the file is untouched, and the input is unchanged.
+
+Basic tier: 96 single edits, 32 per format.
+
+| | Generic file tools | BetterOffice MCP |
+|---|---|---|
+| DOCX | 41/96 | **64/96** |
+| XLSX | 39/96 | **75/96** |
+| PPTX | 81/96 | **89/96** |
+
+Basic: 228/288 for BetterOffice, 161/288 for generic file tools.
+
+Generic: shell and Python with python-docx, openpyxl and python-pptx, no network. BetterOffice: only the `@betteroffice/agents` MCP server.
+
+[Per-task results and methodology](https://evals.betteroffice.dev).
+
 ## Structure
 
 - `crates/` — the Rust engines
@@ -173,8 +188,6 @@ The [E2E guide](e2e/README.md) also covers pinned corpus scenarios,
 cross-SDK checks, and operation profiles.
 
 Use the [Office visual quality harness](scripts/office-quality/README.md) to export Word, PowerPoint, and Excel references, compare local renders, or refresh the fidelity scores with the manual action.
-
-
 
 ## Contributing
 

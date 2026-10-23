@@ -10,6 +10,7 @@ use std::cell::Cell as Flag;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use xlsx_model::progress::tick as progress;
 use xlsx_model::{
     Cell, CellProvider, CellRange, CellRef, CellValue, ColId, DefinedName, ErrorValue, RowId,
     SheetId, Table, Workbook,
@@ -17,7 +18,7 @@ use xlsx_model::{
 
 use crate::array::{Spill, charged_spill, evaluate_spill};
 use crate::eval::{EvalContext, EvaluationBudget, MAX_RECALCULATION_CELL_VISITS, evaluate};
-use crate::graph::DepGraph;
+use crate::graph::{DepGraph, ReaderIndex};
 
 #[cfg(feature = "test-counters")]
 thread_local! {
@@ -45,6 +46,9 @@ pub struct RecalcResult {
     pub changed: Vec<(SheetId, CellRef)>,
     pub cycle_cells: Vec<(SheetId, CellRef)>,
     pub limited_cells: Vec<(SheetId, CellRef)>,
+    /// the recalculation's shared budget ran out, so formulas it refused kept
+    /// their cached values or show `#NUM!` without one.
+    pub budget_exhausted: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -52,6 +56,11 @@ struct RecalcContext {
     now_serial: Option<f64>,
     rand_seed: Option<u32>,
 }
+
+/// registers a function that parsing, building a workbook's authority and
+/// recalculation call every few thousand units of work, so a host blocked on
+/// a long one can report that it is alive.
+pub use xlsx_model::progress::set_hook as set_progress_hook;
 
 /// normalized cell identity (avoids `$`-anchor `Hash`/`Eq` mismatches).
 type Key = (SheetId, RowId, ColId);
@@ -144,7 +153,9 @@ pub fn rebuild_and_recalc_all_with_seed(
         rand_seed,
     };
     let result = run_recalc(wb, &graph, recompute, context, None);
+    xlsx_model::progress::pulse();
     graph.refresh_spills(wb);
+    xlsx_model::progress::pulse();
     (graph, result)
 }
 
@@ -168,17 +179,61 @@ fn collect_recompute(graph: &DepGraph, seeds: &[(SheetId, CellRef)]) -> HashSet<
     }
 
     let mut expanded: HashSet<Key> = HashSet::new();
+    let mut readers = Readers::new(graph);
+    let mut found = Vec::new();
     while let Some(k) = worklist.pop() {
         if !expanded.insert(k) {
             continue;
         }
-        for (ds, dc) in graph.dependents_of(k.0, cell_of(k)) {
+        progress();
+        readers.dependents_of(k, &mut found);
+        for (ds, dc) in found.drain(..) {
             let dk = key(ds, dc);
             recompute.insert(dk);
             worklist.push(dk);
         }
     }
     recompute
+}
+
+/// lookups a walk makes into one sheet by scanning its edges before it
+/// indexes that sheet.
+const SCANNED_LOOKUPS: usize = 16;
+
+/// the readers of a cell for a walk through the graph: a scan per lookup for
+/// short walks, and one [`ReaderIndex`] per sheet the walk keeps returning to,
+/// so a chain of `n` formulas costs `O(n + edges)` rather than `O(n * edges)`.
+struct Readers<'g> {
+    graph: &'g DepGraph,
+    sheets: HashMap<SheetId, SheetReaders<'g>>,
+}
+
+enum SheetReaders<'g> {
+    Scanned(usize),
+    Indexed(ReaderIndex<'g>),
+}
+
+impl<'g> Readers<'g> {
+    fn new(graph: &'g DepGraph) -> Self {
+        Self {
+            graph,
+            sheets: HashMap::new(),
+        }
+    }
+
+    fn dependents_of(&mut self, k: Key, out: &mut Vec<(SheetId, CellRef)>) {
+        let readers = self.sheets.entry(k.0).or_insert(SheetReaders::Scanned(0));
+        if let SheetReaders::Scanned(lookups) = readers {
+            *lookups += 1;
+            if *lookups > SCANNED_LOOKUPS {
+                *readers = SheetReaders::Indexed(self.graph.reader_index(k.0));
+            }
+        }
+        match readers {
+            SheetReaders::Indexed(index) => index.dependents_of(cell_of(k), out),
+            SheetReaders::Scanned(_) => out.extend(self.graph.dependents_of(k.0, cell_of(k))),
+        }
+    }
 }
 
 /// a spilled rectangle that grows or shrinks uncovers cells whose readers were
@@ -226,6 +281,7 @@ fn run_recalc(
         }
     }
 
+    let budget_exhausted = pass.budget.refused();
     let Pass {
         mut changed,
         mut cycle_cells,
@@ -240,6 +296,7 @@ fn run_recalc(
         changed,
         cycle_cells,
         limited_cells,
+        budget_exhausted,
     }
 }
 
@@ -248,11 +305,15 @@ fn dependents_closure(graph: &DepGraph, seeds: &[(SheetId, CellRef)]) -> HashSet
     let mut found: HashSet<Key> = HashSet::new();
     let mut expanded: HashSet<Key> = HashSet::new();
     let mut worklist: Vec<Key> = seeds.iter().map(|&(s, c)| key(s, c)).collect();
+    let mut readers = Readers::new(graph);
+    let mut dependents = Vec::new();
     while let Some(node) = worklist.pop() {
         if !expanded.insert(node) {
             continue;
         }
-        for (sheet, cell) in graph.dependents_of(node.0, cell_of(node)) {
+        progress();
+        readers.dependents_of(node, &mut dependents);
+        for (sheet, cell) in dependents.drain(..) {
             let dependent = key(sheet, cell);
             if found.insert(dependent) {
                 worklist.push(dependent);
@@ -305,6 +366,7 @@ impl Pass<'_> {
     fn evaluate(&mut self, wb: &mut Workbook, u: Key) {
         #[cfg(test)]
         FORMULA_EVALUATIONS.with(|count| count.set(count.get() + 1));
+        progress();
         let (value, limited) = eval_node(wb, u, self.context, Rc::clone(&self.budget), self.graph);
         self.write(wb, u, value, limited);
     }
@@ -339,6 +401,7 @@ impl Pass<'_> {
                 };
                 #[cfg(test)]
                 FORMULA_EVALUATIONS.with(|count| count.set(count.get() + 1));
+                progress();
                 let (value, limited) = eval_node_with(
                     &log,
                     wb,
@@ -616,8 +679,16 @@ fn eval_node_with(
     if (refused || unsupported) && !matches!(wb.value_cow(u.0, cell).as_ref(), CellValue::Empty) {
         return (None, ctx.exhausted());
     }
-    if refused && authored.is_some() {
-        return (Some(NodeValue::Refused), ctx.exhausted());
+    // a refusal is no error value a wrapper may answer, so what `IFERROR` or
+    // `ISERROR` made of it never stands in for the result
+    if refused {
+        let refused = match authored {
+            Some(_) => NodeValue::Refused,
+            None => NodeValue::Scalar(CellValue::Error {
+                value: ErrorValue::Num,
+            }),
+        };
+        return (Some(refused), ctx.exhausted());
     }
     // a rectangle an engine gap reshaped would retire cells the real result
     // still covers, so report the gap over the recorded rectangle instead.
@@ -2423,61 +2494,250 @@ mod tests {
         assert_eq!(result.limited_cells, vec![(SheetId(1), a1("A1"))]);
     }
 
-    #[test]
-    fn handled_budget_error_updates_the_cached_value() {
+    /// a far corner cell gives `Data!A1:XFD1048576` the extent the
+    /// per-formula cap refuses; formulas go on the second sheet.
+    fn over_the_formula_cap() -> Workbook {
         let mut wb = Workbook::default();
         wb.sheets.push(Sheet::new("Data"));
         wb.sheets.push(Sheet::new("Formula"));
-        // a cell in the far corner gives Data the extent the guard is for
-        wb.sheet_mut(SheetId(0)).unwrap().set_cell(
-            a1("XFD1048576"),
-            Cell {
-                value: num(1.0),
-                formula: None,
-                style: None,
-            },
-        );
-        put_formula(
-            &mut wb,
-            SheetId(1),
-            "A1",
+        put_num(&mut wb, SheetId(0), "XFD1048576", 1.0);
+        wb
+    }
+
+    /// an error handler over a formula's refused work answers nothing: the
+    /// cell keeps its cached value, or shows `#NUM!` without one.
+    #[test]
+    fn error_handlers_do_not_answer_a_formula_over_its_cap() {
+        let refused = CellValue::Error {
+            value: ErrorValue::Num,
+        };
+        let s = SheetId(1);
+        for formula in [
             "IFERROR(SUM(Data!A1:XFD1048576),42)",
-        );
+            "IFERROR(SUM(Data!A1:XFD1048576),#NUM!)",
+            "ISERROR(SUM(Data!A1:XFD1048576))",
+            "ISNUMBER(SUM(Data!A1:XFD1048576))",
+            "COUNT(1,SUM(Data!A1:XFD1048576))",
+        ] {
+            let mut wb = over_the_formula_cap();
+            put_cached_formula(&mut wb, s, "A1", formula, num(123.0));
+            put_formula(&mut wb, s, "A2", formula);
+            let (_, result) = rebuild_and_recalc_all(&mut wb, None);
+            assert_eq!(value(&wb, s, "A1"), num(123.0), "{formula}");
+            assert_eq!(value(&wb, s, "A2"), refused, "{formula}");
+            assert_eq!(result.limited_cells.len(), 2, "{formula}");
+            for at in ["A1", "A2"] {
+                assert!(result.limited_cells.contains(&(s, a1(at))), "{formula}");
+            }
+        }
+    }
+
+    /// a lookup that runs out of its formula's budget before the match keeps
+    /// the cached match under `IFERROR` instead of taking the fallback.
+    #[test]
+    fn a_lookup_over_its_cap_keeps_its_cached_match_under_iferror() {
+        let (mut wb, s) = one_sheet();
+        put_num(&mut wb, s, "A600000", 600_000.0);
+        put_num(&mut wb, s, "C600000", 1.0);
+        put_num(&mut wb, s, "D600000", 42.0);
+        let formula = "IFERROR(_xlfn.XLOOKUP(1,OFFSET(C1,0,0,SUM(A:A)),OFFSET(D1,0,0,A600000)),0)";
+        put_cached_formula(&mut wb, s, "B1", formula, num(42.0));
+        put_formula(&mut wb, s, "B2", formula);
         let (_, result) = rebuild_and_recalc_all(&mut wb, None);
-        assert_eq!(value(&wb, SheetId(1), "A1"), num(42.0));
+        assert_eq!(value(&wb, s, "B1"), num(42.0));
+        assert_eq!(
+            value(&wb, s, "B2"),
+            CellValue::Error {
+                value: ErrorValue::Num
+            }
+        );
+        assert!(result.limited_cells.contains(&(s, a1("B1"))));
+        assert!(result.limited_cells.contains(&(s, a1("B2"))));
+    }
+
+    /// an array formula whose refused work an error handler would answer
+    /// keeps its cached anchor and rectangle.
+    #[test]
+    fn a_refused_array_keeps_its_cache_under_an_error_handler() {
+        let s = SheetId(1);
+        for formula in [
+            "IFERROR(SUM(Data!A1:XFD1048576),0)",
+            "IFERROR(Data!A1:A10*SUM(Data!A1:XFD1048576),0)",
+            "ISERROR(SUM(Data!A1:XFD1048576))",
+        ] {
+            let mut wb = over_the_formula_cap();
+            put_cached_formula(&mut wb, s, "C20", formula, num(5.0));
+            put_num(&mut wb, s, "D25", 7.0);
+            wb.sheet_mut(s)
+                .unwrap()
+                .set_array_formula(a1("C20"), CellRange::parse_a1("C20:D29").unwrap());
+            let (_, result) = rebuild_and_recalc_all(&mut wb, None);
+            assert_eq!(value(&wb, s, "C20"), num(5.0), "{formula}");
+            assert_eq!(value(&wb, s, "D25"), num(7.0), "{formula}");
+            assert_eq!(value(&wb, s, "D29"), CellValue::Empty, "{formula}");
+            assert!(result.limited_cells.contains(&(s, a1("C20"))), "{formula}");
+        }
+    }
+
+    /// once the recalculation's budget is spent, error handlers over the
+    /// refused work keep the cached values and uncached cells show `#NUM!`,
+    /// while a formula that charges nothing still computes.
+    #[test]
+    fn a_spent_recalculation_keeps_cached_values_under_error_handlers() {
+        let (mut wb, s) = one_sheet();
+        spend_the_budget(&mut wb, s);
+        for row in 1..=3 {
+            put_num(&mut wb, s, &format!("E{row}"), f64::from(row));
+        }
+        let cached = [
+            ("B20", "IFERROR(SUMPRODUCT(E1:E3,E1:E3),0)", num(14.0)),
+            (
+                "B21",
+                "ISERROR(SUMPRODUCT(E1:E3))",
+                CellValue::Bool { value: false },
+            ),
+            (
+                "B22",
+                "ISNUMBER(SUMPRODUCT(E1:E3))",
+                CellValue::Bool { value: true },
+            ),
+            ("B23", "ISERROR(B20)", CellValue::Bool { value: false }),
+            ("B24", "IF(ISERROR(SUM(E1:E3)),-1,SUM(E1:E3))", num(6.0)),
+        ];
+        for (at, formula, cache) in &cached {
+            put_cached_formula(&mut wb, s, at, formula, cache.clone());
+        }
+        put_formula(&mut wb, s, "B30", "IFERROR(SUMPRODUCT(E1:E3),0)");
+        put_formula(&mut wb, s, "B31", "ISERROR(SUMPRODUCT(E1:E3))");
+        put_formula(&mut wb, s, "B32", "1+2");
+        let (_, result) = rebuild_and_recalc_all(&mut wb, None);
+        for (at, formula, cache) in &cached {
+            assert_eq!(value(&wb, s, at), *cache, "{formula}");
+            assert!(result.limited_cells.contains(&(s, a1(at))), "{formula}");
+        }
+        let refused = CellValue::Error {
+            value: ErrorValue::Num,
+        };
+        assert_eq!(value(&wb, s, "B30"), refused);
+        assert_eq!(value(&wb, s, "B31"), refused);
+        assert_eq!(value(&wb, s, "B32"), num(3.0));
+        assert!(!result.limited_cells.contains(&(s, a1("B32"))));
+    }
+
+    /// the result says when the recalculation's own budget ran out, which a
+    /// single formula over its cap does not.
+    #[test]
+    fn a_spent_recalculation_reports_its_budget_exhausted() {
+        let (mut wb, s) = one_sheet();
+        put_formula(&mut wb, s, "B1", "1+2");
+        let (_, result) = rebuild_and_recalc_all(&mut wb, None);
+        assert!(!result.budget_exhausted);
+
+        let mut wb = over_the_formula_cap();
+        put_formula(&mut wb, SheetId(1), "A1", "SUM(Data!A1:XFD1048576)");
+        let (_, result) = rebuild_and_recalc_all(&mut wb, None);
         assert_eq!(result.limited_cells, vec![(SheetId(1), a1("A1"))]);
+        assert!(!result.budget_exhausted);
+
+        let (mut wb, s) = one_sheet();
+        spend_the_budget(&mut wb, s);
+        put_cached_formula(&mut wb, s, "B1", "SUM(A1:A11)", num(5.0));
+        let (mut graph, result) = rebuild_and_recalc_all(&mut wb, None);
+        assert!(result.budget_exhausted);
+        assert_eq!(value(&wb, s, "B1"), num(5.0));
+
+        put_num(&mut wb, s, "C1", 1.0);
+        let result = recalc_after(&mut wb, &mut graph, &[(s, a1("C1"))], None);
+        assert!(!result.budget_exhausted);
+    }
+
+    /// an inner handler that answers an error after work was spent there
+    /// leaves a later refusal standing, so the outer handler cannot answer it.
+    #[test]
+    fn an_outer_handler_keeps_the_cache_after_an_inner_one_answers() {
+        let inputs = |spent: bool| {
+            let (mut wb, s) = one_sheet();
+            if spent {
+                spend_the_budget(&mut wb, s);
+            }
+            put_num(&mut wb, s, "A600000", 1.0);
+            put_num(&mut wb, s, "C1", 1.0);
+            put_num(&mut wb, s, "D1", 42.0);
+            (wb, s)
+        };
+        let lookup =
+            "IFERROR(IFERROR(_xlfn.XLOOKUP(NA(),OFFSET(C1,0,0,SUM(A:A)),D1),42)+SUM(A:A),0)";
+        // reads `A:A` twice, which is over the formula's cap
+        let twice = "IFERROR(IFERROR(INDEX(OFFSET(C1,0,0,SUM(A:A)),1)+NA(),42)+SUM(A:A),0)";
+        let refused = CellValue::Error {
+            value: ErrorValue::Num,
+        };
+        for (formula, spent) in [(lookup, true), (twice, false), (twice, true)] {
+            let (mut wb, s) = inputs(spent);
+            put_cached_formula(&mut wb, s, "E1", formula, num(43.0));
+            put_formula(&mut wb, s, "E2", formula);
+            let (_, result) = rebuild_and_recalc_all(&mut wb, None);
+            assert_eq!(value(&wb, s, "E1"), num(43.0), "{formula} {spent}");
+            assert_eq!(value(&wb, s, "E2"), refused, "{formula} {spent}");
+            assert!(result.limited_cells.contains(&(s, a1("E1"))), "{formula}");
+        }
+        let (mut wb, s) = inputs(false);
+        put_formula(&mut wb, s, "E1", lookup);
+        let (_, result) = rebuild_and_recalc_all(&mut wb, None);
+        assert_eq!(value(&wb, s, "E1"), num(43.0));
+        assert!(result.limited_cells.is_empty());
     }
 
     #[test]
-    fn handled_budget_error_can_produce_an_explicit_num_error() {
-        let mut wb = Workbook::default();
-        wb.sheets.push(Sheet::new("Data"));
-        wb.sheets.push(Sheet::new("Formula"));
-        // a cell in the far corner gives Data the extent the guard is for
-        wb.sheet_mut(SheetId(0)).unwrap().set_cell(
-            a1("XFD1048576"),
-            Cell {
-                value: num(1.0),
-                formula: None,
-                style: None,
-            },
-        );
-        wb.sheet_mut(SheetId(1)).unwrap().set_cell(
-            a1("A1"),
-            Cell {
-                value: num(123.0),
-                formula: Some("IFERROR(SUM(Data!A1:XFD1048576),#NUM!)".into()),
-                style: None,
-            },
-        );
-        let (_, result) = rebuild_and_recalc_all(&mut wb, None);
-        assert_eq!(
-            value(&wb, SheetId(1), "A1"),
-            CellValue::Error {
-                value: xlsx_model::ErrorValue::Num
-            }
-        );
-        assert_eq!(result.limited_cells, vec![(SheetId(1), a1("A1"))]);
+    fn a_long_recalculation_reports_progress() {
+        thread_local! {
+            static CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        fn count() {
+            CALLS.with(|calls| calls.set(calls.get() + 1));
+        }
+        let (mut wb, s) = one_sheet();
+        put_num(&mut wb, s, "A1", 0.0);
+        for row in 1..20_000u32 {
+            let prev = CellRef::new(row - 1, 0).to_a1();
+            put_formula(
+                &mut wb,
+                s,
+                &CellRef::new(row, 0).to_a1(),
+                &format!("{prev}+1"),
+            );
+        }
+        let (mut graph, _) = rebuild_and_recalc_all(&mut wb, None);
+        set_progress_hook(Some(count));
+        put_num(&mut wb, s, "A1", 1.0);
+        recalc_after(&mut wb, &mut graph, &[(s, a1("A1"))], None);
+        set_progress_hook(None);
+        assert!(CALLS.with(|calls| calls.get()) >= 4);
+    }
+
+    #[test]
+    fn progress_follows_the_cells_a_recalculation_reads() {
+        thread_local! {
+            static CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        fn count() {
+            CALLS.with(|calls| calls.set(calls.get() + 1));
+        }
+        const ROWS: u32 = 100_000;
+        let (mut wb, s) = one_sheet();
+        for row in 0..ROWS {
+            put_num(&mut wb, s, &CellRef::new(row, 0).to_a1(), f64::from(row));
+        }
+        for (at, last) in [("B1", ROWS), ("B2", ROWS - 1), ("B3", ROWS - 2)] {
+            put_formula(&mut wb, s, at, &format!("SUM(A1:A{last})"));
+        }
+        let (mut graph, _) = rebuild_and_recalc_all(&mut wb, None);
+        set_progress_hook(Some(count));
+        put_num(&mut wb, s, "A1", 1.0);
+        recalc_after(&mut wb, &mut graph, &[(s, a1("A1"))], None);
+        set_progress_hook(None);
+        let read = 3 * (ROWS - 1);
+        assert!(CALLS.with(|calls| calls.get()) >= read / xlsx_model::progress::EVERY);
     }
 
     #[test]

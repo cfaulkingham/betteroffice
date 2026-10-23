@@ -4,7 +4,7 @@ use xlsx_model::styles::{
     Alignment, Border, BorderEdge, BorderStyle, Color, Fill, Font, HAlign, PatternType, Protection,
     Theme, VAlign, Xf,
 };
-use xlsx_model::{AnchorCell, ChartRefKind};
+use xlsx_model::{AnchorCell, AutoFilter, ChartRefKind, ConditionalFormatRule, DifferentialFormat};
 
 use crate::snapshot::growth::Growth;
 use crate::snapshot::header::{SnapshotHeader, SnapshotMode};
@@ -757,6 +757,33 @@ impl Codec for SheetId {
     }
 }
 
+pub(crate) type ConditionalFormatSnapshot =
+    (Vec<DifferentialFormat>, Vec<Vec<ConditionalFormatting>>);
+
+struct_codec!(DifferentialFormat {
+    font_color,
+    bold,
+    fill
+});
+struct_codec!(ConditionalFormatRule {
+    id,
+    rule_type,
+    operator,
+    formulas,
+    priority,
+    dxf_id,
+    format,
+    raw_xml
+});
+struct_codec!(ConditionalFormatting { sqref, rules });
+struct_codec!(AutoFilter {
+    range,
+    raw_xml,
+    source_count,
+    filter_columns,
+    has_sort_state
+});
+
 struct_codec!(CellRef {
     row,
     col,
@@ -1284,7 +1311,13 @@ impl Codec for ChartAnchor {
     }
 }
 
-const BASE_SECTIONS: usize = 17;
+const BASE_SECTIONS: usize = 19;
+const AUTO_FILTER_SECTION: usize = 19;
+const AUTO_FILTER_MANIFEST_TAG: u8 = 24;
+const AUTO_FILTER_TAG: usize = 25;
+const CONDITIONAL_FORMATS_SECTION: usize = 18;
+const CONDITIONAL_FORMATS_MANIFEST_TAG: u8 = 22;
+const CONDITIONAL_FORMATS_TAG: usize = 23;
 /// The sections a manifest tagged with section 0 counts: those before row
 /// defaults.
 const RELEASED_BASE_SECTIONS: usize = 16;
@@ -1303,7 +1336,9 @@ const BORDER_RECORD: usize = 19;
 
 fn base_section(tag: usize) -> usize {
     match tag {
-        20 => 0,
+        20 | 22 | 24 => 0,
+        AUTO_FILTER_TAG => AUTO_FILTER_SECTION,
+        CONDITIONAL_FORMATS_TAG => CONDITIONAL_FORMATS_SECTION,
         21 => ROW_STYLE_SECTION,
         XF_V2_TAG => XF_SECTION,
         FILL_RECORD => 11,
@@ -1314,7 +1349,17 @@ fn base_section(tag: usize) -> usize {
 }
 
 fn manifest_tag(base: &WorkbookBase) -> u8 {
-    if base.row_styles.is_empty() {
+    if base.auto_filters.iter().any(Option::is_some) {
+        return AUTO_FILTER_MANIFEST_TAG;
+    }
+    if !base.styles.dxfs.is_empty()
+        || base
+            .conditional_formats
+            .iter()
+            .any(|formats| !formats.is_empty())
+    {
+        CONDITIONAL_FORMATS_MANIFEST_TAG
+    } else if base.row_styles.is_empty() {
         0
     } else {
         ROW_STYLE_MANIFEST_TAG
@@ -1322,8 +1367,12 @@ fn manifest_tag(base: &WorkbookBase) -> u8 {
 }
 
 fn manifest_counts(tag: usize) -> usize {
-    if tag == usize::from(ROW_STYLE_MANIFEST_TAG) {
+    if tag == usize::from(AUTO_FILTER_MANIFEST_TAG) {
         BASE_SECTIONS
+    } else if tag == usize::from(CONDITIONAL_FORMATS_MANIFEST_TAG) {
+        CONDITIONAL_FORMATS_SECTION
+    } else if tag == usize::from(ROW_STYLE_MANIFEST_TAG) {
+        ROW_STYLE_SECTION
     } else {
         RELEASED_BASE_SECTIONS
     }
@@ -1361,6 +1410,8 @@ fn base_counts(base: &WorkbookBase) -> [usize; BASE_SECTIONS] {
         col_styles,
         row_styles,
         hyperlinks,
+        conditional_formats: _,
+        auto_filters: _,
         charts,
         hidden_dimensions,
         shared_strings,
@@ -1385,6 +1436,14 @@ fn base_counts(base: &WorkbookBase) -> [usize; BASE_SECTIONS] {
         styles.indexed_colors.len(),
         tables.len(),
         row_styles.len(),
+        usize::from(
+            !base.styles.dxfs.is_empty()
+                || base
+                    .conditional_formats
+                    .iter()
+                    .any(|formats| !formats.is_empty()),
+        ),
+        usize::from(base.auto_filters.iter().any(Option::is_some)),
     ]
 }
 
@@ -1400,6 +1459,8 @@ fn write_manifest(base: &WorkbookBase, w: &mut Writer) {
         col_styles: _,
         row_styles: _,
         hyperlinks: _,
+        conditional_formats: _,
+        auto_filters: _,
         charts: _,
         hidden_dimensions: _,
         shared_strings: _,
@@ -1417,6 +1478,7 @@ fn write_manifest(base: &WorkbookBase, w: &mut Writer) {
 
 #[derive(Clone, Default)]
 struct BaseCursor {
+    counts: Option<[usize; BASE_SECTIONS]>,
     section: usize,
     index: usize,
     fingerprint_key: Option<i64>,
@@ -1434,7 +1496,8 @@ impl BaseCursor {
     }
 
     fn next(&mut self, base: &WorkbookBase) -> Option<Vec<u8>> {
-        self.normalize(&base_counts(base));
+        let counts = *self.counts.get_or_insert_with(|| base_counts(base));
+        self.normalize(&counts);
         if self.section > BASE_SECTIONS {
             return None;
         }
@@ -1449,6 +1512,8 @@ impl BaseCursor {
             col_styles,
             row_styles,
             hyperlinks,
+            conditional_formats,
+            auto_filters,
             charts,
             hidden_dimensions,
             shared_strings,
@@ -1460,6 +1525,8 @@ impl BaseCursor {
         w.u8(match self.section {
             0 => usize::from(manifest_tag(base)),
             ROW_STYLE_SECTION => usize::from(ROW_STYLE_TAG),
+            CONDITIONAL_FORMATS_SECTION => CONDITIONAL_FORMATS_TAG,
+            AUTO_FILTER_SECTION => AUTO_FILTER_TAG,
             11 => FILL_RECORD,
             12 => BORDER_RECORD,
             XF_SECTION if !released => XF_V2_TAG,
@@ -1497,6 +1564,11 @@ impl BaseCursor {
             15 => styles.indexed_colors[index].write(&mut w),
             16 => tables[index].write(&mut w),
             17 => row_styles[index].write(&mut w),
+            AUTO_FILTER_SECTION => auto_filters.write(&mut w),
+            CONDITIONAL_FORMATS_SECTION => {
+                styles.dxfs.write(&mut w);
+                conditional_formats.write(&mut w);
+            }
             _ => unreachable!(),
         }
         if self.section == 0 {
@@ -1763,12 +1835,14 @@ enum BaseRecord {
     NumberFormat((u16, String)),
     Color(String),
     Table(Table),
+    ConditionalFormats(ConditionalFormatSnapshot),
+    AutoFilters(Vec<Option<AutoFilter>>),
 }
 
 impl BaseRecord {
     fn preflight_cost(tag: usize, r: &mut DecodePreflight<'_>) -> SnapshotResult<usize> {
         match tag {
-            0 | 20 => {
+            0 | 20 | 22 | 24 => {
                 r.value::<u64>()?;
                 r.value::<DateSystem>()?;
                 r.value::<String>()?;
@@ -1797,6 +1871,8 @@ impl BaseRecord {
             21 => r.value::<BTreeMap<u32, u32>>()?,
             FILL_RECORD => r.value::<Fill>()?,
             BORDER_RECORD => r.value::<Border>()?,
+            CONDITIONAL_FORMATS_TAG => r.value::<ConditionalFormatSnapshot>()?,
+            AUTO_FILTER_TAG => r.value::<Vec<Option<AutoFilter>>>()?,
             _ => return Err(SnapshotError::new("invalid authority base section")),
         }
         Ok(r.cost)
@@ -1805,7 +1881,7 @@ impl BaseRecord {
     #[cfg(test)]
     fn decode_cost(tag: usize) -> SnapshotResult<usize> {
         Ok(match tag {
-            0 | 20 => std::mem::size_of::<BaseManifest>()
+            0 | 20 | 22 | 24 => std::mem::size_of::<BaseManifest>()
                 .max(u64::decode_cost())
                 .max(DateSystem::decode_cost())
                 .max(String::decode_cost())
@@ -1830,13 +1906,15 @@ impl BaseRecord {
             21 => <BTreeMap<u32, u32>>::decode_cost(),
             FILL_RECORD => Fill::decode_cost(),
             BORDER_RECORD => Border::decode_cost(),
+            CONDITIONAL_FORMATS_TAG => ConditionalFormatSnapshot::decode_cost(),
+            AUTO_FILTER_TAG => <Vec<Option<AutoFilter>>>::decode_cost(),
             _ => return Err(SnapshotError::new("invalid authority base section")),
         })
     }
 
     fn read(r: &mut BoundedReader<'_>, tag: usize) -> SnapshotResult<Self> {
         Ok(match tag {
-            0 | 20 => {
+            0 | 20 | 22 | 24 => {
                 let start = r.position;
                 r.prepare::<u64>()?;
                 r.prepare::<DateSystem>()?;
@@ -1889,6 +1967,8 @@ impl BaseRecord {
             21 => Self::Rows(r.value()?),
             FILL_RECORD => Self::Fill(r.value()?),
             BORDER_RECORD => Self::Border(r.value()?),
+            CONDITIONAL_FORMATS_TAG => Self::ConditionalFormats(r.value()?),
+            AUTO_FILTER_TAG => Self::AutoFilters(r.value()?),
             _ => return Err(SnapshotError::new("invalid authority base section")),
         })
     }
@@ -1985,6 +2065,8 @@ impl BaseBuilder {
                     col_styles: Vec::new(),
                     row_styles: Vec::new(),
                     hyperlinks: Vec::new(),
+                    conditional_formats: Vec::new(),
+                    auto_filters: Vec::new(),
                     charts: Vec::new(),
                     hidden_dimensions: Vec::new(),
                     shared_strings: Vec::new(),
@@ -2016,6 +2098,11 @@ impl BaseBuilder {
                     BaseRecord::NumberFormat(value) => base.styles.num_fmts.push(value),
                     BaseRecord::Color(value) => base.styles.indexed_colors.push(value),
                     BaseRecord::Table(value) => base.tables.push(value),
+                    BaseRecord::AutoFilters(filters) => base.auto_filters = filters,
+                    BaseRecord::ConditionalFormats((dxfs, formats)) => {
+                        base.styles.dxfs = dxfs;
+                        base.conditional_formats = formats;
+                    }
                     BaseRecord::Fingerprints((key, value)) => {
                         if self
                             .cursor
@@ -2068,6 +2155,8 @@ impl BaseBuilder {
                 col_styles: Vec::new(),
                 row_styles: Vec::new(),
                 hyperlinks: Vec::new(),
+                conditional_formats: Vec::new(),
+                auto_filters: Vec::new(),
                 charts: Vec::new(),
                 hidden_dimensions: Vec::new(),
                 shared_strings: Vec::new(),
@@ -2117,6 +2206,11 @@ impl BaseBuilder {
                 21 => base.row_styles.push(Codec::read(&mut r)?),
                 FILL_RECORD => base.styles.fills.push(Codec::read(&mut r)?),
                 BORDER_RECORD => base.styles.borders.push(Codec::read(&mut r)?),
+                AUTO_FILTER_TAG => base.auto_filters = Codec::read(&mut r)?,
+                CONDITIONAL_FORMATS_TAG => {
+                    base.styles.dxfs = Codec::read(&mut r)?;
+                    base.conditional_formats = Codec::read(&mut r)?;
+                }
                 _ => return Err(SnapshotError::new("invalid authority base section")),
             }
             self.cursor.index += 1;
@@ -2645,8 +2739,7 @@ mod tests {
         for section in [11, 12] {
             let mut cursor = BaseCursor {
                 section,
-                index: 0,
-                fingerprint_key: None,
+                ..BaseCursor::default()
             };
             tags.push(cursor.next(&base).unwrap()[0]);
         }
@@ -3991,6 +4084,31 @@ mod tests {
     }
 
     #[test]
+    fn conditional_format_base_records_preserve_source_fallbacks() {
+        let mut model = model();
+        model.styles.dxfs.push(DifferentialFormat {
+            font_color: Some("#123456".into()),
+            bold: Some(false),
+            fill: Some("#abcdef".into()),
+        });
+        model.sheets[1].conditional_formats = serde_json::from_value(serde_json::json!([{
+            "sqref": "A1:A5", "rules": [{"id": "cf1", "type": "expression",
+                "operator": "greaterThan", "formulas": ["A1>0"], "priority": 1, "dxfId": 0,
+                "format": {"fontColor": "#123456", "bold": false, "fill": "#abcdef"},
+                "rawXml": "<cfRule/>"}]
+        }]))
+        .unwrap();
+        let base = WorkbookBase::from_model(&model).unwrap();
+        let records = base_records(&base);
+        assert_eq!(records[0][0], CONDITIONAL_FORMATS_MANIFEST_TAG);
+        for decoded in decoded_bases(&records) {
+            assert_eq!(decoded.styles.dxfs, base.styles.dxfs);
+            assert_eq!(decoded.conditional_formats, base.conditional_formats);
+            assert_eq!(base_records(&decoded), records);
+        }
+    }
+
+    #[test]
     fn base_records_without_row_defaults_keep_the_released_layout() {
         let base = WorkbookBase::from_model(&styled_defaults_model(BTreeMap::new())).unwrap();
         let records = base_records(&base);
@@ -4147,9 +4265,10 @@ mod ceiling_tests {
             sheets: vec![Sheet::new("Data")],
             ..WorkbookModel::default()
         };
-        let mut authority = WorkbookAuthority::from_source_with_projection(&model, None, &[], None)
-            .unwrap()
-            .0;
+        let mut authority =
+            WorkbookAuthority::from_source_with_projection(&model, None, &[], None, &[])
+                .unwrap()
+                .0;
         Arc::make_mut(&mut authority.base)
             .shared_strings
             .push("a".repeat(xlsx_parse::SNAPSHOT_RECORD_MAX_BYTES + 1));

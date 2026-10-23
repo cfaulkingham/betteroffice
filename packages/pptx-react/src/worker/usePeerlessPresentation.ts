@@ -1,7 +1,7 @@
-import { createPeerlessSession, presentationSharedInputs, PRESENTATION_COMMAND_ADMISSION } from '@betteroffice/pptx/peerless';
+import { createPptxWorkerSession, presentationSharedInputs, PRESENTATION_COMMAND_ADMISSION } from '@betteroffice/pptx/worker';
 import { sizeCanvasForSlide, PptxWorkerEditorDisposedError, PptxWorkerEditorFailedError } from '@betteroffice/pptx/editor';
 import type {
-  DeckSnapshot, PptxFontFace, PeerlessSession, PresentationCommandClient, PresentationCommandFrame, PresentationCommandAck,
+  DeckSnapshot, PptxFontFace, PptxWorkerSession, PresentationCommandClient, PresentationCommandFrame, PresentationCommandAck,
 } from '@betteroffice/pptx';
 import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { RefObject } from 'react';
@@ -16,7 +16,10 @@ import {
   type PeerlessConfirmedFrame, type PeerlessViewSnapshot, type PeerlessViewStore,
 } from './peerlessViewStore';
 
-export const peerlessSessionOpener = { open: createPeerlessSession };
+export const peerlessSessionOpener = { open: createPptxWorkerSession };
+export const peerlessViewStoreFactory = {
+  create: (...args: Parameters<typeof createPeerlessViewStore>) => createPeerlessViewStore(...args),
+};
 export const peerlessPainterFactories = {
   frame: createCommandFramePainter,
   echo: createLocalEchoPainter,
@@ -36,7 +39,7 @@ export interface PeerlessVisualSnapshot { view: PeerlessViewSnapshot; fit: Slide
 
 export interface PeerlessPresentation {
   readonly fileGeneration: object;
-  readonly session: PeerlessSession;
+  readonly session: PptxWorkerSession;
   readonly client: PresentationCommandClient;
   readonly store: PeerlessViewStore;
   readonly images: CommandFrameImages;
@@ -91,7 +94,7 @@ export function usePeerlessPresentation(
     if (!props.file || !canvas.current) return;
     const surface = canvas.current;
     let alive = true;
-    let session: PeerlessSession | undefined;
+    let session: PptxWorkerSession | undefined;
     let observedChanges = Boolean(callbacks.current.onChange);
     let base: PeerlessViewStore | undefined;
     let run: PeerlessPresentation | undefined;
@@ -150,6 +153,13 @@ export function usePeerlessPresentation(
     const report = (cause: unknown) => {
       if (!current()) return;
       fatal = cause instanceof PptxWorkerEditorFailedError ? cause : new PptxWorkerEditorFailedError(cause);
+      const event = changeEvent;
+      if (changeSeq !== undefined && event && modeClient && event.throughSeq >= changeSeq &&
+        event.throughSeq <= modeClient.state.throughSeq && event.version === modeClient.state.version) {
+        changeSeq = undefined;
+        changeEvent = undefined;
+        try { callbacks.current.onChange?.(event.snapshot); } catch {}
+      }
       cancelIdle?.(); cancelIdle = undefined;
       clearTimeout(checkpointTimer); checkpointTimer = undefined;
       framePainter?.freeze();
@@ -241,8 +251,10 @@ export function usePeerlessPresentation(
       if (!current() || !base || (base.getSnapshot().confirmed && !firstPainted) || cancelIdle || draining) return;
       cancelIdle = idle(() => {
         cancelIdle = undefined;
-        if (!current() || !base || (base.getSnapshot().confirmed && (!firstPainted || !paintedFrame ||
-          paintedFrame.coversThroughSeq < client.state.throughSeq))) return;
+        if (!current() || !base) return;
+        const view = base.getSnapshot();
+        if (view.confirmed && (!firstPainted || !paintedFrame ||
+          paintedView?.confirmed !== view.confirmed || view.presentedThroughSeq < client.state.throughSeq)) return;
         draining = true;
         void drain(client).catch(report).finally(() => {
           draining = false;
@@ -270,32 +282,33 @@ export function usePeerlessPresentation(
     async function drain(client: PresentationCommandClient): Promise<void> {
       if (!base || !current()) return;
       await whenPainted();
-      if (changeSeq !== undefined) {
-        changeSeq = undefined;
+      const pendingSeq = changeSeq;
+      if (pendingSeq !== undefined) {
         if (callbacks.current.onChange) {
           await base.fence();
           if (!current()) return;
           await whenPainted();
           const event = changeEvent;
           if (event) {
+            changeEvent = undefined;
+            if (changeSeq !== undefined && changeSeq <= event.throughSeq) changeSeq = undefined;
             if (event.throughSeq <= client.state.throughSeq && event.version === client.state.version) {
               try { callbacks.current.onChange?.(event.snapshot); } catch {}
             }
-            if (changeEvent === event) changeEvent = undefined;
-            if (changeSeq !== undefined && changeSeq <= event.throughSeq) changeSeq = undefined;
           } else {
           const reply = await client.read();
           if (!current()) return;
           await whenPainted();
+          let snapshot: DeckSnapshot | undefined;
           if (reply.result.ok) {
-            const snapshot: DeckSnapshot = client.access ? await client.access('snapshot') : { widthEmu: client.state.size.width,
+            snapshot = client.access ? await client.access('snapshot') : { widthEmu: client.state.size.width,
               heightEmu: client.state.size.height, slides: reply.result.slides };
             if (!current()) return;
-            try { callbacks.current.onChange?.(snapshot); } catch {}
           }
-          if (changeSeq !== undefined && changeSeq <= reply.throughSeq) changeSeq = undefined;
+          if (changeSeq !== undefined && changeSeq <= Math.max(pendingSeq, reply.throughSeq)) changeSeq = undefined;
+          if (snapshot) { try { callbacks.current.onChange?.(snapshot); } catch {} }
           }
-        }
+        } else changeSeq = undefined;
       }
       if (!current()) return;
       await whenPainted();
@@ -355,7 +368,7 @@ export function usePeerlessPresentation(
         if (!current()) return;
         checkpoint.version = client.state.version;
         checkpointUpdate = client.state.recoveryUpdate ? new Uint8Array(client.state.recoveryUpdate).slice() : undefined;
-        base = createPeerlessViewStore(client, {
+        base = peerlessViewStoreFactory.create(client, {
           checkpoint(pixels) {
             const restoreFrame = framePainter?.checkpoint(pixels);
             const restoreEcho = echoPainter?.checkpoint();
@@ -419,17 +432,17 @@ export function usePeerlessPresentation(
           },
           subscribePresentation: (listener) => subscribe(subscribePresentation, listener),
           subscribeEditState: (listener) => subscribe(subscribeEditState, listener),
-          dispatch: (intent) => {
+          dispatch: (intent, options) => {
             try {
               require();
               const admission = PRESENTATION_COMMAND_ADMISSION[intent.kind];
               if (admission === 'local-write' && (mode.current || !modeReady() || getSnapshot().editState.readOnly)) {
                 throw new Error('The editor is read-only');
               }
-              if (admission !== 'mode' && !selectionEnabled() && !['undo', 'redo', 'applyEdits', 'registerFont', 'invoke', 'setChangeObserver'].includes(intent.kind)) {
+              if (admission !== 'mode' && intent.kind !== 'collabPipe' && !selectionEnabled() && !['undo', 'redo', 'applyEdits', 'registerFont', 'invoke', 'setChangeObserver'].includes(intent.kind)) {
                 throw new Error('Slide input is unavailable');
               }
-              return dispatch(intent);
+              return dispatch(intent, options);
             } catch (error) { return Promise.reject(error); }
           },
           fence: async () => { require(); await fence(); require(); },

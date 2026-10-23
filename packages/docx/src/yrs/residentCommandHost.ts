@@ -15,6 +15,14 @@ import type {
   ResidentCommandInitReply,
 } from './residentCommandProtocol';
 
+const selectionDerivedEditStateFields = new Set([
+  'toolbar', 'effectiveFormatting', 'hyperlink', 'tableContext', 'currentRevisionId',
+]);
+
+function selectionIndependentEditState(state: DocxEditState): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(state).filter(([key]) => !selectionDerivedEditStateFields.has(key)));
+}
+
 export function createResidentCommandHost(options: ResidentCommandHostOptions): ResidentCommandHost {
   const { init, hooks, registry } = options;
   let version = init.version ?? 0;
@@ -25,7 +33,8 @@ export function createResidentCommandHost(options: ResidentCommandHostOptions): 
   let failure: unknown;
   let selection: DocxCommandSelection | null | undefined;
   let editState: DocxEditState | undefined;
-  const selections = new Map<number, DocxCommandSelection | null>();
+  let selectionOnly = false;
+  const selections = new Map<number, DocxCommandSelection | null>(structuredClone(init.recoveryState?.selections ?? []));
   const selectionLimit = Math.max(256, options.retainedOutcomes ?? 256);
   const shared = createCommandHost<
     DocxCommandPayload, DocxCommandSelection | null, DocxEditState, DocxCommandFramePayload
@@ -44,6 +53,8 @@ export function createResidentCommandHost(options: ResidentCommandHostOptions): 
         ...(command.afterSeq !== undefined && selections.has(command.afterSeq)
           ? { predecessorSelection: structuredClone(selections.get(command.afterSeq)!) } : {}),
       };
+      const selectionCommand = options.selectionAck && ['select', 'navigate', 'selectPoint', 'extendSelection', 'selectTableCells', 'navigateCell'].includes(command.kind);
+      const previousEditState = selectionCommand ? structuredClone(selectionIndependentEditState(hooks.editState())) : undefined;
       const preflight = await hooks.preflight(command, applyContext);
       const result = preflight.status === 'ready'
         ? await hooks.apply(preflight.prepared, applyContext) : preflight;
@@ -56,8 +67,12 @@ export function createResidentCommandHost(options: ResidentCommandHostOptions): 
         selections.set(command.seq, structuredClone(selection));
         if (selections.size > selectionLimit) selections.delete(selections.keys().next().value!);
       }
-      return { ...result, selection, editState: hooks.editState() };
+      const nextEditState = hooks.editState();
+      selectionOnly = !!selectionCommand && result.status === 'noop' &&
+        sameCommandState(previousEditState, selectionIndependentEditState(nextEditState));
+      return { ...result, selection, editState: nextEditState };
     },
+    deferFrame: () => selectionOnly,
     frame: (input) => renderFrame({ ...input, full: false }),
     snapshot: () => hooks.snapshot(),
   });
@@ -119,12 +134,20 @@ export function createResidentCommandHost(options: ResidentCommandHostOptions): 
             outcomes: [{ seq: command.seq, status: 'refused', reason: 'stale-epoch', committed: false }],
           }, true);
         }
+        selectionOnly = false;
         const duplicate = command.seq <= throughSeq;
         const reply = await shared.handler(context, command);
         const ack = isTransferResult(reply) ? reply.value : reply;
         throughSeq = ack.throughSeq;
-        return packState(reply, duplicate || ack.outcomes.some(({ status }) =>
+        const packed = packState(reply, duplicate || ack.outcomes.some(({ status }) =>
           status === 'refused' || status === 'cancelled' || status === 'duplicate'));
+        if (selectionOnly) {
+          const early = isTransferResult(packed) ? packed.value : packed;
+          const echoContext = options.selectionAck!.echoContext();
+          if (echoContext) early.echoContext = echoContext;
+          options.selectionAck!.deferFrame(early);
+        }
+        return packed;
       });
     },
     policy(command) {
@@ -132,7 +155,15 @@ export function createResidentCommandHost(options: ResidentCommandHostOptions): 
         ? { lane: 'input', mutates: true, reframes: true, reorderable: false }
         : shared.policy(command);
     },
-    checkpoint: (context) => serialize(() => shared.checkpoint(context)),
+    checkpoint: (context) => serialize(async () => {
+      const result = await shared.checkpoint(context);
+      if (!hooks.recoveryState) return result;
+      const checkpoint = isTransferResult(result) ? result.value : result;
+      const value = { ...checkpoint, recoveryState: structuredClone({
+        ...hooks.recoveryState(), selections: [...selections],
+      }) };
+      return isTransferResult(result) ? transferable(value, result.transfer) : value;
+    }),
     checkpointPolicy: shared.checkpointPolicy,
     frame: () => failure === undefined ? shared.frame() : Promise.reject(failure),
     withFrameWork(run) {

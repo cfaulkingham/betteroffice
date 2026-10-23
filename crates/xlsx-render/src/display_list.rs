@@ -15,6 +15,14 @@ pub enum Align {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextValign {
+    Top,
+    Center,
+    Bottom,
+}
+
 /// a rectangle in viewport-local pixels.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct Rect {
@@ -109,6 +117,14 @@ pub enum DrawCmd {
         ghost: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         chart: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rotation_deg: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rotation_box: Option<Rect>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rotation_valign: Option<TextValign>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        stacked: bool,
     },
 }
 
@@ -133,6 +149,10 @@ pub struct GridMeta {
     pub row_indices: Option<Vec<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub col_indices: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_row_spans: Vec<(u32, u32)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_col_spans: Vec<(u32, u32)>,
     pub row_offsets: Vec<f32>,
     pub col_offsets: Vec<f32>,
 }
@@ -189,6 +209,8 @@ pub struct DisplayList {
     pub hyperlinks: Vec<HyperlinkRegion>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub charts: Vec<ChartRegion>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
 }
 
 /// scale every coordinate, size, stroke width, and font size by `factor`,
@@ -292,6 +314,10 @@ pub fn scaled(dl: DisplayList, factor: f32) -> DisplayList {
                 number_format,
                 ghost,
                 chart,
+                rotation_deg,
+                rotation_box,
+                rotation_valign,
+                stacked,
             } => DrawCmd::Text {
                 x: x * factor,
                 y: y * factor,
@@ -314,17 +340,24 @@ pub fn scaled(dl: DisplayList, factor: f32) -> DisplayList {
                 }),
                 ghost,
                 chart,
+                rotation_deg,
+                rotation_box: rotation_box.map(|rect| scale_rect(rect, factor)),
+                rotation_valign,
+                stacked,
             },
         })
         .collect();
 
     DisplayList {
+        truncated: dl.truncated,
         width: dl.width * factor,
         height: dl.height * factor,
         commands,
         grid: GridMeta {
             start_row: dl.grid.start_row,
             start_col: dl.grid.start_col,
+            hidden_row_spans: dl.grid.hidden_row_spans,
+            hidden_col_spans: dl.grid.hidden_col_spans,
             row_indices: dl.grid.row_indices,
             col_indices: dl.grid.col_indices,
             row_offsets: dl
@@ -420,6 +453,7 @@ mod tests {
 
     fn sample() -> DisplayList {
         DisplayList {
+            truncated: false,
             width: 100.0,
             height: 50.0,
             commands: vec![
@@ -487,11 +521,17 @@ mod tests {
                     number_format: None,
                     ghost: false,
                     chart: false,
+                    rotation_deg: None,
+                    rotation_box: None,
+                    rotation_valign: None,
+                    stacked: false,
                 },
             ],
             grid: GridMeta {
                 start_row: 1,
                 start_col: 2,
+                hidden_row_spans: vec![(10, 20)],
+                hidden_col_spans: vec![(4, 5)],
                 row_indices: None,
                 col_indices: None,
                 row_offsets: vec![0.0, 20.0],
@@ -576,6 +616,8 @@ mod tests {
             _ => panic!("expected text"),
         }
         assert_eq!(dl.grid.start_row, 1);
+        assert_eq!(dl.grid.hidden_row_spans, vec![(10, 20)]);
+        assert_eq!(dl.grid.hidden_col_spans, vec![(4, 5)]);
         assert_eq!(dl.grid.col_offsets, vec![0.0, 128.0]);
         assert_eq!(dl.charts[0].label, "Revenue chart");
         assert_eq!(dl.charts[0].id, "xl/charts/chart1.xml");

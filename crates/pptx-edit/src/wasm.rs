@@ -87,6 +87,8 @@ struct DeleteTextArgs {
     story_id: String,
     start: u32,
     end: u32,
+    #[serde(default)]
+    allow_paragraph_join: bool,
 }
 
 #[derive(Deserialize)]
@@ -187,6 +189,15 @@ struct SlideArgs {
 struct SetSlideNotesArgs {
     slide_id: String,
     text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetSlideLayoutArgs {
+    slide_id: String,
+    layout_part_path: String,
+    #[serde(default)]
+    mapping: Vec<(String, u32)>,
 }
 
 #[derive(Deserialize)]
@@ -524,7 +535,11 @@ impl PptxDocument {
         if request.len() > MAX_REQUEST_BYTES {
             return self.oversized();
         }
-        let request: EditRequest = parse_args(request)?;
+        let request: EditRequest = serde_json::from_str(request).map_err(|error| {
+            let exception = js_sys::Error::new(&error.to_string());
+            exception.set_name("PptxEditDecodeError");
+            JsValue::from(exception)
+        })?;
         outcome_json(&self.session.validate_edits(&request).map_err(js_error)?).map_err(js_error)
     }
 
@@ -882,6 +897,20 @@ impl PptxDocument {
         )
     }
 
+    #[wasm_bindgen(js_name = setSlideLayoutJson)]
+    pub fn set_slide_layout_json(&self, args: &str) -> Result<String, JsValue> {
+        let args: SetSlideLayoutArgs = parse_args(args)?;
+        self.session
+            .set_slide_layout(
+                &local_context(),
+                &args.slide_id,
+                &args.layout_part_path,
+                &args.mapping,
+            )
+            .map_err(js_error)?;
+        json(())
+    }
+
     #[wasm_bindgen(js_name = setSlideNotesJson)]
     pub fn set_slide_notes_json(&self, args: &str) -> Result<String, JsValue> {
         let args: SetSlideNotesArgs = parse_args(args)?;
@@ -1186,6 +1215,17 @@ impl PptxDocument {
     }
 
     fn delete_text(&self, args: DeleteTextArgs) -> Result<TextReceipt, JsValue> {
+        if args.allow_paragraph_join {
+            return self
+                .session
+                .delete_text_joining_paragraphs(
+                    &local_context(),
+                    &args.story_id,
+                    args.start,
+                    args.end,
+                )
+                .map_err(js_error);
+        }
         self.session
             .delete_text(&local_context(), &args.story_id, args.start, args.end)
             .map_err(js_error)

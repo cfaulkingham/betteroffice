@@ -53,6 +53,7 @@ test('default editor reaches the peerless surface only through a dynamic import'
   visit(resolve(root, 'packages/pptx-react/src/index.ts'));
   expect([...seen].map((path) => relative(root, path))).not.toContain('packages/pptx-react/src/worker/PeerlessPptxSurface.tsx');
   expect([...seen].filter((path) => /\/worker\/(?:Peerless|peerless|createPeerless|usePeerless)/.test(path))).toEqual([]);
+  expect(seen.has(resolve(root, 'shared/textSelection.ts'))).toBe(false);
   expect(deferred.has(resolve(root, 'packages/pptx-react/src/worker/PeerlessPptxSurface.tsx'))).toBe(true);
 });
 
@@ -90,7 +91,7 @@ test('default editor static chunks exclude the peerless core', async () => {
 
 test('p2_peerless_import_graph_has_no_wasm_modules', () => {
   const exports = new Map<string, string>();
-  for (const barrel of ['editor', 'peerless'].map((name) => resolve(root, `packages/pptx/src/${name}.ts`))) {
+  for (const barrel of ['editor', 'worker'].map((name) => resolve(root, `packages/pptx/src/${name}.ts`))) {
     for (const statement of source(barrel).statements) {
       if (!ts.isExportDeclaration(statement) || statement.isTypeOnly || !statement.moduleSpecifier ||
         !ts.isStringLiteral(statement.moduleSpecifier) || !statement.exportClause ||

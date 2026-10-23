@@ -10,17 +10,15 @@
       "types": "./dist/index.d.mts",
       "import": "./dist/index.mjs"
     },
-    "./styles.css": "./dist/styles.css",
-    "./peerless-harness": {
-      "types": "./dist/peerless-harness.d.mts",
-      "import": "./dist/peerless-harness.mjs"
-    }
+    "./styles.css": "./dist/styles.css"
   },
   "sideEffects": [
     "*.css"
   ],
   "files": [
-    "dist"
+    "dist",
+    "!dist/peerless-harness.*",
+    "THIRD-PARTY-NOTICES.md"
   ],
   "scripts": {
     "build": "tsup && bun run build:css",
@@ -89,6 +87,6 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "@testing-library/react": "^16.0.0",
-    "@happy-dom/global-registrator": "^20.8.3"
+    "@happy-dom/global-registrator": "^20.11.2"
   }
 }

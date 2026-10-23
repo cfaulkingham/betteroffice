@@ -38,7 +38,6 @@ import type {
 } from '@betteroffice/pptx';
 import type { Translations } from '@betteroffice/pptx-i18n';
 import { LocaleProvider, useTranslation } from './i18n';
-import { ProposalsPanel } from './components/ProposalsPanel';
 import { ProposalCanvasOverlay, ProposalCanvasToolbar, ProposalNotesDiff, useProposalCanvas } from './components/ProposalCanvas';
 import {
   Component,
@@ -62,7 +61,6 @@ import type {
 } from 'react';
 import { EditorToolbar } from './components/EditorToolbar';
 import { EditorChromeContext } from './components/EditorToolbarContext';
-import { PresentationOverlay } from './components/PresentationOverlay';
 import type {
   PptxEditorTool,
   PptxShapePreset,
@@ -157,6 +155,19 @@ import { warnPptxEngine, type PptxEngineWarning } from './engineWarnings';
 import { PeerlessPptxEditorLoader } from './PeerlessPptxEditorLoader';
 
 const THUMBNAIL_SLICE_MS = 12;
+type PresentationOverlayComponent = typeof import('./components/PresentationOverlay').PresentationOverlay;
+type ProposalsPanelComponent = typeof import('./components/ProposalsPanel').ProposalsPanel;
+function cachedLoader<T>(load: () => Promise<T>): () => Promise<T> {
+  let pending: Promise<T> | undefined;
+  return () => (pending ??= load().catch((error: unknown) => {
+    pending = undefined;
+    throw error;
+  }));
+}
+const loadPresentationOverlay = cachedLoader(() => import('./components/PresentationOverlay')
+  .then((module) => module.PresentationOverlay));
+const loadProposalsPanel = cachedLoader(() => import('./components/ProposalsPanel')
+  .then((module) => module.ProposalsPanel));
 export const PEERLESS_FLAG = 'asyncApi' as const;
 export const pptxPeerlessEditorLoader = { load: () => import('./worker/PeerlessPptxSurface') };
 
@@ -332,8 +343,8 @@ export type PptxWorkerViewerProps = Omit<
   plugins?: readonly [];
   onChange?: undefined;
   readOnly: true;
-  /** Keeps worker opening enabled in the legacy runtime. */
-  experimentalWorkerOpen?: true;
+  /** Opens in the worker; without it the legacy runtime runs in-thread. */
+  experimentalWorkerOpen: true;
   /** Without `Worker`, falls back to the in-thread engine and passes `PptxEditorApi`. */
   onReady?: (api: PptxWorkerViewerApi) => void;
 };
@@ -573,7 +584,7 @@ const initialStyle: EffectiveTextStyle = {
 };
 
 type WorkerSessionProps = Omit<PptxWorkerEditorProps, 'readOnly' | 'onReady' | 'experimentalWorkerOpen'> & {
-  experimentalWorkerOpen?: true;
+  experimentalWorkerOpen: true;
   readOnly?: boolean;
   onReady?: (api: PptxWorkerEditorApi | PptxWorkerViewerApi) => void;
 };
@@ -591,7 +602,7 @@ type GeneralEditorSessionProps = Omit<PptxLegacyEditorProps, 'experimentalWorker
 export type PptxEditorProps = PptxAsyncEditorProps | GeneralEditorSessionProps;
 
 export function PptxEditor(props: PptxAsyncEditorProps): JSX.Element;
-export function PptxEditor(props: PptxLegacyEditorProps & { experimentalWorkerOpen: false }): JSX.Element;
+export function PptxEditor(props: PptxLegacyEditorProps): JSX.Element;
 export function PptxEditor(props: CollaborationSessionProps): JSX.Element;
 export function PptxEditor(props: PptxWorkerEditorProps): JSX.Element;
 export function PptxEditor(props: WorkerEditorSessionProps & { onChange: NonNullable<PptxInThreadEditorProps['onChange']> }): JSX.Element;
@@ -635,9 +646,10 @@ function PptxAsyncEditorSession(props: PptxAsyncEditorProps) {
   </PeerlessEditorBoundary>;
 }
 
-function choosePptxEngine(inThread: boolean, collaboration: PptxEditorCollaborationOptions | undefined,
-  workerAvailable: boolean): PptxEngineWarning | undefined {
-  if (inThread) return 'deprecated';
+function choosePptxEngine(workerOpen: boolean | undefined, collaboration: PptxEditorCollaborationOptions | undefined,
+  workerAvailable: boolean): PptxEngineWarning | 'in-thread' | undefined {
+  if (workerOpen === false) return 'deprecated';
+  if (workerOpen !== true) return 'in-thread';
   if (collaboration != null) return 'collaboration';
   if (!workerAvailable) return 'no-worker';
 }
@@ -645,11 +657,11 @@ function choosePptxEngine(inThread: boolean, collaboration: PptxEditorCollaborat
 function PptxEditorSession(props: WorkerEditorSessionProps | PptxWorkerViewerProps | WorkerSessionProps | CollaborationSessionProps | PptxLegacyEditorProps | GeneralEditorSessionProps) {
   useEffect(() => { warnPptxEngine('legacy-sync-api'); }, []);
   const fonts = useStableFontFaces(props.fonts);
-  const inThread = props.experimentalWorkerOpen === false;
-  const identity = useMemo(() => ({}), [props.file, fonts, props.clientId, props.collaboration, inThread]);
-  const engineIdentity = useMemo(() => ({}), [props.file, props.collaboration, inThread]);
+  const workerOpen = props.experimentalWorkerOpen;
+  const identity = useMemo(() => ({}), [props.file, fonts, props.clientId, props.collaboration, workerOpen]);
+  const engineIdentity = useMemo(() => ({}), [props.file, props.collaboration, workerOpen]);
   const startEngine = () => ({ identity: engineIdentity,
-    reason: choosePptxEngine(inThread, props.collaboration, typeof Worker === 'function') });
+    reason: choosePptxEngine(workerOpen, props.collaboration, typeof Worker === 'function') });
   const [engineChoice, setEngineChoice] = useState(startEngine);
   const engine = engineChoice.identity === engineIdentity ? engineChoice : startEngine();
   if (engineChoice !== engine) setEngineChoice(engine);
@@ -659,7 +671,7 @@ function PptxEditorSession(props: WorkerEditorSessionProps | PptxWorkerViewerPro
   const session = choice.identity === identity ? choice : start();
   const editable = session.editable || needsEditor;
   if (choice !== session || choice.editable !== editable) setChoice({ ...session, editable });
-  useEffect(() => { if (engine.reason) warnPptxEngine(engine.reason); }, [engine.reason]);
+  useEffect(() => { if (engine.reason && engine.reason !== 'in-thread') warnPptxEngine(engine.reason); }, [engine.reason]);
   const Editor = PptxWorkerEditor as (props: WorkerEditorSessionProps) => JSX.Element;
   return engine.reason ? (
     <PptxEditorContent {...props as PptxInThreadEditorProps} />
@@ -834,6 +846,20 @@ export function PptxEditorContent({
   const publishedReplicaRef = useRef<{ handle: PresentationHandle } | null>(null);
   const [remotePeers, setRemotePeers] = useState<readonly PptxPresencePeer[]>([]);
   const [presenting, setPresenting] = useState(false);
+  const [PresentationOverlay, setPresentationOverlay] = useState<PresentationOverlayComponent | null>(null);
+  const [ProposalsPanel, setProposalsPanel] = useState<ProposalsPanelComponent | null>(null);
+  useEffect(() => {
+    let live = true;
+    loadPresentationOverlay().then((overlay) => {
+      if (live) setPresentationOverlay(() => overlay);
+    }, () => {});
+    loadProposalsPanel().then((panel) => {
+      if (live) setProposalsPanel(() => panel);
+    }, () => {});
+    return () => {
+      live = false;
+    };
+  }, []);
   const [proposals, setProposals, proposalsRef] = useSyncedState<Proposal[]>([]);
   const [proposalsOpen, setProposalsOpen, proposalsOpenRef] = useSyncedState(false);
   const proposalButtonRef = useRef<HTMLButtonElement>(null);
@@ -892,6 +918,21 @@ export function PptxEditorContent({
     setError(next.message);
     if (next !== workerRef.current?.owner.failure) onErrorRef.current?.(next);
   }, []);
+
+  useEffect(() => {
+    if (!proposalsOpen || ProposalsPanel) return;
+    let live = true;
+    loadProposalsPanel().then((panel) => {
+      if (live) setProposalsPanel(() => panel);
+    }, (error: unknown) => {
+      if (!live) return;
+      setProposalsOpen(false);
+      reportError(error);
+    });
+    return () => {
+      live = false;
+    };
+  }, [proposalsOpen, ProposalsPanel, reportError, setProposalsOpen]);
 
   const refreshAt = useCallback(
     (
@@ -2837,7 +2878,14 @@ export function PptxEditorContent({
 
   const startPresenting = () => {
     if (!modelRef.current?.snapshot.slides.length) return;
-    setPresenting(true);
+    if (PresentationOverlay) {
+      setPresenting(true);
+      return;
+    }
+    loadPresentationOverlay().then((overlay) => {
+      setPresentationOverlay(() => overlay);
+      setPresenting(true);
+    }, reportError);
   };
 
   // Export the current slide through the same canvas painter the editor draws
@@ -3305,7 +3353,7 @@ export function PptxEditorContent({
           {renderDock('bottom')}
         </div>
         {renderDock('right')}
-        {!readOnly && proposalsOpen && model && handleRef.current && (
+        {!readOnly && proposalsOpen && ProposalsPanel && model && handleRef.current && (
           <ProposalsPanel handle={handleRef.current} proposals={proposals} snapshot={model.snapshot}
             visualDisabledReason={backend ? t('worker.disabled') : undefined}
             resolveImage={resolveSlideImage}
@@ -3334,7 +3382,7 @@ export function PptxEditorContent({
           }}
         />
       ) : null}
-      {presenting && slideCount > 0 && handleRef.current ? (
+      {presenting && PresentationOverlay && slideCount > 0 && handleRef.current ? (
         <PresentationOverlay
           handle={handleRef.current}
           slideCount={slideCount}

@@ -1,9 +1,12 @@
+import { sectionPropertiesEqual } from './sections';
 /** yrs-to-OOXML save projection. */
 
 /* eslint-disable max-lines -- the inverse mapping stays co-located with its save orchestrator */
 
+import { engineProgressTick } from '../utils/engineProgress';
 import { headerFooterAliasOf, markHeaderFooterAlias } from '../docx/headerFooterAliasProjection';
-import { headerFooterStory } from './sessionInternals';
+import { markRevisionInfo } from '../docx/sessionRevisionIds';
+import { headerFooterStory, sessionSourcePackage } from './sessionInternals';
 import { createStyleResolver, type StyleResolver } from '../styles';
 import { hasTrackedControlContent } from '../utils/trackedControlContent';
 import { isRawXml } from '../types/content/rawXml';
@@ -13,6 +16,7 @@ import {
   type ContentControlValue,
 } from './contentControlValues';
 import { sdtAttrsToProps } from '../types/sdtAttributes';
+import { tableRowGrid } from './storyPlainText';
 import {
   paragraphAttrsToFormatting,
   tableAttrsToFormatting,
@@ -55,6 +59,7 @@ import type {
   Footnote,
   Endnote,
   HeaderFooter,
+  SectionProperties,
 } from '../types/document';
 import type { YrsRunInheritance, YrsSession, YrsTableInheritance } from './index';
 
@@ -91,6 +96,7 @@ interface YrsImageAttrs {
   shapeType?: string;
   opacity?: number;
   layoutInCell?: boolean;
+  noChangeAspect?: boolean;
   allowOverlap?: boolean;
   effectExtentTop?: number;
   effectExtentRight?: number;
@@ -151,6 +157,8 @@ const PARAGRAPH_ATTR_DEFAULTS: Attrs = {
   snapToGrid: null,
   autoSpaceDE: null,
   autoSpaceDN: null,
+  adjustRightInd: null,
+  cnfStyle: null,
   defaultTextFormatting: null,
   sectionBreakType: null,
   bidi: null,
@@ -437,7 +445,7 @@ const ON_OFF_RUN_PROPERTIES = new Set<string>([
   'outline', 'shadow', 'emboss', 'imprint', 'hidden', 'rtl', 'boldCs', 'italicCs',
 ]);
 
-const SOURCE_RUN_PROPERTIES = ['bold', 'italic', 'fontSize', 'boldCs', 'italicCs', 'fontSizeCs'] as const;
+const SOURCE_RUN_PROPERTIES = ['bold', 'italic', 'fontSize', 'boldCs', 'italicCs', 'fontSizeCs', 'language'] as const;
 
 const lentByLinkStyle = (mark: unknown): boolean => asObject(mark)?.inheritedHyperlink === true;
 
@@ -461,7 +469,8 @@ function relativeFormatting(attributes: Attrs, inherited: TextFormatting): TextF
     const value = source?.[key];
     if (value === undefined) continue;
     const live = ON_OFF_RUN_PROPERTIES.has(key) ? formatting[key] ?? false : formatting[key];
-    if (sameJson(value, live) ||
+    // Runs hold no live language, so text keeps the language of the source run it maps to.
+    if (key === 'language' || sameJson(value, live) ||
       ((key === 'boldCs' || key === 'italicCs') && attributes[key] === undefined)) {
       result[key] = value;
     }
@@ -552,11 +561,22 @@ function trackedInfo(raw: unknown, _pmShape = false, id?: number): TrackedChange
   if (!value) return null;
   const author = asString(value.author) || 'Unknown';
   const date = asString(value.date);
-  return {
-    id: id ?? revisionId(value.revisionId ?? value.id),
-    author,
-    ...(date ? { date } : {}),
-  };
+  const source = value.revisionId ?? value.id;
+  const info = { id: id ?? revisionId(source), author, ...(date ? { date } : {}) };
+  return markRevisionInfo(
+    info,
+    id === undefined && typeof source === 'string' && !Number.isFinite(Number(source))
+  );
+}
+
+function propertyChanges(changes: unknown[]): unknown[] {
+  return changes.map((change) => {
+    const value = asObject(change);
+    const info = asObject(value?.info);
+    const id = info?.revisionId ?? info?.id;
+    if (!value || typeof id !== 'string' || Number.isFinite(Number(id))) return change;
+    return { ...value, info: trackedInfo(info) };
+  });
 }
 
 /** Serialized ids for a session revision's deletion and insertion. */
@@ -803,6 +823,7 @@ function imageFromPayload(payload: Attrs): Image {
   if (Object.keys(crop).length > 0) image.crop = crop;
   if (attrs.opacity != null && attrs.opacity < 1) image.opacity = attrs.opacity;
   if (attrs.layoutInCell != null) image.layoutInCell = attrs.layoutInCell;
+  if (attrs.noChangeAspect != null) image.noChangeAspect = attrs.noChangeAspect;
   if (attrs.allowOverlap != null) image.allowOverlap = attrs.allowOverlap;
 
   const padding: NonNullable<Image['padding']> = {};
@@ -871,12 +892,16 @@ function opaqueDrawingRunFromPayload(
   const xml = asString(payload.xml);
   if (!kind || !xml) return null;
   const preview = asObject(payload.preview);
+  const previews = Array.isArray(payload.previews)
+    ? payload.previews.map(asObject).filter((image): image is Attrs => !!image).map(imageFromPayload)
+    : [];
   const formatting = format(attributes);
   return {
     type: 'run',
     content: [{
       type: 'opaqueDrawing', kind, xml,
       ...(preview ? { preview: imageFromPayload(preview) } : {}),
+      ...(previews.length ? { previews } : {}),
     }],
     ...(Object.keys(formatting).length > 0 ? { formatting } : {}),
   };
@@ -2174,7 +2199,7 @@ function paragraphFromStory(
   if (pPrIns) paragraph.pPrIns = pPrIns;
   if (pPrDel) paragraph.pPrDel = pPrDel;
   if (Array.isArray(properties.pPrChange) && properties.pPrChange.length > 0) {
-    paragraph.propertyChanges = properties.pPrChange as Paragraph['propertyChanges'];
+    paragraph.propertyChanges = propertyChanges(properties.pPrChange) as Paragraph['propertyChanges'];
   }
   if (properties.sectPr) {
     paragraph.sectionProperties = properties.sectPr as Paragraph['sectionProperties'];
@@ -2213,7 +2238,7 @@ function inferTableBorders(rows: TableRow[]): TableBorders | undefined {
 function normalizeVMergeRuns(rows: TableRow[]): void {
   const columns = new Map<number, Array<{ rowIndex: number; cell: TableCell }>>();
   rows.forEach((row, rowIndex) => {
-    let column = 0;
+    let column = row.formatting?.gridBefore ?? 0;
     for (const cell of row.cells) {
       const start = column;
       column += cell.formatting?.gridSpan ?? 1;
@@ -2305,7 +2330,7 @@ function tableFromPayload(context: SaveContext, payload: TablePayload): Table {
   let totalColumns = 0;
 
   rowPayloads.forEach((row, rowIndex) => {
-    let column = 0;
+    let column = tableRowGrid(row.trPr).before;
     for (const cellPayload of Array.isArray(row.cells) ? row.cells : []) {
       while (occupied[rowIndex]?.[column]) column += 1;
       const tcPr = cellPayload.tcPr ?? {};
@@ -2339,7 +2364,7 @@ function tableFromPayload(context: SaveContext, payload: TablePayload): Table {
 
   const rows: TableRow[] = rowPayloads.map((rowPayload, rowIndex) => {
     const cells: TableCell[] = [];
-    for (let col = 0; col < totalColumns; ) {
+    for (let col = tableRowGrid(rowPayload.trPr).before; col < totalColumns; ) {
       const anchor = byStart.get(`${rowIndex}-${col}`);
       if (anchor) {
         const formatting = { ...(anchor.cell.formatting ?? {}) };
@@ -2460,7 +2485,7 @@ function restoreNoteMarks(
   if (index < 0) return projected;
   const target = projected[index] as Paragraph;
   const restored = [...projected];
-  restored[index] = { ...target, content: [...marks, ...target.content] };
+  restored[index] = cloneProjectedParagraph(target, { content: [...marks, ...target.content] });
   return restored;
 }
 
@@ -2609,11 +2634,172 @@ function paragraphChartRuns(content: readonly ParagraphContent[]): Run[] {
   return runs;
 }
 
-function restoreRawBlocks(projected: BlockContent[], base: readonly BlockContent[]): BlockContent[] {
+function isBlockBookmark(block: BlockContent): boolean {
+  return isRawXml(block) && /^<w:bookmark(?:Start|End)(?=[\s/>])/.test(block.xml);
+}
+
+type BookmarkKind = 'start' | 'end';
+
+function rawBlockBookmark(xml: string): { kind: BookmarkKind; id?: string } | undefined {
+  const kind = /^<w:bookmark(Start|End)(?=[\s/>])/.exec(xml)?.[1];
+  if (!kind) return undefined;
+  let value: string | undefined;
+  for (const attribute of xml.matchAll(/([^\s=<>/]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)) {
+    if (attribute[1] !== 'w:id') continue;
+    value = (attribute[2] ?? attribute[3]!).replace(/&#(?:x([0-9a-f]+)|([0-9]+));/gi, (entity, hex, decimal) => {
+      const code = Number.parseInt(hex ?? decimal, hex === undefined ? 10 : 16);
+      return code <= 0x10ffff ? String.fromCodePoint(code) : entity;
+    });
+    break;
+  }
+  const id = value === undefined ? undefined
+    : Number.isSafeInteger(Number(value)) ? String(Number(value)) : value;
+  return { kind: kind === 'Start' ? 'start' : 'end', id };
+}
+
+function storyBlockKeys(blocks: readonly BlockContent[], storyId: string): Array<string | undefined> {
+  let paragraph = 0;
+  let table = 0;
+  let sdt = 0;
+  return blocks.map((block) => {
+    const memo = projectedBlocks.get(block);
+    if (block.type === 'paragraph') {
+      const key = memo?.sessionKey ?? ((!block.repeatedParaId && block.paraId) || `${storyId}:p${paragraph}`);
+      paragraph += 1;
+      return `P${key}`;
+    }
+    if (block.type === 'table') {
+      const key = memo?.tableSourcePrefix ?? `${storyId}:t${table}`;
+      table += 1;
+      return `T${key}`;
+    }
+    if (block.type === 'blockSdt') {
+      const key = memo?.key ?? `S${storyId}:sdt${sdt}`;
+      sdt += 1;
+      return key;
+    }
+    return undefined;
+  });
+}
+
+function projectedBookmarkPositions(blocks: readonly BlockContent[]): Map<string, Partial<Record<BookmarkKind, number>>> {
+  const positions = new Map<string, Partial<Record<BookmarkKind, number>>>();
+  const visited = new WeakSet<object>();
+  const visit = (value: unknown, position: number): void => {
+    if (value === null || typeof value !== 'object' || visited.has(value)) return;
+    visited.add(value);
+    if (Array.isArray(value)) {
+      for (const child of value) visit(child, position);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    const marker = record.type === 'rawXml' && typeof record.xml === 'string'
+      ? rawBlockBookmark(record.xml)
+      : record.type === 'bookmarkStart' || record.type === 'bookmarkEnd'
+        ? { kind: record.type === 'bookmarkStart' ? 'start' as const : 'end' as const, id: String(record.id) }
+        : undefined;
+    if (marker?.id !== undefined) {
+      let pair = positions.get(marker.id);
+      if (!pair) positions.set(marker.id, pair = {});
+      pair[marker.kind] ??= position;
+      return;
+    }
+    for (const child of Object.values(record)) visit(child, position);
+  };
+  blocks.forEach((block, index) => visit(block, index + 0.5));
+  return positions;
+}
+
+interface BlockBookmarkPlacement {
+  block: BlockContent;
+  index: number;
+  position: number;
+  omit?: boolean;
+  following?: BlockContent;
+}
+
+function restoreBlockBookmarks(
+  projected: BlockContent[],
+  base: readonly BlockContent[],
+  storyId: string
+): BlockContent[] {
+  if (!base.some(isBlockBookmark)) return projected;
+  const keys = storyBlockKeys(base, storyId);
+  const live = new Map<string, number>();
+  storyBlockKeys(projected, storyId).forEach((key, index) => {
+    if (key !== undefined) live.set(key, index);
+  });
+  const nextPositions = new Array<number | undefined>(base.length);
+  let next: number | undefined;
+  for (let index = base.length - 1; index >= 0; index -= 1) {
+    nextPositions[index] = next;
+    const key = keys[index];
+    const position = key === undefined ? undefined : live.get(key);
+    if (position !== undefined) next = position;
+  }
+  const present = projectedBookmarkPositions(projected);
+  const pairs = new Map<string, Partial<Record<BookmarkKind, BlockBookmarkPlacement>>>();
+  const boundaries: BlockBookmarkPlacement[] = [];
+  let previous: number | undefined;
+  for (let index = 0; index < base.length; index += 1) {
+    const block = base[index]!;
+    const marker = isRawXml(block) ? rawBlockBookmark(block.xml) : undefined;
+    if (marker) {
+      const id = marker.id ?? `\0${index}`;
+      let pair = pairs.get(id);
+      if (!pair) pairs.set(id, pair = {});
+      if (!pair[marker.kind]) {
+        const boundary = {
+          block, index,
+          position: nextPositions[index] ?? (previous === undefined ? 0 : previous + 1),
+          omit: present.get(id)?.[marker.kind] !== undefined,
+        };
+        pair[marker.kind] = boundary;
+        boundaries.push(boundary);
+      }
+    }
+    const key = keys[index];
+    const position = key === undefined ? undefined : live.get(key);
+    if (position !== undefined) previous = position;
+  }
+  for (const [id, pair] of pairs) {
+    const { start, end } = pair;
+    const existing = present.get(id);
+    if (start && !start.omit && existing?.end !== undefined) {
+      start.position = Math.min(start.position, Math.floor(existing.end));
+    }
+    if (end && !end.omit && existing?.start !== undefined) {
+      end.position = Math.max(end.position, Math.ceil(existing.start));
+    }
+    if (start && end && !start.omit && !end.omit && (
+      end.position < start.position || (end.position === start.position && end.index < start.index)
+    )) {
+      start.following = end.block;
+      end.omit = true;
+    }
+  }
+  const insertions = new Map<number, BlockContent[]>();
+  for (const boundary of boundaries) {
+    if (boundary.omit) continue;
+    let bucket = insertions.get(boundary.position);
+    if (!bucket) insertions.set(boundary.position, bucket = []);
+    bucket.push(boundary.block);
+    if (boundary.following) bucket.push(boundary.following);
+  }
+  const restored: BlockContent[] = [];
+  for (let index = 0; index <= projected.length; index += 1) {
+    for (const block of insertions.get(index) ?? []) restored.push(block);
+    if (index < projected.length) restored.push(projected[index]!);
+  }
+  return restored;
+}
+
+function restoreRawBlocks(projected: BlockContent[], base: readonly BlockContent[], storyId: string): BlockContent[] {
+  projected = restoreBlockBookmarks(projected, base, storyId);
   let offset = 0;
   for (let index = 0; index < base.length; index += 1) {
     const block = base[index]!;
-    if (!isRawXml(block)) continue;
+    if (!isRawXml(block) || isBlockBookmark(block)) continue;
     const following = base.slice(index + 1).find((candidate) =>
       candidate.type === 'paragraph' && candidate.paraId && projected.some((entry) =>
         entry.type === 'paragraph' && entry.paraId === candidate.paraId));
@@ -2662,6 +2848,19 @@ interface SessionProjectionMemo {
 
 const projectedBlocks = new WeakMap<BlockContent, ProjectedBlockMemo>();
 
+function cloneProjectedParagraph(
+  paragraph: Paragraph,
+  changes: Partial<Paragraph> = {},
+  identity: Paragraph = paragraph
+): Paragraph {
+  const clone: Paragraph = { ...paragraph, ...changes };
+  const memo = projectedBlocks.get(identity);
+  if (memo?.sessionKey) {
+    projectedBlocks.set(clone, { sessionKey: memo.sessionKey, sourceRuns: memo.sourceRuns });
+  }
+  return clone;
+}
+
 /** The session key of the pilcrow a projected paragraph was built from. @internal */
 export function projectedSessionKey(paragraph: Paragraph): string | undefined {
   return projectedBlocks.get(paragraph)?.sessionKey;
@@ -2681,10 +2880,7 @@ function carryParagraphIdentities(
     if (block.type !== 'paragraph') return block;
     const source = previous[index++];
     if (!source?.paraId) return block;
-    const carried: Paragraph = { ...block, paraId: source.paraId };
-    const memo = projectedBlocks.get(source);
-    if (memo?.sessionKey) projectedBlocks.set(carried, { sessionKey: memo.sessionKey, sourceRuns: memo.sourceRuns });
-    return carried;
+    return cloneProjectedParagraph(block, { paraId: source.paraId }, source);
   });
 }
 
@@ -2696,10 +2892,7 @@ function carryParagraphIdentities(
 export function ownProjectedParagraphs(blocks: readonly BlockContent[]): BlockContent[] {
   return blocks.map((block) => {
     if (block.type === 'paragraph') {
-      const own: Paragraph = { ...block };
-      const memo = projectedBlocks.get(block);
-      if (memo?.sessionKey) projectedBlocks.set(own, { sessionKey: memo.sessionKey, sourceRuns: memo.sourceRuns });
-      return own;
+      return cloneProjectedParagraph(block);
     }
     if (block.type !== 'table') return block;
     const own: Table = {
@@ -2752,7 +2945,7 @@ function sameJson(a: unknown, b: unknown): boolean {
   );
 }
 
-const NESTED_STORY_ID = /^(.*?)(?::t\d+:r\d+c\d+|:sdt\d+)$/;
+const NESTED_STORY_ID = /^(.*?)(?::t\d+:r\d+c\d+(?:~\d+)?|:sdt\d+)$/;
 
 /** Page and column breaks the layout gives a block of their own, ahead of a paragraph. */
 const isBlockBreak = (item: InlineItem): boolean =>
@@ -2915,6 +3108,10 @@ class SaveContext {
       : !this.memo.dirty.has(storyId);
   }
 
+  sectionChanged(paraId: string, properties: Paragraph['sectionProperties']): boolean {
+    return !sectionPropertiesEqual(this.baseParagraphs.get(paraId)?.sectionProperties, properties);
+  }
+
   private inheritance(): YrsRunInheritance {
     return (this.runInheritance ??= this.session.runInheritance(this.styleDefinitions));
   }
@@ -2926,7 +3123,7 @@ class SaveContext {
     const candidates = payload.tblPr?._originalFormatting ? cells : [];
     for (const cell of candidates) {
       const story = asString(cell.tcPr?._sourceCellStory) ?? asString(cell.story);
-      const prefix = story?.match(/^(.*:t\d+):r\d+c\d+$/)?.[1];
+      const prefix = story?.match(/^(.*:t\d+):r\d+c\d+(?:~\d+)?$/)?.[1];
       const table = prefix ? this.sourceTables.get(prefix) : undefined;
       if (prefix && table) {
         source = { prefix, table };
@@ -3003,21 +3200,30 @@ class SaveContext {
 
   private inheritedFormatting(storyId: string, properties: Attrs): ParagraphFormatting | undefined {
     const cell = this.cellParagraphs.has(storyId);
-    if (
-      (NESTED_STORY_ID.test(storyId) && !cell) ||
-      (this.syntheticDefaults && !cell) || properties.numPr != null
-    ) {
+    const nested = !cell && NESTED_STORY_ID.test(storyId);
+    if (this.syntheticDefaults && !cell && !nested) {
       return undefined;
     }
+    const numbered = properties.numPr != null;
     const style = typeof properties.pStyle === 'string' ? properties.pStyle : '';
     const tableFormatting = this.cellParagraphs.get(storyId);
-    const key = cell ? JSON.stringify([style, tableFormatting]) : style;
+    const key = cell
+      ? JSON.stringify([style, tableFormatting, numbered])
+      : JSON.stringify([style, numbered, nested]);
     if (!this.inherited.has(key)) {
       const resolved = cell
         ? this.inheritance().paragraphFormatting(style || null, tableFormatting)
         : this.styles.resolveParagraphStyle(style || null).paragraphFormatting;
-      if (resolved === undefined || resolved.numPr != null) {
+      if (resolved === undefined || (!numbered && resolved.numPr != null)) {
         this.inherited.set(key, undefined);
+      } else if (numbered || nested) {
+        const formatting: ParagraphFormatting = {};
+        if (resolved.autoSpaceDE !== undefined) formatting.autoSpaceDE = resolved.autoSpaceDE;
+        if (resolved.autoSpaceDN !== undefined) formatting.autoSpaceDN = resolved.autoSpaceDN;
+        if (resolved.adjustRightInd !== undefined) {
+          formatting.adjustRightInd = resolved.adjustRightInd;
+        }
+        this.inherited.set(key, formatting);
       } else {
         const formatting = { ...resolved };
         delete formatting.indentLeft;
@@ -3177,6 +3383,7 @@ class SaveContext {
     let witnesses: BlockBreakKind[] = [];
     let breaks: BlockBreakKind[] = [];
     for (const segment of segments) {
+      engineProgressTick();
       if (segment.kind === 'text') {
         pushText(segment.text, segment.attributes);
         storyOffset += segment.text.length;
@@ -3232,9 +3439,16 @@ class SaveContext {
           const leading = leadingBlockBreaks(paragraph);
           const consumed = leading.every((kind, index) => kind === breaks[index]) ? leading.length : 0;
           const pending = breaks.slice(consumed);
-          if (pending.length) paragraph = { ...paragraph, content: [...pending.map((breakType): ParagraphContent => ({
-            type: 'run', content: [{ type: 'break', breakType }],
-          })), ...paragraph.content] };
+          if (pending.length) {
+            paragraph = cloneProjectedParagraph(paragraph, {
+              content: [
+                ...pending.map((breakType): ParagraphContent => ({
+                  type: 'run', content: [{ type: 'break', breakType }],
+                })),
+                ...paragraph.content,
+              ],
+            });
+          }
           projectedBlocks.set(paragraph, { inputs: snapshot, sessionKey: segment.paraId, trailing, sourceRuns });
           witnesses = [...trailing];
         }
@@ -3269,7 +3483,7 @@ class SaveContext {
             key,
             inputs,
             tableBaseline: this.payloadBaselines.get(payload),
-            tableSourcePrefix: asString(firstCell?.story)?.match(/^(.*:t\d+):r\d+c\d+$/)?.[1],
+            tableSourcePrefix: asString(firstCell?.story)?.match(/^(.*:t\d+):r\d+c\d+(?:~\d+)?$/)?.[1],
             children: contents ?? this.cellContents(payload, storyId),
           });
         }
@@ -3360,15 +3574,14 @@ class SaveContext {
       while (index >= 0 && blocks[index]!.type !== 'paragraph') index -= 1;
       const previous = blocks[index];
       if (previous?.type === 'paragraph') {
-        const paragraph: Paragraph = { ...previous, content: [...previous.content, ...pendingBreaks] };
-        const memo = projectedBlocks.get(previous);
-        if (memo?.sessionKey) projectedBlocks.set(paragraph, { sessionKey: memo.sessionKey, sourceRuns: memo.sourceRuns });
-        blocks[index] = paragraph;
+        blocks[index] = cloneProjectedParagraph(previous, {
+          content: [...previous.content, ...pendingBreaks],
+        });
       } else {
         blocks.push({ type: 'paragraph', content: pendingBreaks });
       }
     }
-    const projected = restoreRawBlocks(blocks, baseBlocks ?? []);
+    const projected = restoreRawBlocks(blocks, baseBlocks ?? [], storyId);
     this.memo.stories.set(storyId, { commentsKey, blocks: projected });
     this.memo.dirty.delete(storyId);
     this.memo.clean.add(storyId);
@@ -3429,6 +3642,17 @@ function projectDocument(
     context?.dispose();
     projectedMedia = previous;
   }
+}
+
+function withHostSectionChanges(authored: SectionProperties, source: SectionProperties, host: SectionProperties): SectionProperties {
+  const merged: Record<string, unknown> = { ...authored };
+  for (const key of new Set([...Object.keys(source), ...Object.keys(host)])) {
+    const field = key as keyof SectionProperties;
+    if (sectionPropertiesEqual(host[field], source[field]) || !sectionPropertiesEqual(authored[field], source[field])) continue;
+    if (host[field] === undefined) delete merged[key];
+    else merged[key] = host[field];
+  }
+  return merged as SectionProperties;
 }
 
 function projectStories(
@@ -3516,6 +3740,23 @@ function projectStories(
   const footnotes = projectNotes(base.package.footnotes, 'fn:');
   const endnotes = projectNotes(base.package.endnotes, 'en:');
 
+  const sourcePackage = sessionSourcePackage(session);
+  const liveSections = sourcePackage && shouldProject('body') ? session.listSections?.() ?? [] : [];
+  const sourceFinal = sourcePackage ? (JSON.parse(sourcePackage.keys.metadata) as Document['package']['document']).finalSectionProperties : undefined;
+  const finalSectionChanges = liveSections.length > 0 && !sectionPropertiesEqual(sourceFinal ?? {}, liveSections.at(-1)!.authored);
+  const sectionChanges = finalSectionChanges || liveSections.slice(0, -1).some(section =>
+    context.sectionChanged(section.closingParagraphId, section.authored)
+  );
+  const projectedSections = sectionChanges ? (() => {
+    let start = 0;
+    return liveSections.map(section => {
+      const end = section.closingParagraphId === 'final' ? bodyContent.length : bodyContent.findIndex(block => block.type === 'paragraph' && projectedSessionKey(block) === section.closingParagraphId) + 1;
+      const content = bodyContent.slice(start, end);
+      start = end;
+      return { id: section.closingParagraphId, properties: section.resolved, content };
+    });
+  })() : undefined;
+
   return {
     ...base,
     ...(context.warnings.length > 0
@@ -3526,6 +3767,8 @@ function projectStories(
       document: {
         ...base.package.document,
         content: bodyContent,
+        ...(sectionChanges ? { sections: projectedSections } : {}),
+        ...(finalSectionChanges ? { finalSectionProperties: withHostSectionChanges(liveSections.at(-1)!.authored, sourceFinal ?? {}, base.package.document.finalSectionProperties ?? {}) } : {}),
       },
       ...(headers ? { headers } : {}),
       ...(footers ? { footers } : {}),

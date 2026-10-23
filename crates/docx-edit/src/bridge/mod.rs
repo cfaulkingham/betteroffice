@@ -33,7 +33,7 @@
 //! page content height, and the mapping from yrs ids to the numeric ids the
 //! layout contract uses — arrive in [`RenderEnv`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
@@ -55,10 +55,17 @@ use yrs::{Any, Map, MapRef, OffsetKind, Out, ReadTxn, Text, Transact};
 use super::{COMMENTS, DEL, EditError, EditingDoc, INS, decode_anchor, is_pilcrow, story_ref};
 use crate::list_marker::{ListState, compute_list_marker};
 use crate::seed::synthesized_cell_width;
+use crate::sticky_positions::sticky_offset;
 
+pub(crate) mod group_pictures;
+mod group_transforms;
 pub(crate) mod local;
 pub(crate) mod preview;
+pub mod reservations;
+pub use group_pictures::GroupPictureSources;
 mod shapes;
+
+pub use reservations::{Reservation, ReservationKind, ReservationSide, Reservations};
 
 const AUTO_PARAGRAPH_SPACING_PX: f64 = 14.0;
 
@@ -86,6 +93,9 @@ pub struct RenderEnv {
     pub numeric_ids: BTreeMap<String, f64>,
     /// Include hidden text in visible layout without changing the document.
     pub show_hidden_text: bool,
+    /// Report borderless table cell edges as view-only guides.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub show_table_gridlines: bool,
     /// Revision id, as [`crate::ChangeInfo`] reports it, to the decision
     /// shown in place of its markup. A decided insertion or deletion renders
     /// as plain text or not at all, at its original positions; any other
@@ -114,6 +124,11 @@ pub struct RenderEnv {
     /// document's when empty.
     #[serde(skip)]
     pub media: crate::media::MediaSources,
+    /// View-only layout space and hidden ranges, by host key. Never saved.
+    #[serde(skip_serializing_if = "Reservations::is_empty")]
+    pub reservations: Reservations,
+    #[serde(skip)]
+    pub group_pictures: GroupPictureSources,
 }
 
 impl RenderEnv {
@@ -372,17 +387,19 @@ fn yrs_doc_to_mapped_layout_blocks_inner(
         return Err(BridgeError::WrongOffsetKind);
     }
 
-    let with_media;
-    let env = match doc.media_sources() {
-        media if env.media_tokens && env.media.is_empty() && !media.is_empty() => {
-            with_media = RenderEnv {
-                media,
-                ..env.clone()
-            };
-            &with_media
-        }
-        _ => env,
+    let with_sources = RenderEnv {
+        media: if env.media_tokens && env.media.is_empty() {
+            doc.media_sources()
+        } else {
+            env.media.clone()
+        },
+        group_pictures: doc
+            .source_index()
+            .map(|index| index.group_picture_sources())
+            .unwrap_or_else(|| env.group_pictures.clone()),
+        ..env.clone()
     };
+    let env = &with_sources;
     let source = doc.source_metadata();
     local.source = source.as_ref().map(Arc::downgrade).unwrap_or_default();
     local.block(source.as_ref().is_some_and(|source| {
@@ -553,6 +570,89 @@ fn lower_story_with_preview<T: ReadTxn>(
     result
 }
 
+fn can_omit_trailing_body_page_break<T: ReadTxn>(
+    txn: &T,
+    chunks: &[yrs::types::text::Diff<YChange>],
+    starts_at_boundary: bool,
+    local: &local::LocalLowering,
+) -> bool {
+    use crate::structured::source::InlineSource;
+
+    let Some(source) = local.source.upgrade() else {
+        return false;
+    };
+    let mut tail = chunks.iter().rev();
+    let pilcrow = loop {
+        match tail.next().map(|diff| &diff.insert) {
+            Some(Out::YMap(embed))
+                if shared_map_string(embed, txn, "_kind").as_deref() == Some("pageBreak") => {}
+            Some(Out::YMap(mark)) if is_pilcrow(mark, txn) => break mark,
+            _ => return false,
+        }
+    };
+    let empty = match tail.next().map(|diff| &diff.insert) {
+        Some(Out::YMap(embed)) => matches!(
+            shared_map_string(embed, txn, "_kind").as_deref(),
+            Some("pilcrow" | "table" | "blockSdt" | "pageBreak")
+        ),
+        None => starts_at_boundary,
+        _ => false,
+    };
+    if !empty
+        || pilcrow.contains_key(txn, "sectPr")
+        || pilcrow.contains_key(txn, "sectionBreakType")
+    {
+        return false;
+    }
+    let Some(para_id) = shared_map_string(pilcrow, txn, "paraId") else {
+        return false;
+    };
+    let read = source.read();
+    let provenance = &read.provenance;
+    if provenance
+        .block_order
+        .get("body")
+        .is_some_and(|order| order.last().and_then(Option::as_deref) != Some(para_id.as_str()))
+        || !provenance
+            .relocated
+            .iter()
+            .any(|item| item.pin.story == "body" && item.para_id == para_id)
+        || provenance.inline.iter().any(|item| {
+            item.pin.story == "body"
+                && item.para_id == para_id
+                && !matches!(
+                    item.content,
+                    InlineSource::Break {
+                        kind: crate::structured::BreakType::Page,
+                        ..
+                    }
+                )
+        })
+    {
+        return false;
+    }
+    let footnote_position = read
+        .final_section
+        .as_ref()
+        .and_then(|section| section.get("footnotePr"))
+        .and_then(|properties| properties.get("position"))
+        .or_else(|| read.settings.as_ref()?.get("footnotePr")?.get("position"))
+        .and_then(Value::as_str)
+        .unwrap_or("pageBottom");
+    !txn.get_map(crate::STORIES).is_some_and(|stories| {
+        stories.iter(txn).any(|(id, _)| {
+            let note_id = id.strip_prefix("en:").or_else(|| {
+                if matches!(footnote_position, "docEnd" | "sectEnd") {
+                    id.strip_prefix("fn:")
+                } else {
+                    None
+                }
+            });
+            note_id.is_some_and(|id| id.parse::<i64>().is_ok_and(|id| id > 0))
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn walk_story_chunks<T: ReadTxn>(
     txn: &T,
@@ -572,6 +672,8 @@ fn walk_story_chunks<T: ReadTxn>(
     mut hidden_field_blocks: BTreeSet<String>,
     mut recording: Option<&mut preview::UnitRecorder>,
 ) -> Result<(Vec<LayoutBlock>, preview::WalkPosition, BTreeSet<String>), BridgeError> {
+    let starts_at_boundary =
+        initial.at_block_boundary && initial.paragraph_start == initial.story_index;
     let preview::WalkPosition {
         story_slot,
         mut table_ordinal,
@@ -591,6 +693,7 @@ fn walk_story_chunks<T: ReadTxn>(
     let mut pending_hidden_field_blocks = BTreeSet::new();
     let mut pending_code_join: Option<(Vec<FieldCodeParagraph>, String)> = None;
     let mut field_join: Option<FieldJoin> = None;
+    let mut section_mark_breaks = None;
     macro_rules! position {
         () => {
             preview::WalkPosition {
@@ -671,6 +774,8 @@ fn walk_story_chunks<T: ReadTxn>(
             }
             Out::YMap(pilcrow) if is_pilcrow(pilcrow, txn) => {
                 let values = pilcrow_values(pilcrow, txn);
+                let para_id = value_string(values.get("paraId")).unwrap_or_default();
+                let reserved = env.reservations.paragraph(story_id, &para_id);
                 local.observe_pilcrow(
                     &mut plain,
                     pilcrow,
@@ -685,10 +790,24 @@ fn walk_story_chunks<T: ReadTxn>(
                     ),
                     story_index + 1 == story.len(txn),
                     local_safe
+                        && !(story_id == "body"
+                            && chunk_index + 2 == chunks.len()
+                            && chunks.get(chunk_index + 1).is_some_and(|next| {
+                                matches!(&next.insert, Out::YMap(embed)
+                                    if shared_map_string(embed, txn, "_kind").as_deref()
+                                        == Some("pageBreak"))
+                            }))
+                        && reserved.is_empty()
                         && !value_string(values.get("paraId"))
                             .is_some_and(|id| hidden_field_blocks.contains(&id)),
                 );
-                let para_id = value_string(values.get("paraId")).unwrap_or_default();
+                let placed = reservations::place(
+                    reserved,
+                    &mut paragraph_runs,
+                    &mut paragraph_drawings,
+                    paragraph_start,
+                    story_index,
+                );
                 let code_join = pending_code_join.take();
                 let sectioned =
                     values.contains_key("sectPr") || values.contains_key("sectionBreakType");
@@ -832,6 +951,7 @@ fn walk_story_chunks<T: ReadTxn>(
                     opaque_sequences,
                     revealable,
                     segments,
+                    placed.hides_mark,
                 );
                 suppress_cell_edge_spacing(
                     &mut paragraph_blocks,
@@ -841,6 +961,12 @@ fn walk_story_chunks<T: ReadTxn>(
                         after: cell_edges.after && story_index + 1 == story.len(txn),
                     },
                 );
+                let paragraph_blocks: Vec<LayoutBlock> = placed
+                    .before
+                    .into_iter()
+                    .chain(paragraph_blocks)
+                    .chain(placed.after)
+                    .collect();
                 if !shared_map_string(pilcrow, txn, "paraId")
                     .is_some_and(|id| hidden_field_blocks.contains(&id))
                 {
@@ -974,7 +1100,11 @@ fn walk_story_chunks<T: ReadTxn>(
                 // so an edit before a break leaves its block unchanged.
                 let id = BlockId::Str(format!("{story_id}:{kind}:{break_ordinal}"));
                 break_ordinal += 1;
-                if !hidden {
+                let terminal = kind == "pageBreak"
+                    && story_id == "body"
+                    && story_index + 1 == story.len(txn)
+                    && can_omit_trailing_body_page_break(txn, chunks, starts_at_boundary, local);
+                if !hidden && !terminal {
                     let (pm_start, pm_end) = (Some(pm_cursor as f64), Some((pm_cursor + 1) as f64));
                     blocks.push(if kind == "columnBreak" {
                         LayoutBlock::ColumnBreak(ColumnBreakBlock {
@@ -985,6 +1115,15 @@ fn walk_story_chunks<T: ReadTxn>(
                         })
                     } else {
                         LayoutBlock::PageBreak(PageBreakBlock {
+                            section_mark_ineligible: section_mark_ineligible(
+                                txn,
+                                chunks,
+                                (chunk_index, story_index),
+                                local.source.upgrade().as_deref(),
+                                story_id,
+                                &mut section_mark_breaks,
+                            )
+                            .then_some(true),
                             sdt_groups: None,
                             id,
                             pm_start,
@@ -1321,6 +1460,7 @@ fn walk_story_chunks<T: ReadTxn>(
                     txn,
                     paragraph_pm_start + 1 + u64::from(pm_offset),
                     env,
+                    story_id,
                 ) else {
                     return Err(BridgeError::UnsupportedEmbed {
                         story: story_id.to_owned(),
@@ -1357,12 +1497,14 @@ fn walk_story_chunks<T: ReadTxn>(
                         wrap_polygon: None,
                         allow_overlap: None,
                         layout_in_cell: None,
+                        no_change_aspect: None,
                         effect_extent: None,
                         effects: None,
                         outline: None,
                         decorative: block.decorative,
                         hyperlink: formatting.hyperlink.clone(),
                         inline_shape: Some(Box::new(block)),
+                        inline_chart: None,
                         is_insertion: formatting.is_insertion,
                         is_deletion: formatting.is_deletion,
                         change_author: formatting.change_author.clone(),
@@ -1401,7 +1543,7 @@ fn walk_story_chunks<T: ReadTxn>(
                 if shared_map_string(opaque, txn, "_kind").as_deref() == Some("opaqueDrawing") =>
             {
                 let values = shared_values(opaque, txn);
-                if let Some(preview) = values.get("preview").and_then(any_map) {
+                for preview in opaque_image_previews(&values) {
                     let formatting = lower_run_formatting(attributes, env);
                     paragraph_runs.push(RawRun {
                         kind: RawRunKind::Image(lower_image_values(preview, &formatting, env)),
@@ -1425,9 +1567,8 @@ fn walk_story_chunks<T: ReadTxn>(
             {
                 let pm_offset = paragraph_pm_units;
                 let Some(block) = lower_chart_block(
-                    chart,
-                    txn,
-                    paragraph_pm_start + 1 + u64::from(pm_offset),
+                    &shared_values(chart, txn),
+                    Some(paragraph_pm_start + 1 + u64::from(pm_offset)),
                     env,
                 ) else {
                     return Err(BridgeError::UnsupportedEmbed {
@@ -1493,6 +1634,87 @@ fn walk_story_chunks<T: ReadTxn>(
     Ok((blocks, after, hidden_field_blocks))
 }
 
+type ParagraphBreakEnds = BTreeMap<String, (crate::structured::BreakType, Option<u32>)>;
+
+fn section_mark_ineligible<T: ReadTxn>(
+    txn: &T,
+    chunks: &[yrs::types::text::Diff<YChange>],
+    (chunk_index, story_index): (usize, u32),
+    source: Option<&crate::seed::SourceMetadata>,
+    story_id: &str,
+    breaks: &mut Option<ParagraphBreakEnds>,
+) -> bool {
+    use crate::structured::source::InlineSource;
+
+    let mut owner = chunk_index;
+    let pilcrow = loop {
+        let Some(previous) = owner.checked_sub(1) else {
+            return false;
+        };
+        owner = previous;
+        let Out::YMap(mark) = &chunks[owner].insert else {
+            return false;
+        };
+        if is_pilcrow(mark, txn) {
+            break mark;
+        }
+        if !matches!(
+            shared_map_string(mark, txn, "_kind").as_deref(),
+            Some("pageBreak" | "columnBreak")
+        ) {
+            return false;
+        }
+    };
+    let start = chunks[..owner]
+        .iter()
+        .rposition(|chunk| {
+            matches!(&chunk.insert, Out::YMap(mark) if matches!(
+                shared_map_string(mark, txn, "_kind").as_deref(),
+                Some("pilcrow" | "table" | "blockSdt" | "pageBreak" | "columnBreak")
+            ))
+        })
+        .map_or(0, |index| index + 1);
+    let whitespace_only = start < owner
+        && chunks[start..owner]
+            .iter()
+            .all(|chunk| match &chunk.insert {
+                Out::Any(Any::String(text)) => text.chars().all(char::is_whitespace),
+                Out::YMap(mark) => shared_map_string(mark, txn, "_kind").as_deref() == Some("tab"),
+                _ => false,
+            });
+    if whitespace_only {
+        return true;
+    }
+    let breaks = breaks.get_or_insert_with(|| {
+        let Some(source) = source else {
+            return BTreeMap::new();
+        };
+        let provenance = &source.read().provenance;
+        let Some((inline, _)) = provenance.by_story.get(story_id) else {
+            return BTreeMap::new();
+        };
+        let mut resolved = Default::default();
+        inline
+            .iter()
+            .filter_map(|&index| {
+                let record = &provenance.inline[index];
+                let InlineSource::Break { kind, .. } = record.content else {
+                    return None;
+                };
+                Some((
+                    record.para_id.clone(),
+                    (kind, record.pin.resolve(txn, &mut resolved)),
+                ))
+            })
+            .collect()
+    });
+    let para_id = shared_map_string(pilcrow, txn, "paraId").unwrap_or_default();
+    let pilcrow_index = story_index - (chunk_index - owner) as u32;
+    breaks.get(&para_id).is_some_and(|(kind, position)| {
+        *kind != crate::structured::BreakType::Page || *position != Some(pilcrow_index)
+    })
+}
+
 /// CamelCase alias of [`yrs_doc_to_layout_blocks`] for callers spelling the
 /// entry point the way the boundary names it.
 #[allow(non_snake_case)]
@@ -1502,6 +1724,17 @@ pub fn yrsDocToLayoutBlocks(
     env: &RenderEnv,
 ) -> Result<Vec<LayoutBlock>, BridgeError> {
     yrs_doc_to_layout_blocks(doc, story_id, env)
+}
+
+fn opaque_image_previews(values: &HashMap<String, Any>) -> Vec<&HashMap<String, Any>> {
+    let mut previews = Vec::new();
+    if let Some(preview) = values.get("preview").and_then(any_map) {
+        previews.push(preview);
+    }
+    if let Some(Any::Array(images)) = values.get("previews") {
+        previews.extend(images.iter().filter_map(any_map));
+    }
+    previews
 }
 
 /// The paragraph a field's paragraph joins because the field's code hides its mark, and the
@@ -1645,6 +1878,7 @@ impl FieldJoin {
             opaque_sequences,
             revealable,
             self.segments,
+            false,
         );
         suppress_cell_edge_spacing(
             &mut blocks,
@@ -2003,6 +2237,7 @@ fn lower_table<T: ReadTxn>(
             compatibility_mode,
             cell_margin_left: table_margin("left"),
             cell_margin_right: table_margin("right"),
+            gridlines: env.show_table_gridlines.then_some(true),
             pm_start: Some(pm_start as f64),
             pm_end: Some((pm_start + node_size) as f64),
         },
@@ -2129,6 +2364,7 @@ fn image_outline(
             }
             .to_owned(),
         ),
+        ooxml_style: None,
     })
 }
 
@@ -2203,12 +2439,14 @@ fn lower_image_values(
         wrap_polygon: None,
         allow_overlap: None,
         layout_in_cell: None,
+        no_change_aspect: map_bool(values, "noChangeAspect"),
         effect_extent: None,
         effects: None,
         outline: image_outline(values, env),
         decorative: None,
         hyperlink: None,
         inline_shape: None,
+        inline_chart: None,
         is_insertion: formatting.is_insertion,
         is_deletion: formatting.is_deletion,
         change_author: formatting.change_author.clone(),
@@ -2355,6 +2593,7 @@ fn lower_shape_block<T: ReadTxn>(
     txn: &T,
     pm_start: u64,
     env: &RenderEnv,
+    story_id: &str,
 ) -> Option<ShapeBlock> {
     let values = shared_values(shape, txn);
     if let Some(block) = values
@@ -2364,7 +2603,12 @@ fn lower_shape_block<T: ReadTxn>(
             _ => None,
         })
         .and_then(|value| serde_json::from_str::<Value>(&value).ok())
-        .and_then(|value| shapes::lower_shape_json(&value, pm_start, env))
+        .and_then(|value| {
+            let projected =
+                group_pictures::project(&value, story_id, &env.group_pictures, env.media_tokens);
+            let rendered = projected.unwrap_or_else(|| group_pictures::raw_projection(&value));
+            shapes::lower_shape_json(&rendered, pm_start, env)
+        })
     {
         return Some(block);
     }
@@ -2419,27 +2663,29 @@ fn lower_shape_block<T: ReadTxn>(
     })
 }
 
-fn lower_chart_block<T: ReadTxn>(
-    chart: &MapRef,
-    txn: &T,
-    pm_start: u64,
+fn lower_chart_block(
+    values: &std::collections::HashMap<String, Any>,
+    pm_start: Option<u64>,
     env: &RenderEnv,
 ) -> Option<ChartBlock> {
-    let values = shared_values(chart, txn);
-    let chart = map_string(&values, "chartJson")
+    let chart = map_string(values, "chartJson")
         .and_then(|value| serde_json::from_str::<Value>(&value).ok())?;
     let (width, height) = constrain_to_page(
-        map_number(&values, "width")
+        map_number(values, "width")
             .filter(|value| *value != 0.0)
             .unwrap_or(320.0),
-        map_number(&values, "height")
+        map_number(values, "height")
             .filter(|value| *value != 0.0)
             .unwrap_or(220.0),
         env,
     );
     Some(ChartBlock {
         sdt_groups: None,
-        id: BlockId::Str(format!("chart:{pm_start}")),
+        id: BlockId::Str(
+            pm_start
+                .map(|start| format!("chart:{start}"))
+                .unwrap_or_else(|| "chart:inline".to_owned()),
+        ),
         chart,
         width,
         height,
@@ -2448,10 +2694,10 @@ fn lower_chart_block<T: ReadTxn>(
         wrap_text: None,
         relative_height: None,
         behind_doc: None,
-        doc_start: Some(pm_start as f64),
-        doc_end: Some((pm_start + 1) as f64),
-        pm_start: Some(pm_start as f64),
-        pm_end: Some((pm_start + 1) as f64),
+        doc_start: pm_start.map(|start| start as f64),
+        doc_end: pm_start.map(|start| (start + 1) as f64),
+        pm_start: pm_start.map(|start| start as f64),
+        pm_end: pm_start.map(|start| (start + 1) as f64),
     })
 }
 
@@ -2498,7 +2744,7 @@ fn stamp_sdt_group(blocks: &mut [LayoutBlock], group: SdtGroup) {
             LayoutBlock::SectionBreak(block) => &mut block.sdt_groups,
             LayoutBlock::PageBreak(block) => &mut block.sdt_groups,
             LayoutBlock::ColumnBreak(block) => &mut block.sdt_groups,
-            LayoutBlock::Unsupported => continue,
+            LayoutBlock::Reserved(_) | LayoutBlock::Unsupported => continue,
         };
         groups.get_or_insert_with(Vec::new).insert(0, group.clone());
     }
@@ -2699,17 +2945,15 @@ fn lower_inline_sdt_values(
                 });
             }
             "image" | "opaqueDrawing" => {
-                let image = if kind == "opaqueDrawing" {
-                    payload
-                        .and_then(|payload| payload.get("preview"))
-                        .and_then(any_map)
+                let images = if kind == "opaqueDrawing" {
+                    payload.map(opaque_image_previews).unwrap_or_default()
                 } else {
-                    payload
+                    payload.into_iter().collect()
                 };
-                if let Some(payload) = image {
+                for payload in images {
                     runs.push(RawRun {
                         kind: RawRunKind::Image(lower_image_values(payload, &formatting, env)),
-                        formatting,
+                        formatting: formatting.clone(),
                         story_start: story_index,
                         story_end: story_index + 1,
                         pm_start: child_pm_start,
@@ -2901,6 +3145,7 @@ fn lower_cell_borders(
                     width: Some(0.0),
                     color: None,
                     style: Some("none".to_owned()),
+                    ooxml_style: None,
                 })
             })
     };
@@ -2952,6 +3197,7 @@ fn lower_cell_border(
         width: Some(width),
         color: Some(color),
         style: Some(css_style.to_owned()),
+        ooxml_style: Some(style),
     })
 }
 
@@ -2978,6 +3224,7 @@ enum RawRunKind {
         locked: bool,
         nested_sequences: Vec<String>,
     },
+    Reserved(docx_layout::types::ReservedRun),
 }
 
 /// One run before coalescing and before its position is made absolute.
@@ -3067,9 +3314,10 @@ fn lift_drawings(
 
 /// Resolves every comment anchored in `story_id` to sorted, story-global
 /// UTF-16 intervals with the numeric ids the layout contract carries. Anchors
-/// in other stories are skipped and an empty range contributes nothing; an
-/// anchor that no longer resolves is an error, because the run cuts derived
-/// from these intervals would silently misplace the comment.
+/// in other stories are skipped and an empty range contributes nothing. An
+/// anchor whose text this replica has not integrated yet contributes nothing
+/// either: anchors are opaque bytes, so a comment can arrive before the text
+/// it points at, and the next lowering picks it up once that text arrives.
 fn resolve_comment_intervals<T: ReadTxn>(
     txn: &T,
     story_id: &str,
@@ -3092,13 +3340,12 @@ fn resolve_comment_intervals<T: ReadTxn>(
             if anchor.story != story_id {
                 continue;
             }
-            let start = anchor.start.get_offset(txn).ok_or_else(|| {
-                EditError::InvalidComment("start anchor no longer resolves".into())
-            })?;
-            let end = anchor
-                .end
-                .get_offset(txn)
-                .ok_or_else(|| EditError::InvalidComment("end anchor no longer resolves".into()))?;
+            let (Some(start), Some(end)) = (
+                sticky_offset(&anchor.start, txn),
+                sticky_offset(&anchor.end, txn),
+            ) else {
+                continue;
+            };
             if start.index < end.index {
                 intervals.push(CommentInterval {
                     start: start.index,
@@ -3278,6 +3525,7 @@ fn flush_paragraph_parts<T: ReadTxn>(
     opaque_sequences: &mut BTreeSet<String>,
     revealable: &mut Option<Vec<LayoutBlock>>,
     mut carried: Vec<(u32, Vec<RawRun>)>,
+    hides_mark: bool,
 ) -> Vec<LayoutBlock> {
     let source = map.paragraph_count();
     map.paragraphs.push((
@@ -3314,12 +3562,13 @@ fn flush_paragraph_parts<T: ReadTxn>(
             atom: true,
         });
     }
+    let has_source_content = !drawings.is_empty();
     let (anchored, drawings): (Vec<_>, Vec<_>) =
         drawings.into_iter().partition(|drawing| drawing.anchored);
     let mut blocks: Vec<LayoutBlock> = anchored.into_iter().map(|drawing| drawing.block).collect();
 
     if drawings.is_empty() {
-        let paragraph = flush_paragraph(
+        let mut paragraph = flush_paragraph(
             raw_runs,
             pilcrow,
             pilcrow_attributes,
@@ -3332,14 +3581,21 @@ fn flush_paragraph_parts<T: ReadTxn>(
             (map, source),
             carried,
         );
-        if !env.show_hidden_text
-            && paragraph.runs.is_empty()
-            && mark_bool(pilcrow_attributes, "hidden").or_else(|| {
-                shared_any(pilcrow, txn, "defaultTextFormatting")
-                    .as_ref()
-                    .and_then(any_map)
-                    .and_then(|defaults| map_bool(defaults, "hidden"))
-            }) == Some(true)
+        if has_source_content || (paragraph.runs.is_empty() && paragraph_pm_units > 0) {
+            paragraph
+                .attrs
+                .get_or_insert_with(Default::default)
+                .has_source_content = Some(true);
+        }
+        if paragraph.runs.is_empty()
+            && (hides_mark
+                || (!env.show_hidden_text
+                    && mark_bool(pilcrow_attributes, "hidden").or_else(|| {
+                        shared_any(pilcrow, txn, "defaultTextFormatting")
+                            .as_ref()
+                            .and_then(any_map)
+                            .and_then(|defaults| map_bool(defaults, "hidden"))
+                    }) == Some(true)))
         {
             return blocks;
         }
@@ -3414,6 +3670,14 @@ fn flush_paragraph_parts<T: ReadTxn>(
             Vec::new(),
         )));
     }
+    for block in &mut blocks {
+        if let LayoutBlock::Paragraph(paragraph) = block {
+            paragraph
+                .attrs
+                .get_or_insert_with(Default::default)
+                .has_source_content = Some(true);
+        }
+    }
     blocks
 }
 
@@ -3466,6 +3730,7 @@ fn flush_paragraph<T: ReadTxn>(
         .iter()
         .flat_map(|(source, runs)| runs.iter().map(|raw| (raw, *source)))
         .chain(raw_runs.iter().map(|raw| (raw, source)))
+        .filter(|(raw, _)| !matches!(raw.kind, RawRunKind::Reserved(_)))
     {
         map.spans.push(SourceSpan {
             pm_start: paragraph_pm_start + 1 + u64::from(raw.pm_start),
@@ -3751,6 +4016,11 @@ fn raw_run_to_layout(raw: RawRun, paragraph_pm_start: u64) -> Run {
             image.pm_end = pm_end;
             Run::Image(image)
         }
+        RawRunKind::Reserved(mut reserved) => {
+            reserved.pm_start = pm_start;
+            reserved.pm_end = pm_end;
+            Run::Reserved(reserved)
+        }
         RawRunKind::Field {
             field_type,
             raw_type,
@@ -3784,7 +4054,7 @@ fn stamp_logical_order(runs: &mut [Run]) {
             Run::Text(run) => run.fmt.logical_order = Some(index as u64),
             Run::Tab(run) => run.fmt.logical_order = Some(index as u64),
             Run::Field(run) => run.fmt.logical_order = Some(index as u64),
-            Run::Image(_) | Run::LineBreak(_) | Run::Unsupported => {}
+            Run::Image(_) | Run::LineBreak(_) | Run::Reserved(_) | Run::Unsupported => {}
         }
     }
 }
@@ -4105,6 +4375,7 @@ fn lower_paragraph_attrs(
     lower_paragraph_indent(values, &mut result);
     lower_paragraph_tabs(values, &mut result);
 
+    result.has_source_content = true_property(values, "hasSourceContent");
     result.keep_next = true_property(values, "keepNext");
     result.keep_lines = true_property(values, "keepLines");
     result.widow_control = false_property(values, "widowControl");
@@ -6760,5 +7031,20 @@ mod tests {
             ),
         ]);
         assert!(image_outline(&values, &RenderEnv::default()).is_none());
+    }
+
+    #[test]
+    fn image_outlines_read_legacy_and_ordered_colour_modifiers_alike() {
+        for color in [
+            json!({"rgb":"FFFFFF","luminanceModulation":0.75}),
+            json!({"rgb":"FFFFFF","transforms":[{"kind":"lumMod","value":0.75}]}),
+        ] {
+            let values = HashMap::from([(
+                "borderColorValue".to_owned(),
+                serde_json::from_value::<Any>(color).unwrap(),
+            )]);
+            let outline = image_outline(&values, &RenderEnv::default()).unwrap();
+            assert_eq!(outline.color.as_deref(), Some("#BFBFBF"));
+        }
     }
 }

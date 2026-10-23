@@ -7,7 +7,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createOfficeMcpServer } from '../src/mcp';
 import { openPptx } from '../src/pptx';
-import { presentationFixture } from './pptx-fixture';
+import { presentationFixture, layoutFixture } from './pptx-fixture';
 
 async function connect(readOnly = false) {
   const root = await mkdtemp(join(tmpdir(), 'pptx-mcp-'));
@@ -71,6 +71,32 @@ test('PPTX MCP read-only mode excludes writes and rejects oversized read inputs'
   } finally { await context.dispose(); }
 });
 
+test('PPTX MCP edit validation names the field that is wrong', async () => {
+  const context = await connect();
+  try {
+    const tool = (await context.client.listTools()).tools.find(tool => tool.name === 'pptx_edit') as any;
+    const item = tool.inputSchema.properties.edits.items;
+    expect(Object.keys(item)).toEqual(['oneOf']);
+    expect(item.oneOf.map((variant: any) => variant.properties.op.const)).toEqual([
+      'replace_text', 'set_paragraphs', 'find_replace', 'add_slide', 'set_slide_layout', 'duplicate_slide', 'delete_slide',
+      'move_slide', 'add_text_box', 'add_shape', 'add_image', 'set_notes', 'add_image_file',
+    ]);
+    for (const variant of item.oneOf) expect(variant.additionalProperties).toBe(false);
+    const opened = await context.client.callTool({ name: 'office_open', arguments: { path: 'deck.pptx' } });
+    const document = (opened.structuredContent as any).document;
+    const outline = (await context.client.callTool({ name: 'pptx_outline', arguments: { document } })).structuredContent as any;
+    const slide = outline.slides[0].id;
+    const edit =(edits: object[]) => context.client.callTool({ name: 'pptx_edit', arguments: { document, version: outline.version, edits } });
+    const missing = await edit([{ op: 'replace_text', shape: 'shape', text: 'x' }]);
+    expect(missing.structuredContent).toMatchObject({ code: 'INVALID_ARGUMENT', issues: [{ path: ['edits', 0, 'slide'] }] });
+    const unknownKey = await edit([{ op: 'set_slide_layout', slide, layout: 'layout', mapping: {} }]);
+    expect(unknownKey.structuredContent).toMatchObject({ code: 'INVALID_ARGUMENT', issues: [{ path: ['edits', 0] }] });
+    expect(JSON.stringify(unknownKey.structuredContent)).toContain('mapping');
+    const image = await edit([{ op: 'add_image_file', slide, name: 'Logo', rect: { x: 0, y: 0, width: 10, height: 10 } }]);
+    expect(image.structuredContent).toMatchObject({ code: 'INVALID_ARGUMENT', issues: [{ path: ['edits', 0, 'path'] }] });
+  } finally { await context.dispose(); }
+});
+
 test('PPTX MCP set_notes text describes its paragraph lines', async () => {
   const context = await connect();
   try {
@@ -120,4 +146,31 @@ test('PPTX MCP adds workspace images and refuses traversal and symlink escapes a
     expect(added.isError).not.toBe(true);
     expect(added.structuredContent).toMatchObject({ results: [{ op: 'add_image_file', changed: true }] });
   } finally { await context.dispose(); await rm(outside, { recursive: true, force: true }); }
+});
+
+test('PPTX MCP exposes and applies explicit layout mappings', async () => {
+  const context = await connect();
+  try {
+    await writeFile(join(context.root, 'layout.pptx'), await layoutFixture());
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const result = await context.client.callTool({ name, arguments: args });
+      expect(result.isError, JSON.stringify(result.structuredContent)).not.toBe(true);
+      return result.structuredContent as any;
+    };
+    const { document } = await call('office_open', { path: 'layout.pptx' });
+    const outline = await call('pptx_outline', { document });
+    const layout = outline.layouts.find((layout: any) => layout.name === 'Title Only');
+    expect(layout.placeholders[0].name).toBe('Heading');
+    const slide = outline.slides[0];
+    const edit = { op: 'set_slide_layout', slide: slide.id, layout: layout.id, placeholders: [{ shape: slide.shapes[0].id, layoutPlaceholder: '8' }] };
+    const rejected = await context.client.callTool({ name: 'pptx_edit', arguments: { document, version: outline.version, edits: [{ op: 'set_notes', slide: slide.id, text: 'rollback' }, { ...edit, layout: 'missing' }] } });
+    expect(rejected.isError).toBe(true);
+    await call('pptx_edit', { document, version: outline.version, edits: [edit] });
+    const stale = await context.client.callTool({ name: 'pptx_edit', arguments: { document, version: outline.version, edits: [edit] } });
+    expect(stale.structuredContent).toMatchObject({ code: 'STALE_TARGET' });
+    await call('office_export', { document, path: 'layout-saved.pptx' });
+    const reopened = await openPptx(await readFile(join(context.root, 'layout-saved.pptx')));
+    try { expect(reopened.outline().slides[0].layoutId).toBe(layout.id); }
+    finally { reopened.close(); }
+  } finally { await context.dispose(); }
 });

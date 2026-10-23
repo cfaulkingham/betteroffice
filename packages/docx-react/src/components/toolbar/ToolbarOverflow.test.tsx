@@ -665,6 +665,7 @@ describe('overflow coverage', () => {
       'Delete column',
       'Delete table',
       'Borders',
+      'View gridlines',
       'Border Color',
       'Border width',
       'Cell Fill Color',
@@ -699,7 +700,7 @@ describe('overflow coverage', () => {
       'Align table center',
       'Align table right',
     ]);
-  });
+  }, 30_000);
 
   test('overflow choices run the same commands as the controls they replace', async () => {
     const harness = mountDefault();

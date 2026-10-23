@@ -46,6 +46,8 @@ pub fn reset_col_style_scans() {
 /// `ref` must not be able to ask for a sheet's worth of cells.
 pub const MAX_SPILL_CELLS: usize = 262_144;
 
+pub const MAX_DEFINED_NAMES: usize = 65_536;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FreezePane {
     pub rows: RowId,
@@ -122,6 +124,47 @@ impl Table {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionalFormatRule {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub rule_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
+    #[serde(default)]
+    pub formulas: Vec<String>,
+    pub priority: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dxf_id: Option<u32>,
+    #[serde(default)]
+    pub format: crate::styles::DifferentialFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_xml: Option<String>,
+}
+
+impl ConditionalFormatRule {
+    pub fn editable(&self) -> bool {
+        matches!(self.rule_type.as_str(), "cellIs" | "expression")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoFilter {
+    pub range: CellRange,
+    pub raw_xml: Option<String>,
+    pub source_count: u32,
+    pub filter_columns: Vec<u32>,
+    pub has_sort_state: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ConditionalFormatting {
+    pub sqref: String,
+    #[serde(default)]
+    pub rules: Vec<ConditionalFormatRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hyperlink {
     pub range: CellRange,
     pub external_target: Option<String>,
@@ -168,9 +211,13 @@ pub struct Sheet {
     cells: BTreeMap<(RowId, ColId), Cell>,
     pub freeze_pane: Option<FreezePane>,
     pub hyperlinks: Vec<Hyperlink>,
+    pub conditional_formats: Vec<ConditionalFormatting>,
+    pub auto_filter: Option<AutoFilter>,
     pub merges: Vec<CellRange>,
     pub col_widths: BTreeMap<ColId, f64>,
     pub row_heights: BTreeMap<RowId, f64>,
+    pub hidden_col_widths: BTreeMap<ColId, f64>,
+    pub hidden_row_heights: BTreeMap<RowId, f64>,
     /// parsed from `sheetFormatPr`; read by the renderer, never by the writer.
     pub format: SheetFormat,
     /// Column defaults in source order.
@@ -625,7 +672,8 @@ impl Sheet {
             .cells
             .keys()
             .map(|&(row, col)| CellRange::new(CellRef::new(row, col), CellRef::new(row, col)))
-            .chain(self.hyperlinks.iter().map(|link| link.range));
+            .chain(self.hyperlinks.iter().map(|link| link.range))
+            .chain(self.merges.iter().copied());
         let first = bounds.next()?;
         let (mut min_r, mut max_r, mut min_c, mut max_c) = (
             first.start.row,

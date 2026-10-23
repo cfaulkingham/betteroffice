@@ -23,6 +23,7 @@ use crate::ops::{Chunk, ChunkKind};
 use crate::queries::revision_parts;
 use crate::read_types::{block_control_id, control_metadata, inline_control_id, nested_control_id};
 use crate::seed::{SourceMetadata, numeric_field_instruction};
+use crate::sticky_positions::sticky_offset;
 use crate::target::{EditTextView, StoryView, TextPosition, Views};
 use crate::{
     COMMENTS, DEL, EditingDoc, INS, KIND_KEY, TextRange, decode_anchor, map_string, story_ref,
@@ -632,7 +633,7 @@ pub(super) fn export(
 pub(super) fn has_stories(doc: &EditingDoc) -> bool {
     let txn = doc.yrs_doc().transact();
     txn.get_map(crate::STORIES)
-        .is_some_and(|stories| stories.len(&txn) > 0)
+        .is_some_and(|stories| crate::live_stories(&stories, &txn).next().is_some())
 }
 
 fn walk(
@@ -652,7 +653,11 @@ fn walk_with(doc: &EditingDoc, mut exporter: Exporter<'_>) -> DocxStructuredCont
     let txn = doc.yrs_doc().transact();
     exporter.story_ids = txn
         .get_map(crate::STORIES)
-        .map(|stories| stories.keys(&txn).map(str::to_owned).collect())
+        .map(|stories| {
+            crate::live_stories(&stories, &txn)
+                .map(|(id, _)| id.to_owned())
+                .collect()
+        })
         .unwrap_or_default();
     let mut views = Views::new(doc, &txn);
     exporter.read_sections(&mut views);
@@ -1322,8 +1327,9 @@ impl<'a> Exporter<'a> {
                         .iter()
                         .filter_map(|anchor| decode_anchor(anchor).ok())
                         .filter_map(|anchor| {
-                            let start = anchor.start.get_offset(txn)?.index;
-                            let end = anchor.end.get_offset(txn)?.index;
+                            crate::story_ref(txn, &anchor.story).ok()?;
+                            let start = sticky_offset(&anchor.start, txn)?.index;
+                            let end = sticky_offset(&anchor.end, txn)?.index;
                             Some((anchor.story, start, end))
                         })
                         .collect(),
@@ -1336,7 +1342,10 @@ impl<'a> Exporter<'a> {
         let mut sources: HashMap<String, &SourceComment> = HashMap::new();
         if let Some(read) = self.read() {
             for comment in &read.comments {
-                if stored.contains_key(&comment.id) || !read.seeded_comments.contains(&comment.id) {
+                if stored.contains_key(&comment.id)
+                    || (!read.seeded_comments.contains(&comment.id)
+                        && !read.comment_writes.written(&comment.id, "anchors"))
+                {
                     order.push(comment.id.clone());
                     sources.insert(comment.id.clone(), comment);
                 }
@@ -3348,7 +3357,12 @@ impl<'a> Exporter<'a> {
             "opaqueDrawing" => {
                 let element =
                     super::source::element_name(any_str(payload.get("xml")).unwrap_or_default());
-                let preview = any_map(payload.get("preview"));
+                let preview = any_map(payload.get("preview")).or_else(|| {
+                    let Any::Array(previews) = payload.get("previews")? else {
+                        return None;
+                    };
+                    any_map(previews.first())
+                });
                 self.note(
                     DiagnosticCode::UnsupportedContent,
                     Severity::Warning,

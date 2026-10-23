@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { CSSProperties, RefObject } from 'react';
-import { indexGeometry, transformedRect } from '@betteroffice/pptx/peerless';
+import { indexGeometry, transformedRect } from '@betteroffice/pptx/worker';
 import type { ShapeRect } from '@betteroffice/pptx';
 import { usePeerlessCommandBinding } from '../commands/usePeerlessCommandBinding';
 import { PptxCommandContext } from '../commands/PptxCommandProvider';
@@ -26,7 +26,7 @@ import { PeerlessReview, type PeerlessReviewState } from './PeerlessReview';
 import { peerlessExportPng } from './peerlessFrameSource';
 import { PeerlessPresence } from './PeerlessPresence';
 import { peerlessObjectCommand } from './peerlessObjectCommands';
-import { createPeerlessReplica } from './peerlessCollaboration';
+import { createPeerlessReplica, retirePeerlessReplica } from './peerlessCollaboration';
 import { navigatePeerlessSlide } from './peerlessNavigation';
 import { peerlessHistoryKey } from './peerlessHistory';
 import { PeerlessCaret } from './PeerlessCaret';
@@ -188,6 +188,9 @@ export function PeerlessPptxSurface(props: PptxAsyncEditorProps) {
     if (pictureOrigin.current) picker.current?.click();
   }, [presentation]);
   const shapes = usePeerlessShapeGestures(presentation?.store ?? null, { canvas, presentation });
+  useEffect(() => {
+    if (canvas.current) canvas.current.style.cursor = insertion.tool !== 'select' ? 'crosshair' : 'default';
+  }, [insertion.tool, review.diff]);
   const save = useCallback(async () => {
     try {
       const value = api.current;
@@ -242,8 +245,9 @@ export function PeerlessPptxSurface(props: PptxAsyncEditorProps) {
   useEffect(() => {
     const collaboration = props.collaboration;
     if (!presentation?.current || failure || !collaboration?.onReplica) return;
-    collaboration.onReplica(createPeerlessReplica(presentation, collaboration.clientId));
-    return () => { collaboration.onReplica?.(null); };
+    const replica = createPeerlessReplica(presentation, collaboration.clientId);
+    collaboration.onReplica(replica);
+    return () => { try { collaboration.onReplica?.(null); } finally { retirePeerlessReplica(replica); } };
   }, [presentation, failure, props.collaboration?.onReplica]);
   const insertionScale = presentation?.getVisualSnapshot()?.fit.scale ?? 1;
   return <PptxCommandContext.Provider value={commands}><div ref={editor} className={props.className} style={styles.editor} data-testid="pptx-peerless-editor">
@@ -277,7 +281,12 @@ export function PeerlessPptxSurface(props: PptxAsyncEditorProps) {
           if (!event.defaultPrevented) navigatePeerlessSlide(event, presentation);
         }}
         onPointerDown={(event) => { if (!pluginEventStore(event.nativeEvent) && !inPluginChrome(event.target) && !review.diff && !insertion.onPointerDown(event) && !shapes.onPointerDown(event)) selection.onPointerDown(event); }}
-        onPointerMove={(event) => { if (!pluginEventStore(event.nativeEvent) && !inPluginChrome(event.target) && !review.diff && !insertion.onPointerMove(event) && !shapes.onPointerMove(event)) selection.onPointerMove(event); }}
+        onPointerMove={(event) => {
+          if (pluginEventStore(event.nativeEvent) || inPluginChrome(event.target) || review.diff) return;
+          const cursor = insertion.tool === 'select' ? shapes.hoverCursor(event) : null;
+          if (cursor && canvas.current) canvas.current.style.cursor = cursor;
+          if (!insertion.onPointerMove(event) && !shapes.onPointerMove(event)) selection.onPointerMove(event);
+        }}
         onPointerUp={(event) => { if (!pluginEventStore(event.nativeEvent) && !inPluginChrome(event.target) && !review.diff && !insertion.onPointerUp(event) && !shapes.onPointerUp(event)) selection.onPointerUp(event); }}
         onPointerCancel={(event) => { if (pluginEventStore(event.nativeEvent) || inPluginChrome(event.target)) return; insertion.onPointerCancel(event); if (!shapes.onPointerCancel(event)) selection.onPointerCancel(event); }}
         onLostPointerCapture={(event) => { if (pluginEventStore(event.nativeEvent) || inPluginChrome(event.target)) return; insertion.onPointerCancel(event); if (!shapes.onLostPointerCapture(event)) selection.onLostPointerCapture(event); }}>

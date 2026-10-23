@@ -318,6 +318,7 @@ export type ImageRun = {
   allowOverlap?: boolean;
   /** `wp:anchor/@layoutInCell`; undefined = true. */
   layoutInCell?: boolean;
+  noChangeAspect?: boolean;
   /** Effect extent in px. Undefined = zero. */
   effectExtent?: { top?: number; right?: number; bottom?: number; left?: number };
   /** Ordered image effects. Undefined = none. */
@@ -552,6 +553,7 @@ export type CellBorderSpec = {
   width?: number; // pixels
   color?: string; // CSS color
   style?: string; // CSS border-style (solid, dashed, dotted, double)
+  ooxmlStyle?: string; // OOXML ST_Border value, for shared-edge conflict resolution
 };
 
 /**

@@ -14,9 +14,11 @@ import type {
 } from '../../packages/docx/src/yrs/residentEngineWorkerProtocol';
 
 type HeldMessage = { worker: Worker; message: ResidentEngineWorkerResponse };
+type CommandConfirmation = Pick<DocxCommandAck, 'session' | 'incarnation' | 'epoch' | 'throughSeq' | 'version'>;
 
 interface InputProbe {
   commands: DocxCommandEnvelope[];
+  confirmedAtSend: Record<number, CommandConfirmation>;
   acks: DocxCommandAck[];
   frames: DocxCommandFrame[];
   initial: DocxCommandAck | null;
@@ -65,13 +67,19 @@ test.use({ launchOptions: { executablePath: process.env.CHROME || undefined } })
 async function installProbe(page: Page) {
   await page.addInitScript(() => {
     const replayed = new WeakSet<Event>();
+    let confirmation: CommandConfirmation | undefined;
+    const confirm = ({ session, incarnation, epoch, throughSeq, version }: DocxCommandAck) => {
+      confirmation = { session, incarnation, epoch, throughSeq, version };
+    };
     const dispatch = ({ worker, message }: HeldMessage) => {
+      if (message.ok && message.commandAck) confirm(message.commandAck);
       const event = new MessageEvent('message', { data: message });
       replayed.add(event);
       worker.dispatchEvent(event);
     };
     const probe: InputProbe = {
       commands: [],
+      confirmedAtSend: {},
       acks: [],
       frames: [],
       initial: null,
@@ -93,20 +101,22 @@ async function installProbe(page: Page) {
       },
     };
     window.__docxPeerlessInput = probe;
+    const counted = (result: WebAssembly.Instance | WebAssembly.WebAssemblyInstantiatedSource) => {
+      const instance = result instanceof WebAssembly.Instance ? result : result.instance;
+      if ('editsession_new' in instance.exports) probe.mainInstances += 1;
+      return result;
+    };
     const instantiate = WebAssembly.instantiate;
     WebAssembly.instantiate = function (...args: Parameters<typeof instantiate>) {
-      probe.mainInstances += 1;
-      return Reflect.apply(instantiate, WebAssembly, args);
+      return Reflect.apply(instantiate, WebAssembly, args).then(counted);
     } as typeof instantiate;
     const streaming = WebAssembly.instantiateStreaming;
     WebAssembly.instantiateStreaming = function (...args: Parameters<typeof streaming>) {
-      probe.mainInstances += 1;
-      return Reflect.apply(streaming, WebAssembly, args);
+      return Reflect.apply(streaming, WebAssembly, args).then(counted);
     } as typeof streaming;
     WebAssembly.Instance = new Proxy(WebAssembly.Instance, {
       construct(target, args, newTarget) {
-        probe.mainInstances += 1;
-        return Reflect.construct(target, args, newTarget);
+        return counted(Reflect.construct(target, args, newTarget));
       },
     });
     const adjustContext = (frame: DocxCommandFrame | undefined) => {
@@ -142,6 +152,9 @@ async function installProbe(page: Page) {
           if (ack && probe.holdAcks) {
             event.stopImmediatePropagation();
             probe.heldAcks.push({ worker: this, message });
+          } else if (message.commandFrame && probe.holdAcks) {
+            event.stopImmediatePropagation();
+            probe.heldAcks.push({ worker: this, message });
           } else if (ack?.frame && probe.holdFrames) {
             event.stopImmediatePropagation();
             const { frame, ...bareAck } = ack;
@@ -162,7 +175,7 @@ async function installProbe(page: Page) {
           } else if (message.commandFrame && probe.holdFrames) {
             event.stopImmediatePropagation();
             probe.heldFrames.push({ worker: this, message });
-          }
+          } else if (ack) confirm(ack);
         }, true);
       }
 
@@ -181,7 +194,9 @@ async function installProbe(page: Page) {
               },
             };
           }
-          probe.commands.push(structuredClone((outgoing as typeof request).command));
+          const command = structuredClone((outgoing as typeof request).command);
+          probe.commands.push(command);
+          if (confirmation) probe.confirmedAtSend[command.seq] = confirmation;
         }
         const post = () => {
           if (Array.isArray(transferOrOptions)) super.postMessage(outgoing, transferOrOptions);
@@ -294,7 +309,7 @@ async function harnessText(page: Page) {
 
 async function open(page: Page, peerless = true, contextBytes: number | null = null, pageCount = 1, buffer?: Buffer) {
   await installProbe(page);
-  await page.goto(peerless ? '/?format=docx&peerless=1' : '/?format=docx');
+  await page.goto(peerless ? '/?format=docx&peerless=1' : '/?format=docx&peerless=0');
   await page.evaluate((bytes) => { window.__docxPeerlessInput.contextBytes = bytes; }, contextBytes);
   await page.locator('input[type=file]').last().setInputFiles({
     name: 'peerless-input.docx',
@@ -361,10 +376,20 @@ async function commandCount(page: Page) {
   return page.evaluate(() => window.__docxPeerlessInput.commands.length);
 }
 
-function expectChain(commands: DocxCommandEnvelope[]) {
+function expectChain(commands: DocxCommandEnvelope[], confirmedAtSend?: Record<number, CommandConfirmation>) {
   expect(commands.length).toBeGreaterThan(0);
   for (let index = 1; index < commands.length; index += 1) {
-    expect(commands[index]!.afterSeq).toBe(commands[index - 1]!.seq);
+    const command = commands[index]!;
+    const previous = commands[index - 1]!;
+    if (command.afterSeq === undefined && confirmedAtSend) {
+      expect(confirmedAtSend[command.seq]).toEqual({
+        session: command.session,
+        incarnation: command.incarnation,
+        epoch: command.basis.epoch,
+        throughSeq: previous.seq,
+        version: command.basis.version,
+      });
+    } else expect(command.afterSeq).toBe(previous.seq);
   }
   for (const command of commands) {
     if (command.kind !== 'select') expect(command.payload).not.toHaveProperty('selection');
@@ -412,6 +437,33 @@ const steadyCaret = '[data-peerless-docx] div[aria-hidden="true"][style*="curren
 async function pixels(page: Page, peerless = true) {
   return documentCanvas(page, peerless).screenshot({ animations: 'disabled', style: steadyCaret });
 }
+
+test('peerless Shift+Enter saves a soft break within one paragraph', async ({ page }) => {
+  const zip = await JSZip.loadAsync(await documentBytes());
+  zip.file('word/document.xml', (await zip.file('word/document.xml')!.async('string'))
+    .replace('<w:r><w:t>abcd</w:t></w:r>', ''));
+  await open(page, true, null, 1, await zip.generateAsync({ type: 'nodebuffer' }));
+  const input = await focusDocument(page);
+  const start = await commandCount(page);
+  await input.pressSequentially('a');
+  await input.press('Shift+Enter');
+  await input.pressSequentially('b');
+  await settled(page);
+  const commands = await commandsSince(page, start);
+  expect(commands.map(command => command.kind)).toEqual(['insertText', 'lineBreak', 'insertText']);
+  expectChain(commands, await page.evaluate(() => window.__docxPeerlessInput.confirmedAtSend));
+  const xml = await savedXml(page);
+  const paragraphs = await page.evaluate(xml => {
+    const document = new DOMParser().parseFromString(xml, 'application/xml');
+    return Array.from(document.getElementsByTagNameNS('*', 'p')).map(paragraph =>
+      Array.from(paragraph.getElementsByTagNameNS('*', '*')).map(node =>
+        node.localName === 't' ? node.textContent ?? '' : node.localName === 'br' ? '\n' : ''
+      ).join('')
+    );
+  }, xml);
+  expect(paragraphs).toEqual(['a\nb']);
+  expect(xml).toMatch(/<w:t[^>]*>a<\/w:t>[\s\S]*<w:br(?: w:type="textWrapping")?\s*\/>[\s\S]*<w:t[^>]*>b<\/w:t>/);
+});
 
 test('d2d_pending_insert_click_arrow_backspace_order', async ({ page }) => {
   await open(page);
@@ -950,6 +1002,37 @@ test('evicted_page_repaints_after_scroll_back', async ({ page }) => {
   expect(await pageCanvas.evaluate((canvas) => (canvas as HTMLCanvasElement).toDataURL())).toBe(original.pixels);
 });
 
+test('peerless_shift_page_down_selects_text_across_the_viewport', async ({ page }) => {
+  const zip = await JSZip.loadAsync(await documentBytes());
+  const xml = await zip.file('word/document.xml')!.async('string');
+  zip.file('word/document.xml', xml.replace('<w:p><w:r><w:t>abcd</w:t></w:r></w:p>',
+    Array.from({ length: 180 }, (_, index) => `<w:p><w:r><w:t>Line ${index + 1} has text to select.</w:t></w:r></w:p>`).join('')));
+  await open(page, true, null, 1, await zip.generateAsync({ type: 'nodebuffer' }));
+  const input = await focusDocument(page);
+  const scroller = page.locator('.editor-stage .docx-editor__scroll-container');
+  const initial = await page.evaluate(() => window.__docxPeerlessInput.acks.at(-1)!.selection!);
+  const before = await input.boundingBox();
+  const height = await scroller.evaluate(element => element.clientHeight);
+  const scrollTop = await scroller.evaluate(element => element.scrollTop);
+  const start = await commandCount(page);
+  await input.press('Shift+PageDown');
+  await expect.poll(() => commandCount(page)).toBeGreaterThan(start);
+  await settled(page);
+  const selected = await page.evaluate(() => window.__docxPeerlessInput.acks.at(-1)!.selection!);
+  expect(selected.anchor).toMatchObject({ story: initial.anchor.story, paraId: initial.anchor.paraId, offset: initial.anchor.offset });
+  expect(selected.focus.paraId).not.toBe(initial.focus.paraId);
+  const after = await input.boundingBox();
+  const distance = after!.y - before!.y + await scroller.evaluate(element => element.scrollTop) - scrollTop;
+  expect(distance).toBeGreaterThan(height * 0.8);
+  expect(distance).toBeLessThan(height * 1.2);
+  await expect(input).toBeFocused();
+  await input.press('Backspace');
+  await settled(page);
+  const text = await savedText(page);
+  expect(text).not.toContain('Line 1 has text to select.');
+  expect(text).toContain('Line 180 has text to select.');
+});
+
 test('peerless_document_scrolls_with_wheel_and_page_down', async ({ page }) => {
   await open(page, true, null, 40);
   const input = await focusDocument(page);
@@ -977,8 +1060,8 @@ test('peerless_document_scrolls_with_wheel_and_page_down', async ({ page }) => {
   await page.keyboard.press('PageDown');
   await expect.poll(() => scroller.evaluate((element) => element.scrollTop)).toBeGreaterThan(afterWheel);
   await paintTurns(page);
-  await expect(input).toBeFocused();
   await expect(laterCanvas).toBeInViewport();
+  await expect(input).toBeFocused();
   const afterPageDown = await scroller.evaluate((element) => element.scrollTop);
   await page.keyboard.press('PageUp');
   await expect.poll(() => scroller.evaluate((element) => element.scrollTop)).toBeLessThan(afterPageDown);
@@ -1031,6 +1114,7 @@ test('d2d_legacy_input_regression', async ({ page }) => {
   expect(await savedText(page)).toBe('legaPyabcd');
   expect(await page.evaluate(() => window.__docxPeerlessInput.initial)).toBeNull();
   expect(await commandCount(page)).toBe(0);
+  expect(await page.evaluate(() => window.__docxPeerlessInput.mainInstances)).toBeGreaterThan(0);
 });
 
 test('d2d_composition_event_orders_commit_once', async ({ page }) => {
@@ -1117,6 +1201,127 @@ test('package_image_pixels_survive_authoritative_edit_frame', async ({ page }) =
   expect(await savedText(page)).toContain('edited ');
   await expect.poll(coloredPixels).toBeGreaterThan(before * 0.9);
   expect(await page.evaluate(() => window.__docxPeerlessInput.mainInstances)).toBe(0);
+});
+
+test('Escape then Tab leaves document input in either direction', async ({ page }) => {
+  await open(page);
+  const input = await focusDocument(page);
+  const start = await commandCount(page);
+  for (const key of ['Tab', 'Shift+Tab']) {
+    await input.focus();
+    await input.press('Escape');
+    await input.press(key);
+    await expect(input).not.toBeFocused();
+  }
+  await input.focus();
+  await input.press('Shift+Tab');
+  await expect(input).not.toBeFocused();
+  expect(await commandsSince(page, start)).toEqual([]);
+});
+
+test('read-only Tab leaves document input in either direction', async ({ page }) => {
+  await open(page);
+  const input = await focusDocument(page);
+  await setMode(page, 'Editing', 'Viewing');
+  await expect(input).not.toBeEditable();
+  await settled(page);
+  const start = await commandCount(page);
+  for (const key of ['Tab', 'Shift+Tab']) {
+    await input.focus();
+    await input.press(key);
+    await expect(input).not.toBeFocused();
+  }
+  expect(await commandsSince(page, start)).toEqual([]);
+});
+
+test('list Tab preserves selected text and Shift Tab preserves level-zero numbering', async ({ page }) => {
+  const zip = await JSZip.loadAsync(await documentBytes());
+  zip.file('word/document.xml', (await zip.file('word/document.xml')!.async('string'))
+    .replace('<w:p><w:r>', '<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r>'));
+  zip.file('word/numbering.xml',
+    '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+    '<w:abstractNum w:abstractNumId="0">' + [0, 1].map(level =>
+      `<w:lvl w:ilvl="${level}"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%${level + 1}."/></w:lvl>`
+    ).join('') + '</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>');
+  zip.file('word/_rels/document.xml.rels',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/></Relationships>');
+  zip.file('[Content_Types].xml', (await zip.file('[Content_Types].xml')!.async('string'))
+    .replace('</Types>', '<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/></Types>'));
+  await open(page, true, null, 1, await zip.generateAsync({ type: 'nodebuffer' }));
+  const input = await focusDocument(page);
+  await expect.poll(() => page.evaluate(() => window.__docxPeerlessInput.initial?.editState?.toolbar?.paragraphProperties.numPr))
+    .toEqual({ numId: 1, ilvl: 0 });
+  const start = await commandCount(page);
+  await input.press('Shift+Tab');
+  await settled(page);
+  expect(await commandsSince(page, start)).toEqual([]);
+  expect(await savedXml(page)).toMatch(/<w:numId w:val="1"\s*\/>/);
+  await input.press('Shift+ArrowRight');
+  await input.press('Shift+ArrowRight');
+  await input.press('Tab');
+  await settled(page);
+  expect(await savedText(page)).toBe('abcd');
+  await expect.poll(() => page.evaluate(() => window.__docxPeerlessInput.acks.at(-1)?.editState?.toolbar?.paragraphProperties.numPr))
+    .toEqual({ numId: 1, ilvl: 1 });
+  await input.press('Shift+Tab');
+  await settled(page);
+  expect(await savedText(page)).toBe('abcd');
+  await expect.poll(() => page.evaluate(() => window.__docxPeerlessInput.acks.at(-1)?.editState?.toolbar?.paragraphProperties.numPr))
+    .toEqual({ numId: 1, ilvl: 0 });
+  for (const key of ['Tab', 'Shift+Tab']) {
+    await input.focus();
+    await input.press('Escape');
+    await input.press(key);
+    await expect(input).not.toBeFocused();
+  }
+});
+
+test('body Tab saves a tab between typed text with acknowledgements withheld', async ({ page }) => {
+  const zip = await JSZip.loadAsync(await documentBytes());
+  zip.file('word/document.xml', (await zip.file('word/document.xml')!.async('string'))
+    .replace('<w:r><w:t>abcd</w:t></w:r>', ''));
+  await open(page, true, null, 1, await zip.generateAsync({ type: 'nodebuffer' }));
+  const input = await focusDocument(page);
+  const start = await commandCount(page);
+  await page.evaluate(() => { window.__docxPeerlessInput.holdAcks = true; });
+  await beforeinput(input, 'a');
+  await input.press('Tab');
+  await expect(input).toBeFocused();
+  await beforeinput(input, 'b');
+  await page.evaluate(() => window.__docxPeerlessInput.releaseAcks());
+  await expect.poll(async () => (await commandsSince(page, start)).length).toBe(3);
+  await settled(page);
+  const commands = await commandsSince(page, start);
+  expect(commands.map(({ kind, payload }) => ({ kind, payload }))).toEqual([
+    { kind: 'insertText', payload: { text: 'a' } },
+    { kind: 'insertText', payload: { text: '\t' } },
+    { kind: 'insertText', payload: { text: 'b' } },
+  ]);
+  expectChain(commands);
+  const xml = await savedXml(page);
+  expect(xml.match(/<w:p[ >]/g)).toHaveLength(1);
+  expect(xml).toMatch(/<w:t[^>]*>a<\/w:t>[\s\S]*<w:tab\s*\/>[\s\S]*<w:t[^>]*>b<\/w:t>/);
+});
+
+test('body Tab replaces selected text and supports undo and redo', async ({ page }) => {
+  await open(page);
+  const input = await focusDocument(page);
+  await input.press('ArrowRight');
+  await input.press('Shift+ArrowRight');
+  await input.press('Shift+ArrowRight');
+  await settled(page);
+  await input.press('Tab');
+  await expect(input).toBeFocused();
+  await settled(page);
+  const xml = await savedXml(page);
+  expect(xml).toMatch(/<w:t[^>]*>a<\/w:t>[\s\S]*<w:tab\s*\/>[\s\S]*<w:t[^>]*>d<\/w:t>/);
+  await input.press('ControlOrMeta+z');
+  await settled(page);
+  expect(await savedText(page)).toBe('abcd');
+  await input.press('ControlOrMeta+Shift+z');
+  await settled(page);
+  expect(await savedXml(page)).toMatch(/<w:t[^>]*>a<\/w:t>[\s\S]*<w:tab\s*\/>[\s\S]*<w:t[^>]*>d<\/w:t>/);
 });
 
 test('table_tab_and_shift_tab_preserve_typing_with_acks_withheld', async ({ page }) => {

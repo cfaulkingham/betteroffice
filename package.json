@@ -21,9 +21,10 @@
     "undici": "^7.29.1",
     "ip-address": "^10.7.1",
     "browserslist": "^4.28.7",
-    "@modelcontextprotocol/sdk": "~1.31.0",
+    "@modelcontextprotocol/sdk": "~1.32.0",
     "hono": "^4.13.7",
-    "qs": "^6.16.0"
+    "qs": "^6.16.0",
+    "glob": "^13.0.6"
   },
   "scripts": {
     "dev": "bun run --filter './apps/web' dev",
@@ -87,7 +88,7 @@
     "@changesets/cli": "^2.31.0",
     "@napi-rs/cli": "^3.9.0",
     "jszip": "3.10.1",
-    "vite": "8.1.4",
+    "vite": "8.1.6",
     "playwright": "1.61.1"
   }
 }

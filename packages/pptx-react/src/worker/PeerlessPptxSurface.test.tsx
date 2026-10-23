@@ -16,7 +16,7 @@ import { registerPresentationCommandHandlers } from '../../../pptx/src/session/c
 import { initWasm } from '../../../pptx/src/wasm/loader';
 import { SessionFailure } from '../../../../shared/office-session/types';
 import type {
-  PeerlessSession, PresentationCommandAck, PresentationCommandClient, PresentationCommandFrame,
+  PptxWorkerSession, PresentationCommandAck, PresentationCommandClient, PresentationCommandFrame,
   PresentationCommandIntent, PresentationCommandOpenResult, PresentationCommandReadResult,
   PresentationCommandEnvelope, PresentationCommandFailure,
   PresentationCommandEvents, PresentationCommandMethods,
@@ -176,6 +176,7 @@ class FakeCommandClient implements PresentationCommandClient {
   state = initial();
   text = 'abc';
   hold = false;
+  refuse?: (intent: PresentationCommandEnvelope) => PresentationCommandAck['outcomes'][number]['reason'];
   readonly versions = new Map<string, number>([['v0', 0]]);
   readonly mutations: { seq: number; from: number; to: number; length: number }[] = [];
   readonly outcomes = new Map<number, PresentationCommandAck['outcomes'][number]>();
@@ -218,6 +219,13 @@ class FakeCommandClient implements PresentationCommandClient {
           this.outcomes.set(sequence, outcome);
           continue;
         }
+      }
+      const refusal = this.refuse?.(intent);
+      if (refusal) {
+        const outcome: PresentationCommandAck['outcomes'][number] = { seq: sequence, status: 'refused', reason: refusal, committed: false };
+        outcomes.push(outcome);
+        this.outcomes.set(sequence, outcome);
+        continue;
       }
       let committed = false;
       if (intent.kind === 'setReadOnly') readOnly = intent.payload.readOnly;
@@ -314,7 +322,7 @@ function session(held = false) {
   const ready = deferred<PresentationCommandClient>();
   const listeners = new Set<(error: PresentationCommandFailure) => void>();
   let failure: PresentationCommandFailure | undefined;
-  const owner: PeerlessSession = {
+  const owner: PptxWorkerSession = {
     ready: ready.promise,
     get failure() { return failure; },
     subscribeFailure(listener) { listeners.add(listener); return () => { listeners.delete(listener); }; },
@@ -461,8 +469,8 @@ test('p2_peerless_mount_ready_after_first_authoritative_paint', async () => {
   await expect(api.saveAsync()).resolves.toEqual(new TextEncoder().encode('abc'));
   await expect(api.readContent()).resolves.toMatchObject({ ok: true });
   const legacy = api as unknown as { handle: unknown; save(): unknown };
-  expect(() => legacy.handle).toThrow(pptx.PptxPeerlessUnsupportedError);
-  expect(() => legacy.save()).toThrow(pptx.PptxPeerlessUnsupportedError);
+  expect(() => legacy.handle).toThrow(pptx.PptxWorkerUnsupportedError);
+  expect(() => legacy.save()).toThrow(pptx.PptxWorkerUnsupportedError);
   view.unmount();
   expect(value.owner.dispose).toHaveBeenCalledTimes(1);
 });
@@ -499,6 +507,29 @@ test('p2_peerless_mount_never_initializes_main_wasm', async () => {
   expect(instantiateStreaming).not.toHaveBeenCalled();
   expect(compile).not.toHaveBeenCalled();
   expect(compileStreaming).not.toHaveBeenCalled();
+});
+
+test('p2_refused_api_proposal_rejects_to_caller_without_onError', async () => {
+  const value = session();
+  value.client.refuse = (intent) => intent.kind === 'invoke' && intent.payload.method === 'propose' ? 'invalid-payload' : undefined;
+  const errors = mock((_error: Error) => {});
+  const ready = mock((_api: PptxAsyncEditorApi) => {});
+  const view = render(<PptxEditor fonts={[]} file={file} {...{ [PEERLESS_FLAG]: true as const }} onError={errors} onReady={ready} />);
+  await waitFor(() => expect(ready).toHaveBeenCalledTimes(1));
+  const access = await ready.mock.calls[0][0].handleAsync();
+  const edit = { type: 'insertSlide', index: 1 } as unknown as editor.ProposalEdit;
+  await act(async () => {
+    await expect(access.propose('Writer', null, [edit])).rejects.toMatchObject({ code: 'invalid-arguments' });
+  });
+  expect(errors).not.toHaveBeenCalled();
+  expect(view.getByRole('application').getAttribute('aria-readonly')).toBe('false');
+  expect(view.queryByRole('alert')).toBe(null);
+  await act(async () => { await access.setSlideNotes('slide', 'notes'); });
+  expect(value.client.outcomes.get(value.client.sent.length)).toMatchObject({ status: 'applied' });
+  let failure!: PresentationCommandFailure;
+  await act(async () => { failure = value.crash(); });
+  expect(errors).toHaveBeenCalledTimes(1);
+  expect(errors.mock.calls[0][0]).toMatchObject({ code: 'editor-failed', cause: failure });
 });
 
 test('p2_worker_failure_goes_read_only_with_typed_onError', async () => {
@@ -1419,7 +1450,7 @@ async function realSession(text = 'abc', position = 1, focus = position, slideCo
   const unsubscribe = client.subscribe((ack) => {
     for (const outcome of ack.outcomes) outcomes.set(outcome.seq, outcome);
   });
-  const owner: PeerlessSession = {
+  const owner: PptxWorkerSession = {
     ready: Promise.resolve(client), failure: undefined,
     subscribeFailure: (listener) => client.subscribeFailure(listener), dispose: mock(async () => {}),
   };
@@ -1578,14 +1609,14 @@ test('p4_paragraph_join_end_type_survives_first_deletion_reply', async () => {
     await act(async () => { value.release(); await value.flush(); });
     const intents = value.sent.slice(value.start);
     expect(intents.map((intent) => intent.kind)).toEqual(['deleteBackward', 'moveSelection', 'insertText']);
-    expect(value.outcomes.get(intents[0].seq)).toMatchObject({ status: 'noop', committed: false });
+    expect(value.outcomes.get(intents[0].seq)).toMatchObject({ status: 'applied', committed: true });
     expect(value.outcomes.get(intents[1].seq)).toMatchObject({ status: 'applied', committed: false });
     expect(value.outcomes.get(intents[2].seq)).toMatchObject({ status: 'applied', committed: true });
     for (const [index, intent] of intents.slice(1).entries()) {
       expect(intent.afterSeq).toBe(intents[index].seq);
       expect('at' in intent.payload ? intent.payload.at : undefined).toEqual({ source: 'afterSeq', seq: intents[index].seq });
     }
-    expect(await value.savedParagraphs()).toEqual(['a', 'bcY']);
+    expect(await value.savedParagraphs()).toEqual(['abcY']);
     expect(value.errors).not.toHaveBeenCalled();
     expect(value.sent[value.start + 1]).toMatchObject({ payload: { motion: 'lineEnd', extend: false } });
   } finally { await value.dispose(); }
@@ -1674,7 +1705,25 @@ test('p5_blank_click_then_text_click_keeps_held_typing', async () => {
       beforeInput(value.input, 'insertText', 'Y');
     });
     await held;
-    await value.finish('aXbcY', ['insertText', 'selectAtPoint', 'insertText']);
+    await value.finish('aXbcY', ['insertText', 'setSelection', 'selectAtPoint', 'insertText']);
+    expect(value.sent[value.start + 1]).toMatchObject({ payload: { selection: null } });
+  } finally { await value.dispose(); }
+});
+
+test.each(['X', 'XY'])('p5_blank_click_keeps_held_typing_without_a_followup (%s)', async (text) => {
+  const value = await mountedRealSession('abc', 1);
+  try {
+    const held = value.hold();
+    await act(async () => {
+      for (const character of text) beforeInput(value.input, 'insertText', character);
+      value.click({ x: value.confirmed.displayList.width - 1, y: value.confirmed.displayList.height - 1 });
+    });
+    await held;
+    expect(value.sent.slice(value.start).map((intent) => intent.kind)).toEqual(['insertText']);
+    await value.finish(`a${text}bc`, [...Array.from(text, () => 'insertText'), 'setSelection']);
+    expect(value.sent[value.start + text.length]).toMatchObject({ payload: { selection: null } });
+    expect(value.client.state.selection).toBeNull();
+    expect(paintedViews[paintedViews.length - 1]?.selection).toBeNull();
   } finally { await value.dispose(); }
 });
 
@@ -1899,7 +1948,7 @@ async function recSurfaceSession(echoReady = false) {
   } as unknown as Worker;
   const font = await readFile(new URL('../../../../crates/ooxml-text/tests/fonts/LiberationSans-Regular.ttf', import.meta.url));
   const factory = mock(() => worker);
-  const owner = pptx.createPeerlessSession(await deck('abc'), {
+  const owner = pptx.createPptxWorkerSession(await deck('abc'), {
     worker: factory, clientId: 7822,
     fonts: [{ family: 'Liberation Sans', bytes: new Uint8Array(font) }],
   });

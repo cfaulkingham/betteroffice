@@ -7,6 +7,10 @@
  * layer is framework glue — keyboard/mouse wiring, focus flow, and DOM chrome.
  */
 
+import {
+  anchorSelection, clearedCells, copiedRange, mergeAnchorCell, selectionDataRequest, selectionHidden, selectionMerges,
+  workbookSelectionMerges,
+} from './selectionData';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { SetStateAction } from 'react';
 import {
@@ -15,7 +19,6 @@ import {
   cellRect,
   chartRegionAtPoint,
   extendTo,
-  fromTsv,
   hyperlinkAtCell,
   initWasm,
   isPngExportAvailable,
@@ -45,6 +48,7 @@ import type {
   MergedRange,
   Proposal,
   Selection,
+  SelectionData,
   SelectionLimits,
   SheetInfo,
   Viewport,
@@ -64,6 +68,7 @@ import type {
   CollaborationReplica,
 } from '@betteroffice/xlsx/collaboration';
 import type { Translations } from '@betteroffice/xlsx-i18n';
+import { CellClipboard, clipboardMarker, parseCellClipboardText, readCellClipboard } from './clipboard';
 import { LocaleProvider, useTranslation } from './i18n';
 import {
   createXlsxCommandController,
@@ -112,7 +117,7 @@ import {
   RemoteSelections,
 } from './presence/Presence';
 import { ProposalsPanel } from './proposals/ProposalsPanel';
-import { deriveLimits, positionAtPoint, scaledRect } from './viewer/sessionGeometry';
+import { cellInViewport, deriveLimits, extendScrollExtent, positionAtPoint, scaledRect } from './viewer/sessionGeometry';
 import { XlsxSessionViewer } from './viewer/XlsxSessionViewer';
 import { XlsxWorkerEditor } from './worker/XlsxWorkerEditor';
 import type { XlsxAsyncEditorApi } from './worker/createAsyncEditorApi';
@@ -124,6 +129,7 @@ import type {
   XlsxRevealAlignment,
 } from './plugins/createPluginClients';
 import { PluginOverlays } from './plugins/PluginOverlays';
+import { frozenGridExtent, visibleGridRange } from './plugins/geometry';
 import { PluginDock, useDockArea, type DockPlacement } from './plugins/PluginPanels';
 import type { XlsxEditorPluginProps, XlsxPluginSelection } from './plugins/types';
 import { useXlsxPluginHost } from './plugins/useXlsxPluginHost';
@@ -304,7 +310,8 @@ export type XlsxWorkerViewerProps = Omit<XlsxInThreadEditorProps, 'onReady' | 'r
   [LEGACY_SYNC_API]: true;
   readOnly: true;
   collaboration?: undefined;
-  experimentalWorkerOpen?: true;
+  /** Opens in the worker; without it the legacy runtime runs in-thread. */
+  experimentalWorkerOpen: true;
   onReady?: (api: XlsxWorkerViewerApi) => void | (() => void);
 };
 
@@ -452,9 +459,6 @@ function covers(painted: PaintMark, wanted: PaintMark): boolean {
   );
 }
 
-const LAST_ROW = 1_048_575;
-const LAST_COL = 16_383;
-
 /** Where one axis should scroll to reveal a track of `size` at `position`; null to stay. */
 function revealAxis(
   position: number,
@@ -475,12 +479,7 @@ function revealAxis(
 /** The frozen panes' extent, read from a frame of the active sheet's top left corner. */
 function frozenExtent(handle: WorkbookHandle, info: SheetInfo, viewport: Viewport) {
   const grid = handle.displayList({ ...viewport, x: 0, y: 0 }).grid;
-  const edge = (offsets: number[] | undefined, frozen: number, whole: number) =>
-    frozen === 0 ? 0 : (offsets?.[frozen] ?? whole);
-  return {
-    width: edge(grid?.colOffsets, info.frozenCols, viewport.width),
-    height: edge(grid?.rowOffsets, info.frozenRows, viewport.height),
-  };
+  return frozenGridExtent(grid, info.frozenRows, info.frozenCols, viewport);
 }
 
 /** Scroll offsets, in unzoomed sheet pixels, that reveal a cell of the active sheet. */
@@ -494,7 +493,7 @@ function revealScroll(
 ): { x: number | null; y: number | null } {
   const info = handle.sheetInfo();
   const at = handle.cellPosition(sheet, row, col);
-  const next = handle.cellPosition(sheet, Math.min(row + 1, LAST_ROW), Math.min(col + 1, LAST_COL));
+  const rect = handle.cellRect(sheet, row, col);
   const frozen =
     info.frozenRows > 0 || info.frozenCols > 0
       ? frozenExtent(handle, info, viewport)
@@ -502,7 +501,7 @@ function revealScroll(
   return {
     x: revealAxis(
       at.x,
-      next.x - at.x,
+      rect.w,
       col < info.frozenCols,
       viewport.x,
       Math.max(0, viewport.width - frozen.width),
@@ -510,7 +509,7 @@ function revealScroll(
     ),
     y: revealAxis(
       at.y,
-      next.y - at.y,
+      rect.h,
       row < info.frozenRows,
       viewport.y,
       Math.max(0, viewport.height - frozen.height),
@@ -658,7 +657,7 @@ function XlsxAsyncInThreadSession(props: XlsxAsyncEditorProps) {
 }
 
 export function XlsxEditor(props: XlsxAsyncEditorProps): React.JSX.Element;
-export function XlsxEditor(props: XlsxLegacyEditorProps & { experimentalWorkerOpen: false }): React.JSX.Element;
+export function XlsxEditor(props: XlsxLegacyEditorProps): React.JSX.Element;
 export function XlsxEditor(props: XlsxWorkerViewerProps): React.JSX.Element;
 export function XlsxEditor(props: XlsxWorkerEditorProps): React.JSX.Element;
 export function XlsxEditor(props: WorkerSessionProps): React.JSX.Element;
@@ -671,16 +670,17 @@ export function XlsxEditor(props: XlsxEditorProps | XlsxLegacyEditorProps | Xlsx
 
 function LegacyXlsxEditor(props: GeneralEditorSessionProps | XlsxLegacyEditorProps | XlsxWorkerViewerProps | XlsxWorkerEditorProps | WorkerSessionProps): React.JSX.Element {
   useEffect(() => { warnXlsxEngine('legacy-sync-api'); }, []);
-  const inThread = props.experimentalWorkerOpen === false;
+  const workerOpen = props.experimentalWorkerOpen;
   const collaboration = props.collaboration;
-  const identity = useMemo(() => ({}), [props.file, collaboration, inThread]);
-  const start = () => ({ identity, reason: inThread ? 'deprecated' as XlsxEngineWarning
+  const identity = useMemo(() => ({}), [props.file, collaboration, workerOpen]);
+  const start = () => ({ identity, reason: workerOpen === false ? 'deprecated' as XlsxEngineWarning
+    : workerOpen !== true ? 'in-thread' as const
     : typeof Worker !== 'function' ? 'no-worker' as XlsxEngineWarning : undefined, editor: !props.readOnly });
   const [choice, setChoice] = useState(start);
   const session = choice.identity === identity ? choice : start();
   const editor = session.editor || !props.readOnly;
   if (choice !== session || choice.editor !== editor) setChoice({ ...session, editor });
-  useEffect(() => { if (session.reason) warnXlsxEngine(session.reason); }, [session.reason]);
+  useEffect(() => { if (session.reason && session.reason !== 'in-thread') warnXlsxEngine(session.reason); }, [session.reason]);
   return session.reason ? <XlsxEditorContent {...props as XlsxInThreadEditorProps} />
     : editor ? <XlsxWorkerEditor {...props as XlsxWorkerEditorProps} />
     : <XlsxSessionViewer {...props as XlsxWorkerViewerProps} />;
@@ -725,6 +725,7 @@ function XlsxEditorContent({
   // current model — either would answer for pixels that are not on screen.
   const paintedRef = useRef<{ frame: DisplayList; zoom: number; sheet: number; handle: WorkbookHandle | null } | null>(null);
   const rafRef = useRef<number | null>(null);
+  const [cellClipboard] = useState(() => new CellClipboard());
   const rootRef = useRef<HTMLDivElement>(null);
   const editorInputRef = useRef<HTMLInputElement>(null);
   const formulaInputRef = useRef<HTMLInputElement>(null);
@@ -783,7 +784,7 @@ function XlsxEditorContent({
   useEffect(() => { if (error) onErrorRef.current?.(new Error(error)); }, [error]);
   const [renderError, setRenderError] = useState<string | null>(null);
   const [frame, setFrame] = useState<DisplayList | null>(null);
-  const [selection, setSelection, selectionRef] = useSyncedState<Selection | null>(null);
+  const [selection, setRawSelection, selectionRef] = useSyncedState<Selection | null>(null);
   const [editing, setEditing] = useState<EditState | null>(null);
   const [focusedCell, setFocusedCell] = useState<CellEdit | null>(null);
   const [formulaDraft, setFormulaDraft] = useState<string | null>(null);
@@ -802,6 +803,13 @@ function XlsxEditorContent({
   // logical-px preview of an arrow burst that has not landed yet.
   const [nudgeOffset, setNudgeOffset] = useState<{ x: number; y: number } | null>(null);
   const [visibleMergedRanges, setVisibleMergedRanges] = useState<readonly MergedRange[]>([]);
+  const mergedRangesRef = useRef<{ sheet: number; ranges: readonly MergedRange[] } | null>(null);
+  const merges = () => workbookSelectionMerges(handleRef.current, activeSheetRef.current,
+    selectionMerges(mergedRangesRef.current?.sheet === activeSheetRef.current ? mergedRangesRef.current.ranges : undefined));
+  const setSelection = useCallback((next: SetStateAction<Selection | null>) => {
+    const selected = typeof next === 'function' ? next(selectionRef.current) : next;
+    setRawSelection(selected ? anchorSelection(selected, workbookSelectionMerges(handleRef.current, activeSheetRef.current)) : null);
+  }, []);
   const borderStyleChoiceRef = useRef<BorderStyle | undefined>(undefined);
   const borderColorChoiceRef = useRef<string | undefined>(undefined);
   const [capturedFormat, setCapturedFormat, capturedFormatRef] =
@@ -888,7 +896,7 @@ function XlsxEditorContent({
     (handle: WorkbookHandle, sheet: number, next: Selection | null) => {
       handle.setActiveSheet(sheet);
       setSheetInfo(handle.sheetInfo());
-      setSelection(next ? { anchor: { ...next.anchor }, focus: { ...next.focus } } : null);
+      setSelection(next ? structuredClone(next) : null);
       setSelectedChart(null);
       dropDrafts();
       setCapturedFormat(null);
@@ -951,6 +959,8 @@ function XlsxEditorContent({
         }
         try {
           const zoom = zoomRef.current;
+          const info = sheetInfoRef.current;
+          if (info) setSheetInfo(extendScrollExtent(scroll, info, handle.cellRect(sheet, row, col), zoom));
           const target = revealScroll(handle, sheet, row, col, align, {
             x: scroll.scrollLeft / zoom,
             y: scroll.scrollTop / zoom,
@@ -964,6 +974,21 @@ function XlsxEditorContent({
     },
     [activeSheetRef]
   );
+
+  const revealedZoom = useRef(zoom);
+  useEffect(() => {
+    if (revealedZoom.current === zoom) return;
+    const previousZoom = revealedZoom.current;
+    revealedZoom.current = zoom;
+    const selected = selectionRef.current;
+    const scroll = scrollRef.current;
+    const handle = handleRef.current;
+    if (!selected || !scroll || !handle) return;
+    const { row, col } = selected.focus;
+    if (cellInViewport(scroll, handle.cellRect(activeSheetRef.current, row, col), previousZoom)) {
+      revealCell(activeSheetRef.current, row, col, 'nearest', () => selectionRef.current === selected);
+    }
+  }, [zoom, revealCell]);
 
   useEffect(() => {
     if (!readOnly) return;
@@ -1089,7 +1114,7 @@ function XlsxEditorContent({
     return {
       sheetId,
       sheetIndex: activeSheet,
-      cells: selection ? { anchor: { ...selection.anchor }, focus: { ...selection.focus } } : null,
+      cells: selection ? structuredClone(selection) : null,
       chartId: selectedChart?.id ?? null,
     };
   }, [sheetInfo, activeSheet, selection, selectedChart]);
@@ -1130,6 +1155,7 @@ function XlsxEditorContent({
     setProposalsPanelOpen(false);
     setCollaborationReplica(null);
     setVisibleMergedRanges([]);
+    mergedRangesRef.current = null;
     borderStyleChoiceRef.current = undefined;
     borderColorChoiceRef.current = undefined;
     setCapturedFormat(null);
@@ -1172,6 +1198,7 @@ function XlsxEditorContent({
           handleRef.current = handle;
           unsubscribeUpdates = handle.onUpdate(() => {
             if (disposed || !handle) return;
+            cellClipboard.changed();
             mutationRef.current += 1;
             try {
               setSheetInfo(handle.sheetInfo());
@@ -1310,10 +1337,11 @@ function XlsxEditorContent({
       collaborationProvider.setCursor(null);
       return;
     }
+    const range = normalizeRange(selection);
     collaborationProvider.setCursor({
       sheet,
-      anchor: { ...selection.anchor },
-      head: { ...selection.focus },
+      anchor: selection.range ? { row: range.top, col: range.left } : { ...selection.anchor },
+      head: selection.range ? { row: range.bottom, col: range.right } : { ...selection.focus },
     });
   }, [collaborationProvider, selection, sheetInfo, activeSheet, revision]);
 
@@ -1359,16 +1387,11 @@ function XlsxEditorContent({
     }
     let nextMergedRanges: readonly MergedRange[] = [];
     const grid = dl.grid;
-    const rows = (grid?.rowOffsets.length ?? 0) - 1;
-    const columns = (grid?.colOffsets.length ?? 0) - 1;
-    if (handle && grid && rows > 0 && columns > 0) {
+    const visibleRange = grid ? visibleGridRange(grid) : null;
+    if (handle && visibleRange) {
       try {
-        const from = handle.cell(activeSheet, grid.startRow, grid.startCol).a1;
-        const to = handle.cell(
-          activeSheet,
-          grid.startRow + rows - 1,
-          grid.startCol + columns - 1
-        ).a1;
+        const from = handle.cell(activeSheet, visibleRange.top, visibleRange.left).a1;
+        const to = handle.cell(activeSheet, visibleRange.bottom, visibleRange.right).a1;
         nextMergedRanges = handle
           .mergedRanges(activeSheet, `${from}:${to}`)
           .slice(0, MAX_OVERLAY_MERGED_RANGES);
@@ -1389,6 +1412,7 @@ function XlsxEditorContent({
     );
     setRenderError(null);
     setVisibleMergedRanges(nextMergedRanges);
+    mergedRangesRef.current = { sheet: activeSheet, ranges: nextMergedRanges };
     setFrame(dl);
     if (!handle) return;
     const painted: PaintMark = {
@@ -1508,13 +1532,14 @@ function XlsxEditorContent({
   // pending proposals because structural ops and undo/redo can drop them.
   const applyResult = useCallback(
     (result: EditResult) => {
+      if (result.applied) cellClipboard.changed();
       mutationRef.current += 1;
       setSheetInfo(result.sheetInfo);
       setRevision((r) => r + 1);
       refreshProposals();
       if (result.applied) onChangeRef.current?.();
     },
-    [refreshProposals]
+    [refreshProposals, cellClipboard]
   );
 
   // before a command runs, an arrow burst lands and a composition ends.
@@ -1602,10 +1627,9 @@ function XlsxEditorContent({
   const limits = useCallback((): SelectionLimits => {
     return deriveLimits(
       frameRef.current,
-      sheetInfo!,
       (scrollRef.current?.clientHeight ?? 0) / zoom
     );
-  }, [sheetInfo, zoom]);
+  }, [zoom]);
 
   // map a viewport-local pointer event to a sheet cell via the frame geometry.
   const pointToCell = useCallback(
@@ -1764,7 +1788,7 @@ function XlsxEditorContent({
       const handle = handleRef.current;
       const selection = selectionRef.current;
       if (!handle || !selection || readOnly) return;
-      const { row, col } = selection.focus;
+      const { row, col } = mergeAnchorCell(selection.focus, merges());
       let value = seed ?? '';
       if (seed === undefined) {
         try {
@@ -1794,7 +1818,7 @@ function XlsxEditorContent({
       suppressBlurRef.current = true;
       setEditing(null);
       const base = selectionAt({ row, col });
-      setSelection(move ? moveFocus(base, move, { limits: limits() }) : base);
+      setSelection(move ? moveFocus(base, move, { limits: limits(), hidden: selectionHidden(frameRef.current?.grid), merges: merges() }) : base);
       focusContainer();
       showRejected(activeSheetRef.current);
     },
@@ -1822,11 +1846,9 @@ function XlsxEditorContent({
   const writeClear = useCallback(
     ({ handle, sheet, range }: CellTarget) => {
       if (handleRef.current !== handle || readOnlyRef.current) return;
-      const edits: CellInputEdit[] = [];
-      for (let row = range.top; row <= range.bottom; row++) {
-        for (let col = range.left; col <= range.right; col++) edits.push({ row, col, input: '' });
-      }
       try {
+        const edits = clearedCells(range, () => handle.selectionData(sheet, 0, 0, 'usedRange').usedRange);
+        if (!edits) { setError('Clear exceeds the cell limit'); return; }
         applyResult(handle.editCells(sheet, edits));
         return true;
       } catch (e) {
@@ -1842,79 +1864,88 @@ function XlsxEditorContent({
     if (target && !readOnly) void coordinator.input(() => writeClear(target));
   }, [captureTarget, writeClear, readOnly, coordinator]);
 
-  const copyTarget = useCallback(async ({ handle, sheet, range }: CellTarget) => {
+  const copyTarget = useCallback(async ({ handle, sheet, range: selected }: CellTarget, cut = false) => {
+    const token = cellClipboard.begin();
     try {
+      const range = copiedRange(selected, () => handle.selectionData(sheet, 0, 0, 'usedRange').usedRange);
       const from = handle.cell(sheet, range.top, range.left).a1;
       const to = handle.cell(sheet, range.bottom, range.right).a1;
       const cells = handle.rangeCells(sheet, `${from}:${to}`);
-      const tsv = toTsv(
-        cells.map((row) => row.map((c) => ({ input: c.input, isFormula: c.isFormula })))
-      );
-      await (clipboard ?? navigator.clipboard).writeText(tsv);
+      const tsv = toTsv(cells);
+      const marked = !cut && !clipboard && typeof ClipboardItem === 'function' && typeof navigator.clipboard.write === 'function';
+      if (marked) await navigator.clipboard.write([new ClipboardItem({
+        'text/plain': new Blob([tsv], { type: 'text/plain' }), 'text/html': clipboardMarker(token, tsv),
+      })]);
+      else await (clipboard ?? navigator.clipboard).writeText(tsv);
+      if (marked && handleRef.current === handle) {
+        cellClipboard.capture(token, { owner: handle, sheet, range, cells, cut: false }, marked);
+      }
       return true;
-    } catch (error) {
-      onErrorRef.current?.(error instanceof Error ? error : new Error(String(error)));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
       return false;
     }
-  }, [clipboard]);
+  }, [cellClipboard, clipboard]);
 
   const copySelection = useCallback(async () => {
     const target = captureTarget();
     if (target) await copyTarget(target);
   }, [captureTarget, copyTarget]);
 
-  // the cut copies at once and takes its place in input order: it clears what was selected
-  // when it was accepted, once the clipboard write settles, and only while that workbook is
-  // still open and writable.
   const cutSelection = useCallback(() => {
     const target = captureTarget();
     if (!target) return;
-    const copied = copyTarget(target);
+    const escapes = cellClipboard.escaped;
+    const copied = copyTarget(target, true);
     if (readOnly) return;
-    void coordinator.input(async () => ((await copied) ? writeClear(target) : undefined));
-  }, [captureTarget, copyTarget, writeClear, readOnly, coordinator]);
+    void coordinator.input(async () => (cellClipboard.escaped === escapes && (await copied) ? writeClear(target) : undefined));
+  }, [captureTarget, cellClipboard, copyTarget, writeClear, readOnly, coordinator]);
 
-  // the clipboard is read while the key press still grants access; the write
-  // takes its place in input order.
   const pasteSelection = useCallback(() => {
     const handle = handleRef.current;
-    const selection = selectionRef.current;
+    const current = selectionRef.current;
+    const selection = current && anchorSelection(current, workbookSelectionMerges(handle, activeSheetRef.current));
     if (!handle || !selection || readOnly) return Promise.resolve();
+    if (selection !== current) setSelection(selection);
+    const accepted = cellClipboard.current;
     const reading = (async () => {
       try {
-        return await (clipboard ?? navigator.clipboard).readText();
-      } catch {
+        return clipboard ? { text: await clipboard.readText() } : await readCellClipboard();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
         return null;
       }
     })();
     const sheet = activeSheetRef.current;
     const r = normalizeRange(selection);
     return coordinator.input(async () => {
-      const text = await reading;
-      if (text === null || readOnlyRef.current || handleRef.current !== handle) return;
-      const grid = fromTsv(text);
-      if (grid.length === 0) return;
-      const edits: CellInputEdit[] = [];
-      let width = 1;
-      grid.forEach((rowArr, dr) => {
-        width = Math.max(width, rowArr.length);
-        rowArr.forEach((input, dc) => edits.push({ row: r.top + dr, col: r.left + dc, input }));
-      });
+      const data = await reading;
+      if (data === null || readOnlyRef.current || handleRef.current !== handle) return;
       try {
+        const { text, html } = data;
+        const pasted = cellClipboard.paste(handle, text, r, html, sheet, accepted);
+        const grid = pasted ? [] : parseCellClipboardText(text);
+        if (!pasted && grid.length === 0) return;
+        const edits: CellInputEdit[] = pasted?.edits ?? [];
+        let width = 1;
+        if (!pasted) grid.forEach((rowArr, dr) => {
+          width = Math.max(width, rowArr.length);
+          rowArr.forEach((input, dc) => edits.push({ row: r.top + dr, col: r.left + dc, input }));
+        });
         applyResult(handle.editCells(sheet, edits));
+        if (selectionRef.current === selection && activeSheetRef.current === sheet) {
+          setSelection({
+            anchor: { row: r.top, col: r.left },
+            focus: { row: pasted?.bottom ?? r.top + grid.length - 1, col: pasted?.right ?? r.left + width - 1 },
+          });
+        }
+        return true;
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
         return false;
       }
-      if (selectionRef.current === selection && activeSheetRef.current === sheet) {
-        setSelection({
-          anchor: { row: r.top, col: r.left },
-          focus: { row: r.top + grid.length - 1, col: r.left + width - 1 },
-        });
-      }
-      return true;
     });
-  }, [selectionRef, activeSheetRef, applyResult, readOnly, coordinator, setSelection, clipboard]);
+  }, [selectionRef, activeSheetRef, applyResult, readOnly, coordinator, setSelection, clipboard, cellClipboard]);
 
   useEffect(() => {
     const handle = handleRef.current;
@@ -1995,7 +2026,8 @@ function XlsxEditorContent({
       if (!handleRef.current || draft?.source !== 'formula' || readOnly) return;
       if (!coordinator.submit(draft)) return;
       setFormulaDraft(null);
-      if (move) setSelection((prev) => (prev ? moveFocus(prev, move, { limits: limits() }) : prev));
+      if (move) setSelection((prev) => (prev ? moveFocus(prev, move, { limits: limits(), hidden: selectionHidden(frameRef.current?.grid),
+        merges: merges() }) : prev));
       showRejected(activeSheetRef.current);
     },
     [coordinator, limits, readOnly, showRejected]
@@ -2060,6 +2092,16 @@ function XlsxEditorContent({
         }
       }
 
+      const request = selectionDataRequest(e);
+      let data: SelectionData | undefined;
+      try {
+        data = request ? handle.selectionData(activeSheetRef.current, selection.focus.row,
+          selection.focus.col, request === 'region' ? undefined : request) : undefined;
+      } catch (error) {
+        if (request !== 'usedRange' && request !== 'rowEnd') throw error;
+        e.preventDefault();
+        return;
+      }
       const action = selectionKeyReducer(
         selection,
         {
@@ -2069,11 +2111,16 @@ function XlsxEditorContent({
           ctrlKey: e.ctrlKey,
           altKey: e.altKey,
         },
-        limits()
+        limits(),
+        data,
+        selectionHidden(frameRef.current?.grid),
+        merges()
       );
       switch (action.type) {
         case 'move':
           setSelection(action.selection);
+          revealCell(activeSheetRef.current, action.selection.focus.row, action.selection.focus.col, 'nearest',
+            () => selectionRef.current === action.selection);
           e.preventDefault();
           break;
         case 'startEdit':
@@ -2100,6 +2147,7 @@ function XlsxEditorContent({
       clearCells,
       selectedChart,
       nudgeChart,
+      revealCell,
       readOnly,
     ]
   );
@@ -2152,7 +2200,7 @@ function XlsxEditorContent({
       if (!addr) return;
       if (dismissesEditor) commitEditor();
       if (e.shiftKey) setSelection((prev) => (prev ? extendTo(prev, addr, limits()) : prev));
-      else setSelection(selectionAt(addr));
+      else setSelection(selectionAt(mergeAnchorCell(addr, merges())));
       // no click start: a press that dismissed the editor must not also follow a
       // hyperlink in the cell it selects.
       clickStartRef.current = dismissesEditor ? null : addr;
@@ -2588,6 +2636,7 @@ function XlsxEditorContent({
 
   const formulaWritable = !readOnly && selection !== null && selectedChart === null;
   const formulaBar: FormulaBarBinding = {
+    onNavigate: (cell) => { selectCells(activeSheetRef.current, selectionAt(cell)); focusContainer(); },
     a1: focusedCell?.a1 ?? '',
     value: formulaValue,
     disabled: !sheetInfo || !selection,
@@ -2597,7 +2646,8 @@ function XlsxEditorContent({
       const current = selectionRef.current;
       if (!formulaWritable || readOnlyRef.current || !current || selectedChartRef.current) return;
       setFormulaDraft(value);
-      coordinator.setDraft(draftFor('formula', current.focus.row, current.focus.col, value));
+      const target = mergeAnchorCell(current.focus, merges());
+      coordinator.setDraft(draftFor('formula', target.row, target.col, value));
       onChangeRef.current?.();
     },
     onCommit: (move) => {
@@ -2703,6 +2753,7 @@ function XlsxEditorContent({
       className={className}
       role="application"
       aria-label={t('editor.appLabel')}
+      onKeyDownCapture={(event) => { if (!fromPlugin(event) && event.key === 'Escape') cellClipboard.escape(); }}
       style={{
         position: 'relative',
         display: 'flex',

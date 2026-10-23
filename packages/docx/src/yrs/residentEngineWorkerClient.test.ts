@@ -18,6 +18,7 @@ import type {
   ResidentEngineWorkerResponse,
 } from './residentEngineWorkerProtocol';
 import type { DocxCommandFrame, ResidentCommandInitReply } from './residentCommandProtocol';
+import { ResidentSourceWorkerClient } from './residentSourceWorkerClient';
 
 class FakeWorker implements ResidentEngineWorkerPort {
   static instances: FakeWorker[] = [];
@@ -105,6 +106,16 @@ function armedBudgets(): number[] {
   return [...timers.values()].map((timer) => timer.ms);
 }
 
+function advanceTimers(ms: number): void {
+  for (const [id, timer] of [...timers]) {
+    timer.ms -= ms;
+    if (timer.ms <= 0) {
+      timers.delete(id);
+      timer.callback();
+    }
+  }
+}
+
 const snapshot: YrsResidentWorkerSnapshot = {
   clientId: 1,
   state: new Uint8Array([1]),
@@ -142,6 +153,52 @@ function setup() {
   const worker = new FakeWorker();
   const client = new ResidentEngineWorkerClient(worker);
   return { worker, client };
+}
+
+test('remote command updates transfer an owned buffer and preserve caller bytes', async () => {
+  const { worker, client } = setup();
+  const update = new Uint8Array([1, 2, 3]).buffer;
+  const pending = client.edit({ session: 'room', incarnation: 1, seq: 1, basis: { epoch: 1, version: 0 },
+    kind: 'applyRemoteUpdate', payload: { update } });
+  const request = worker.requestAt(0);
+  expect(request.type).toBe('edit');
+  if (request.type !== 'edit' || request.command.kind !== 'applyRemoteUpdate' || !('update' in request.command.payload)) throw new Error('Expected remote edit');
+  const owned = request.command.payload.update;
+  const transfers = worker.transfers[0]!;
+  const received = structuredClone(request, { transfer: transfers });
+  worker.reply({ id: request.id, ok: false, error: 'test complete' });
+  await expect(pending).rejects.toThrow('test complete');
+  expect(transfers).toEqual([owned]);
+  expect(owned.byteLength).toBe(0);
+  expect(new Uint8Array(update)).toEqual(new Uint8Array([1, 2, 3]));
+  expect(received).toMatchObject({ command: { payload: { update } } });
+  client.destroy();
+});
+
+for (const input of ['view', 'buffer', 'shared'] as const) {
+  test(`source joins transfer an owned initial update without detaching a caller ${input}`, async () => {
+    const worker = new FakeWorker();
+    const client = new ResidentSourceWorkerClient(worker);
+    const bytes = new Uint8Array([1, 2]);
+    const backing = input === 'buffer' ? Buffer.from([9, 3, 4, 9]) : input === 'shared'
+      ? new Uint8Array(new SharedArrayBuffer(4)) : new Uint8Array(4);
+    backing.set([9, 3, 4, 9]);
+    const initialUpdate = backing.subarray(1, 3);
+    const pending = client.openSource({ bytes, collaboration: { clientId: 1, initialUpdate } });
+    const request = worker.requestAt(0);
+    if (request.type !== 'openSource') throw new Error('Expected source open');
+    const owned = request.source.collaboration!.initialUpdate!;
+    const transfers = worker.transfers[0]!;
+    const received = structuredClone(request, { transfer: transfers });
+    worker.reply({ id: request.id, ok: false, error: 'test complete' });
+    await expect(pending).rejects.toThrow('test complete');
+    expect(transfers).toContain(owned.buffer);
+    expect(owned.byteLength).toBe(0);
+    expect([...backing]).toEqual([9, 3, 4, 9]);
+    expect(bytes).toEqual(new Uint8Array([1, 2]));
+    expect(received).toMatchObject({ source: { collaboration: { initialUpdate: new Uint8Array([3, 4]) } } });
+    client.destroy();
+  });
 }
 
 function stagedFrame(revision: number, closed: string[]): DocxCommandFrame {
@@ -1102,15 +1159,6 @@ describe('watchdog', () => {
 
   test('a superseded command frame restarts the silence budget for a pending save', async () => {
     const { worker, client } = setup();
-    function advanceTimers(ms: number): void {
-      for (const [id, timer] of [...timers]) {
-        timer.ms -= ms;
-        if (timer.ms <= 0) {
-          timers.delete(id);
-          timer.callback();
-        }
-      }
-    }
     const identity = { session: 'watchdog-frame', incarnation: 1, epoch: 7 };
     const initial: ResidentCommandInitReply = {
       ...identity, version: 0, throughSeq: 0, outcomes: [], selection: null,
@@ -1185,6 +1233,57 @@ describe('watchdog', () => {
     expect(worker.terminated).toBe(true);
     await expect(client.buildFrame('', 0)).rejects.toThrow('did not answer buildFrame');
     expect(worker.posted).toHaveLength(1);
+  });
+
+  test('a save that keeps reporting progress outlives the silence window', async () => {
+    const { worker, client } = setup();
+    const bootstrap = client.bootstrap(snapshot, '');
+    worker.reply(frameReply(worker.lastId()));
+    await bootstrap;
+    let settled = false;
+    const saved = client.save({ comments: [] }).finally(() => { settled = true; });
+    const id = worker.lastId();
+    for (let elapsed = 0; elapsed < 5 * RESIDENT_WORKER_SILENCE_MS; elapsed += RESIDENT_WORKER_SILENCE_MS - 1) {
+      advanceTimers(RESIDENT_WORKER_SILENCE_MS - 1);
+      worker.reply({ id: 0, ok: true, progress: id });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      expect(armedBudgets()).toEqual([RESIDENT_WORKER_SILENCE_MS]);
+    }
+    expect(worker.terminated).toBe(false);
+    const bytes = new ArrayBuffer(4);
+    worker.reply({ id, ok: true, saved: bytes, updates: [], version: 'v1' });
+    expect(await saved).toMatchObject({ bytes, version: 'v1' });
+    expect(timers.size).toBe(0);
+    expect(client.isReady()).toBe(true);
+  });
+
+  test('a save whose progress stops fails once the worker stays silent', async () => {
+    const { worker, client } = setup();
+    const bootstrap = client.bootstrap(snapshot, '');
+    worker.reply(frameReply(worker.lastId()));
+    await bootstrap;
+    const saved = client.save({ comments: [] }).then(
+      () => { throw new Error('silent save resolved'); },
+      (error: Error) => error
+    );
+    const id = worker.lastId();
+    advanceTimers(RESIDENT_WORKER_SILENCE_MS - 1);
+    worker.reply({ id: 0, ok: true, progress: id });
+    advanceTimers(RESIDENT_WORKER_SILENCE_MS - 1);
+    expect(worker.terminated).toBe(false);
+    advanceTimers(1);
+    const failure = await saved;
+    expect(failure.message).toContain('did not answer save');
+    expect(worker.terminated).toBe(true);
+    expect(timers.size).toBe(0);
+  });
+
+  test('a progress notice with nothing pending arms no budget', () => {
+    const { worker } = setup();
+    worker.reply({ id: 0, ok: true, progress: 7 });
+    expect(timers.size).toBe(0);
+    expect(worker.terminated).toBe(false);
   });
 
   test('disarms the budget once the worker answers', async () => {

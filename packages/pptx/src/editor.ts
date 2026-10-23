@@ -158,6 +158,7 @@ export type {
 export type {
   BlipEffect,
   CaretStop,
+  ColorTransform,
   ColorValue,
   CommentFlavor,
   CommentReceipt,
@@ -221,3 +222,6 @@ export type {
   TransformReceipt,
   UpdateEvent,
 } from './types';
+
+/** @internal */
+export { attachCollaborationPipe, collaborationPipeFor } from './collaboration';

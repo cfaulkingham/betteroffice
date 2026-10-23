@@ -513,6 +513,7 @@ function imagePayload(image: Image): Attrs {
     effectExtentLeft: image.padding?.left != null ? emuToPixels(image.padding.left) : null,
     effectExtentRight: image.padding?.right != null ? emuToPixels(image.padding.right) : null,
     layoutInCell: image.layoutInCell ?? null,
+    noChangeAspect: image.noChangeAspect ?? null,
     allowOverlap: image.allowOverlap ?? null,
   }) as Attrs;
 }
@@ -838,6 +839,7 @@ function runContentToUnits(
         kind: content.kind,
         xml: content.xml,
         ...(content.preview ? { preview: imagePayload(content.preview) } : {}),
+        ...(content.previews?.length ? { previews: content.previews.map(imagePayload) } : {}),
       }, drawingMarks(marks))];
     case 'footnoteRef':
       return [noteRefUnit(content.id, 'footnote', marks)];
@@ -1141,11 +1143,14 @@ function paragraphAttrs(
     listAbstractNumId: paragraph.listRendering?.abstractNumId ?? null,
     listStartOverride: paragraph.listRendering?.startOverride ?? null,
     _originalFormatting: formatting ?? null,
+    ...(formatting?.cnfStyle ? { cnfStyle: formatting.cnfStyle } : {}),
   };
 
+  if (formatting?.frame) attrs.hasSourceContent = true;
   if (styleResolver) {
     const resolved = styleResolver.resolveParagraphStyle(styleId, tableParagraphFormatting, tableRunFormatting);
     const stylePpr = resolved.paragraphFormatting;
+    if (stylePpr?.frame) attrs.hasSourceContent = true;
     attrs.alignment = formatting?.alignment ?? stylePpr?.alignment ?? null;
     attrs.spaceBefore = formatting?.spaceBefore ?? stylePpr?.spaceBefore ?? null;
     attrs.spaceAfter = formatting?.spaceAfter ?? stylePpr?.spaceAfter ?? null;
@@ -1184,6 +1189,7 @@ function paragraphAttrs(
     attrs.snapToGrid = formatting?.snapToGrid ?? stylePpr?.snapToGrid ?? null;
     attrs.autoSpaceDE = formatting?.autoSpaceDE ?? stylePpr?.autoSpaceDE ?? null;
     attrs.autoSpaceDN = formatting?.autoSpaceDN ?? stylePpr?.autoSpaceDN ?? null;
+    attrs.adjustRightInd = formatting?.adjustRightInd ?? stylePpr?.adjustRightInd ?? null;
     attrs.outlineLevel = formatting?.outlineLevel ?? stylePpr?.outlineLevel ?? null;
     attrs.bidi = formatting?.bidi ?? stylePpr?.bidi ?? null;
 
@@ -1227,6 +1233,7 @@ function paragraphAttrs(
     attrs.snapToGrid = formatting?.snapToGrid ?? null;
     attrs.autoSpaceDE = formatting?.autoSpaceDE ?? null;
     attrs.autoSpaceDN = formatting?.autoSpaceDN ?? null;
+    attrs.adjustRightInd = formatting?.adjustRightInd ?? null;
     attrs.outlineLevel = formatting?.outlineLevel ?? null;
     attrs.bidi = formatting?.bidi ?? null;
     attrs.defaultTextFormatting = formatting?.runProperties ?? null;
@@ -1408,7 +1415,7 @@ function calculateRowSpans(table: Table): Map<string, RowSpanInfo> {
   const result = new Map<string, RowSpanInfo>();
   const active = new Map<number, number>();
   table.rows.forEach((row, rowIndex) => {
-    let column = 0;
+    let column = row.formatting?.gridBefore ?? 0;
     const cells = row.cells.map((cell) => {
       const current = column;
       column += cell.formatting?.gridSpan ?? 1;
@@ -1588,7 +1595,7 @@ function projectRow(
   row.cells.forEach((cell) => {
     const colspan = cell.formatting?.gridSpan ?? 1;
     const startColumn = column;
-    const rowSpan = rowSpans.get(`${rowIndex}-${startColumn}`);
+    const rowSpan = rowSpans.get(`${rowIndex}-${startColumn + (row.formatting?.gridBefore ?? 0)}`);
     let gridWidth: number | undefined;
     if (columnWidths && totalWidth > 0) {
       let cellWidth = 0;

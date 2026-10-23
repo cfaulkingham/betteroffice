@@ -1,8 +1,8 @@
 import { expect, test } from 'bun:test';
-import { createDocxWorkerEditSession } from '@betteroffice/docx/peerless';
+import { createDocxWorkerEditSession } from '@betteroffice/docx/worker';
 import type {
   DocxCommandAck, DocxCommandEnvelope, DocxCommandSelection, DocxSelectionPointIntent, ResidentCommandConnection,
-} from '@betteroffice/docx/peerless';
+} from '@betteroffice/docx/worker';
 import type { CommandTicket } from '../../../../../../shared/office-session/commands/types';
 import { captureSelectionIntent } from './selection';
 import type { PeerlessCommandBinding } from './commandBinding';
@@ -85,6 +85,7 @@ function orderedSelection() {
   let tail: CommandTicket | undefined;
   const commands: PeerlessCommandBinding = {
     submit(intent, options) {
+      if (intent.kind === 'acceptRevision' || intent.kind === 'rejectRevision') throw new Error('Unexpected review intent');
       const echo: PeerlessEchoIntent | undefined = intent.kind === 'insertText'
         ? { intent, originalIntentCount: 1, contextFrameEpoch: 7 } : undefined;
       tail = session.submit(intent.kind, intent.payload, { ...options, after: tail, echo });

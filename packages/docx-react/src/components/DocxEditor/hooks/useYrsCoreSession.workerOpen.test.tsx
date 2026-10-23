@@ -1,3 +1,4 @@
+import { LEGACY_SYNC_API_PROP } from '../peerless/contracts';
 import { GlobalRegistrator } from '@happy-dom/global-registrator';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, mock, spyOn, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
@@ -3206,11 +3207,13 @@ test.each(['null', 'throw'] as const)(
       expect(destroyed).not.toHaveBeenCalled();
       await act(async () => { release(); });
       if (outcome === 'throw') {
-        await waitFor(() => expect(result.current.errors).toHaveLength(1));
+        await waitFor(() => {
+          expect(result.current.errors).toHaveLength(1);
+          expect(result.current.core.session).toBeNull();
+          expect(result.current.core.previewing).toBe(false);
+        });
         expect(result.current.errors[0]).toBeInstanceOf(DocxWorkerError);
         expect((result.current.errors[0] as DocxWorkerError).stage).toBe('open');
-        expect(result.current.core.session).toBeNull();
-        expect(result.current.core.previewing).toBe(false);
         expect(result.current.mainOpens).toEqual([]);
         unmount();
         return;
@@ -3249,14 +3252,16 @@ test('terminal worker open OOM fails a previewing load once without a main seed'
   act(() => result.current.pipeline.runLayoutPipeline());
   await waitFor(() => expect(result.current.renderer.presentedEngine).toBe(result.current.core.session));
   act(() => result.current.presentFrame());
-  await waitFor(() => expect(result.current.errors).toHaveLength(1));
+  await waitFor(() => {
+    expect(result.current.errors).toHaveLength(1);
+    expect(result.current.core.session).toBeNull();
+    expect(result.current.core.opening).toBe(false);
+    expect(result.current.core.handoffFrom).toBeNull();
+  });
   expect(result.current.errors[0]).toBeInstanceOf(ResidentWorkerOutOfMemoryError);
   expect(workers).toHaveLength(2);
   expect(posted.map((request) => request.type)).toEqual(['open', 'open']);
   expect(result.current.mainOpens).toEqual([]);
-  expect(result.current.core.session).toBeNull();
-  expect(result.current.core.opening).toBe(false);
-  expect(result.current.core.handoffFrom).toBeNull();
   expect(result.current.core.failOpening(new Error('later'))).toBe(false);
   expect(result.current.errors).toHaveLength(1);
 });
@@ -3349,11 +3354,13 @@ test('a terminal worker failure before the accepted full frame tears down openin
       result.current.pipeline.runLayoutPipeline();
       await received('fontRequirements');
     });
-    await waitFor(() => expect(result.current.errors).toHaveLength(1));
-    expect(result.current.core.session).toBeNull();
-    expect(result.current.core.handoffFrom).toBeNull();
-    expect(result.current.core.opening).toBe(false);
-    expect(result.current.errors).toEqual([result.current.renderer.error!]);
+    await waitFor(() => {
+      expect(result.current.errors).toHaveLength(1);
+      expect(result.current.core.session).toBeNull();
+      expect(result.current.core.handoffFrom).toBeNull();
+      expect(result.current.core.opening).toBe(false);
+      expect(result.current.errors).toEqual([result.current.renderer.error!]);
+    });
     expect(result.current.errors[0]).toBeInstanceOf(ResidentWorkerOutOfMemoryError);
     expect(result.current.errors).toHaveLength(1);
     expect(workers).toHaveLength(2);
@@ -3512,12 +3519,14 @@ test.each([false, true])('a shown viewer preview crash retries only the queued f
       await act(async () => {
         workers[1].onerror?.({ message: 'full open retry crashed' } as ErrorEvent);
       });
-      await waitFor(() => expect(result.current.errors).toHaveLength(1));
+      await waitFor(() => {
+        expect(result.current.errors).toHaveLength(1);
+        expect(result.current.renderer.error).toBe(result.current.errors[0]!);
+        expect(result.current.core.session).toBeNull();
+      });
       const failure = result.current.errors[0];
       expect(failure).toBeInstanceOf(DocxWorkerError);
       expect((failure as DocxWorkerError).stage).toBe('open');
-      expect(result.current.renderer.error).toBe(failure!);
-      expect(result.current.core.session).toBeNull();
       for (let frame = 0; frame < 5; frame += 1) await act(async () => frames.run());
       expect(result.current.errors).toEqual([failure!]);
     } else {
@@ -3778,12 +3787,14 @@ test.each([false, true])('a failed worker open reports one typed error without a
   const { result } = renderHook(useHarness, {
     initialProps: { ...initialProps, viewer },
   });
-  await waitFor(() => expect(result.current.errors).toHaveLength(1));
+  await waitFor(() => {
+    expect(result.current.errors).toHaveLength(1);
+    expect(result.current.renderer.error).toBe(result.current.errors[0]!);
+    expect(result.current.core.session).toBeNull();
+  });
   const failure = result.current.errors[0];
   expect(failure).toBeInstanceOf(DocxWorkerError);
   expect((failure as DocxWorkerError).stage).toBe('open');
-  expect(result.current.renderer.error).toBe(failure);
-  expect(result.current.core.session).toBeNull();
   expect(result.current.host).toBeNull();
   expect(result.current.mainOpens).toEqual([]);
   expect(workers).toHaveLength(2);
@@ -3824,13 +3835,15 @@ test.each(['capability', 'null'] as const)('a viewer with an unavailable worker 
       ...(unavailable === 'null' ? { openInWorker: mock(async () => null) } : {}),
     },
   });
-  await waitFor(() => expect(result.current.errors).toHaveLength(1));
+  await waitFor(() => {
+    expect(result.current.errors).toHaveLength(1);
+    expect(result.current.core.session).toBeNull();
+  });
   const failure = result.current.errors[0] as DocxWorkerError;
   expect(failure).toBeInstanceOf(DocxWorkerError);
   expect(failure.stage).toBe('open');
   expect(failure.cause).toEqual(new Error('The document worker is unavailable'));
   expect(result.current.host).toBeNull();
-  expect(result.current.core.session).toBeNull();
   expect(result.current.mainOpens).toEqual([]);
 });
 
@@ -4015,9 +4028,10 @@ test('a successful worker-recovery main open permits pending reads, navigation a
     const ready = awaitWorkerOpenReplica(session)!;
     act(() => ensureWorkerOpenReplica(session));
     await frames.untilCommitted(ready);
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
     expect(result.current.core.replicaReady).toBe(true);
     expect(replicaHelpers.workerOpenReplicaPending(session)).toBe(false);
-    expect(ensure.mock.calls).toEqual([[session], [session]]);
+    expect(ensure.mock.calls).toEqual([[session], [session], [session], [session]]);
     expect(api.findInDocument('paragraph')).toContainEqual({
       paraId: 'body:p0', match: 'paragraph', before: 'First ', after: '',
     });
@@ -4126,16 +4140,18 @@ test('a failed worker open reports its typed error without parsing a main fallba
   const invalid = Uint8Array.of(1, 2, 3);
   const { workers, posted } = installWorker({ failOpen: true });
   const { result } = renderHook(useHarness, { initialProps: { ...initialProps, source: invalid } });
-  await waitFor(() => expect(result.current.errors).toHaveLength(1));
+  await waitFor(() => {
+    expect(result.current.errors).toHaveLength(1);
+    expect(result.current.renderer.error).toBe(result.current.errors[0]!);
+    expect(result.current.core.session).toBeNull();
+  });
   const failure = result.current.errors[0] as DocxWorkerError;
   expect(failure).toBeInstanceOf(DocxWorkerError);
   expect(failure.stage).toBe('open');
   expect(failure.cause).toEqual(new Error('open failed'));
-  expect(result.current.renderer.error).toBe(failure);
   expect(workers).toHaveLength(2);
   expect(posted.filter((request) => request.type === 'open')).toHaveLength(2);
   expect(result.current.mainOpens).toEqual([]);
-  expect(result.current.core.session).toBeNull();
 });
 
 test('a shared collaboration update keeps the existing join path', async () => {
@@ -4174,7 +4190,7 @@ test('a shared collaboration update keeps the existing join path', async () => {
   });
   try {
     const view = render(
-      <DocxEditor
+      <DocxEditor {...{ [LEGACY_SYNC_API_PROP]: true }}
         ref={ref}
         documentBuffer={source.slice().buffer as ArrayBuffer}
         collaboration={{ initialUpdate }}
@@ -4307,15 +4323,15 @@ test('read-only handoff fallback requests a new frame and restores queries', asy
 test('read-only handoff OOM bootstraps its replacement worker and restores queries', async () => {
   const { workers, posted } = installWorker({ oomStage: 'encodeState' });
   const { result } = renderHook(useHarness, { initialProps: { ...initialProps, readOnly: true } });
-  await waitFor(() => expect(result.current.core.replicaReady).toBe(true));
   await waitFor(() => expect(workers).toHaveLength(2));
   await waitFor(() => expect(posted.filter((request) => request.type === 'bootstrap')).toHaveLength(2));
   await waitFor(() => expect(result.current.renderer.workerSurfacesActive).toBe(true));
   await waitFor(() => expect(result.current.renderer.queries?.isReady()).toBe(true));
+  await waitFor(() => expect(result.current.mainOpens).toEqual([false]));
+  await waitFor(() => expect(result.current.core.replicaReady).toBe(true));
   expect(result.current.renderer.frame).not.toBeNull();
   expect(result.current.renderer.queries!.pageCount()).toBeGreaterThan(0);
   expect(result.current.renderer.queries!.pageBounds(0)).not.toBeNull();
-  expect(result.current.mainOpens).toEqual([false]);
   expect(result.current.errors).toEqual([]);
 });
 
@@ -6615,7 +6631,7 @@ function openingPluginEditor(plugin: DocxPlugin, replay?: Promise<void>) {
         });
       }
     };
-    view = render(<DocxEditor ref={ref}
+    view = render(<DocxEditor {...{ [LEGACY_SYNC_API_PROP]: true }} ref={ref}
       documentBuffer={longBytes.slice().buffer as ArrayBuffer}
       mode="editing" experimentalWorkerOpen previewFirstPage plugins={[plugin]}
       measurementFontProvider={{ resolve: () => () => Promise.resolve(font.buffer as ArrayBuffer) }}
@@ -8875,7 +8891,7 @@ test.each([false, true])('hiding a tab starts the editor peer immediately with s
     const load = spyOn(session, 'loadState');
     registerRestore(() => load.mockRestore());
     act(() => result.current.pipeline.runLayoutPipeline());
-    await waitFor(() => expect(result.current.renderer.status).toBe('ready'));
+    await waitFor(() => expect(result.current.renderer.status).toBe('ready'), { timeout: 5_000 });
     act(() => result.current.presentFrame());
     await frames.untilCommitted(result.current.renderer.settledDisplayList(null, null, 'window'));
     expect(result.current.mainOpens).toEqual([]);

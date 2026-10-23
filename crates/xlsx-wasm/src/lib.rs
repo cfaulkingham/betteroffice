@@ -34,11 +34,52 @@ extern "C" {
     fn performance_now() -> f64;
 }
 
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = error)]
+    fn console_error(message: &str);
+}
+
+/// wasm panics abort, so a trap reaches JS as a bare `RuntimeError:
+/// unreachable executed`. Log the panic first so it stays diagnosable.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(start)]
+pub fn install_panic_hook() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            console_error(&format!("[xlsx-wasm] panic: {info}"));
+        }));
+    });
+}
+
 /// a workbook handle exposed to js; wraps the pure `Session`.
 #[wasm_bindgen]
 pub struct XlsxDocument {
     session: Session,
     update_observer: Option<UpdateObserver>,
+}
+
+/// tells the worker host that a long engine call is still running, through
+/// `globalThis.__betterofficeEngineProgress` when the host installed one.
+fn engine_progress() {
+    let hook = js_sys::Reflect::get(&js_sys::global(), &"__betterofficeEngineProgress".into());
+    if let Ok(hook) = hook.and_then(|hook| hook.dyn_into::<js_sys::Function>()) {
+        let _ = hook.call0(&JsValue::UNDEFINED);
+    }
+}
+
+impl XlsxDocument {
+    /// installs the progress hook before `open` runs, so the recalculation
+    /// inside an open reports progress too.
+    fn opened<E>(open: impl FnOnce() -> Result<Session, E>) -> Result<Self, E> {
+        betteroffice_xlsx::set_progress_hook(Some(engine_progress));
+        open().map(|session| Self {
+            session,
+            update_observer: None,
+        })
+    }
 }
 
 struct UpdateObserver {
@@ -84,12 +125,7 @@ impl XlsxSnapshotBuilder {
     }
 
     pub fn finish(self) -> Result<XlsxDocument, JsValue> {
-        self.builder
-            .finish()
-            .map(|hydrated| XlsxDocument {
-                session: Session::from_hydrated_workbook(hydrated),
-                update_observer: None,
-            })
+        XlsxDocument::opened(|| self.builder.finish().map(Session::from_hydrated_workbook))
             .map_err(|error| js_sys::Error::new(&error.to_string()).into())
     }
 }
@@ -121,11 +157,8 @@ impl XlsxDocument {
         bytes: &[u8],
         through_seq: f64,
     ) -> Result<XlsxDocument, JsValue> {
-        Session::open_recovery_checkpoint(bytes, parse_recovery_sequence(through_seq)?)
-            .map(|session| XlsxDocument {
-                session,
-                update_observer: None,
-            })
+        let through_seq = parse_recovery_sequence(through_seq)?;
+        XlsxDocument::opened(|| Session::open_recovery_checkpoint(bytes, through_seq))
             .map_err(|error| js_sys::Error::new(&error).into())
     }
 
@@ -171,21 +204,13 @@ impl XlsxDocument {
         bytes: &[u8],
         hydration: &str,
     ) -> Result<XlsxDocument, JsValue> {
-        Session::open_with_peer_hydration_json(bytes, hydration)
-            .map(|session| XlsxDocument {
-                session,
-                update_observer: None,
-            })
+        XlsxDocument::opened(|| Session::open_with_peer_hydration_json(bytes, hydration))
             .map_err(|error| JsValue::from_str(&error))
     }
 
     /// open a workbook from raw `.xlsx` bytes.
     pub fn open(bytes: &[u8]) -> Result<XlsxDocument, JsValue> {
-        Session::open(bytes, now_serial())
-            .map(|session| XlsxDocument {
-                session,
-                update_observer: None,
-            })
+        XlsxDocument::opened(|| Session::open(bytes, now_serial()))
             .map_err(|e| JsValue::from_str(&e))
     }
 
@@ -194,11 +219,7 @@ impl XlsxDocument {
         bytes: &[u8],
         context: &str,
     ) -> Result<XlsxDocument, JsValue> {
-        Session::open_with_calculation_json(bytes, context)
-            .map(|session| XlsxDocument {
-                session,
-                update_observer: None,
-            })
+        XlsxDocument::opened(|| Session::open_with_calculation_json(bytes, context))
             .map_err(|error| js_sys::TypeError::new(&error).into())
     }
 
@@ -213,11 +234,7 @@ impl XlsxDocument {
     #[wasm_bindgen(js_name = openCollaborative)]
     pub fn open_collaborative(bytes: &[u8], client_id: f64) -> Result<XlsxDocument, JsValue> {
         let client_id = parse_client_id(client_id)?;
-        Session::open_collaborative(bytes, client_id, now_serial())
-            .map(|session| XlsxDocument {
-                session,
-                update_observer: None,
-            })
+        XlsxDocument::opened(|| Session::open_collaborative(bytes, client_id, now_serial()))
             .map_err(|e| JsValue::from_str(&e))
     }
 
@@ -417,6 +434,13 @@ impl XlsxDocument {
             .map_err(|e| JsValue::from_str(&e))
     }
 
+    #[wasm_bindgen(js_name = selectionDataJson)]
+    pub fn selection_data_json(&self, args: &str) -> Result<String, JsValue> {
+        self.session
+            .selection_data_json(args)
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
     #[wasm_bindgen(js_name = cellRectJson)]
     pub fn cell_rect_json(&self, args: &str) -> Result<String, JsValue> {
         self.session
@@ -462,11 +486,25 @@ impl XlsxDocument {
             .map_err(|e| JsValue::from_str(&e))
     }
 
+    #[wasm_bindgen(js_name = moveRangeJson)]
+    pub fn move_range_json(&mut self, args: &str) -> Result<String, JsValue> {
+        self.session
+            .move_range_json(args, now_serial())
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
     /// apply a raw op list as one user transaction; returns `SheetInfo` json.
     #[wasm_bindgen(js_name = applyOpsJson)]
     pub fn apply_ops_json(&mut self, transaction_json: &str) -> Result<String, JsValue> {
         self.session
             .apply_ops_json(transaction_json, now_serial())
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
+    #[wasm_bindgen(js_name = conditionalFormatsJson)]
+    pub fn conditional_formats_json(&self, sheet: u32) -> Result<String, JsValue> {
+        self.session
+            .conditional_formats_json(sheet)
             .map_err(|e| JsValue::from_str(&e))
     }
 
@@ -626,6 +664,13 @@ impl XlsxDocument {
     pub fn read_cells_json(&self, request: &str) -> Result<String, JsValue> {
         self.session
             .read_cells_json(request)
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
+    #[wasm_bindgen(js_name = listDefinedNamesJson)]
+    pub fn list_defined_names_json(&self, request: &str) -> Result<String, JsValue> {
+        self.session
+            .list_defined_names_json(request)
             .map_err(|e| JsValue::from_str(&e))
     }
 
