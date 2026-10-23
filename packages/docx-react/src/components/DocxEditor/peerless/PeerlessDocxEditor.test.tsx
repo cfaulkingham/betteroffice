@@ -2475,7 +2475,7 @@ test('a recovered worker receives plugin reservations versioned to its own docum
 });
 
 for (const mode of ['suggesting', 'viewing'] as const) {
-  test(`picture drag rechecks permission when the mode changes to ${mode} before drop`, async () => {
+  test(`picture drag and resize recheck permission when the mode changes to ${mode} before drop`, async () => {
     const view = render(<DocxEditor {...peerlessProps} mode="editing" />);
     await waitFor(() => expect(binding).toBeDefined());
     const pictures = surface.mock.calls.at(-1)![0].pictures!;
@@ -2484,8 +2484,9 @@ for (const mode of ['suggesting', 'viewing'] as const) {
     expect(pictures.canMove()).toBe(false);
     await act(async () => {
       pictures.move({ kind: 'moveObject', payload: { handle: 'picture', expectVersion: 'v1', hOffsetEmu: 95250, vOffsetEmu: 190500 } });
+      pictures.resize({ kind: 'resizeObject', payload: { handle: 'picture', expectVersion: 'v1', widthEmu: 95250, heightEmu: 190500 } });
       await Promise.resolve();
     });
-    expect(requests.filter(request => request.type === 'edit' && request.command.kind === 'moveObject')).toHaveLength(0);
+    expect(requests.filter(request => request.type === 'edit' && ['moveObject', 'resizeObject'].includes(request.command.kind))).toHaveLength(0);
   });
 }

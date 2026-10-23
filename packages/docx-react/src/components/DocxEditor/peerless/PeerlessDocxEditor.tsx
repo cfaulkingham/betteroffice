@@ -879,6 +879,12 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
       void controller.submit(intent).then(result => { if (!result.ok) reportRecoverableError(new Error(result.failure.message)); },
         error => reportRecoverableError(error instanceof Error ? error : new Error(String(error))));
     },
+    resize: (intent: PeerlessPropertyIntent) => {
+      const environment = controller.environment();
+      if (environment.readOnly || environment.mode !== 'editing') return;
+      void controller.submit(intent).then(result => { if (!result.ok) reportRecoverableError(new Error(result.failure.message)); },
+        error => reportRecoverableError(error instanceof Error ? error : new Error(String(error))));
+    },
   }), [controller, reportRecoverableError]);
   const contextMenu = useWorkerContextMenu({ binding: () => active.current?.binding ?? null,
     environment: controller.environment, commands: controller.commands.store, clipboard: onClipboard,

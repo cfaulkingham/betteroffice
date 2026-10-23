@@ -218,7 +218,7 @@ const DOCX_COMMAND_POLICIES = {
   deleteTableRow: { keys: [] }, deleteTableColumn: { keys: [] }, deleteTable: { keys: [] },
   mergeTableCells: { keys: [] }, splitTableCell: { keys: ['rows', 'columns'] }, setTableCellShading: { keys: ['color'] },
   setTableBorders: { keys: ['borders'] }, setTableProperties: { keys: ['op', 'patch', 'expectVersion'] },
-  resizeObject: { keys: ['handle', 'widthEmu', 'heightEmu', 'widthTwips', 'expectVersion'], exact: true },
+  resizeObject: { keys: ['handle', 'widthEmu', 'heightEmu', 'widthTwips', 'hOffsetEmu', 'vOffsetEmu', 'expectVersion'], exact: true },
   moveObject: { keys: ['handle', 'hOffsetEmu', 'vOffsetEmu', 'expectVersion'], exact: true },
   undo: { keys: [], exact: true }, redo: { keys: [], exact: true },
   replaceMatches: { keys: ['targets', 'text', 'expectVersion', 'suggesting'], exact: true },
@@ -231,7 +231,7 @@ const DOCX_COMMAND_POLICIES = {
   propose: { keys: reviewCommandKeys.propose, exact: true },
   setProposalStates: { keys: reviewCommandKeys.setProposalStates, exact: true },
   withdrawProposals: { keys: reviewCommandKeys.withdrawProposals, exact: true },
-  select: { keys: ['selection'] }, insertText: { keys: ['text'] }, replaceSelection: { keys: ['text'] },
+  select: { keys: ['selection', 'object'] }, insertText: { keys: ['text'] }, replaceSelection: { keys: ['text'] },
   navigate: { keys: ['unit', 'direction', 'extend', 'goalX', 'distance'], exact: true },
   navigateCell: { keys: ['direction', 'extend', 'createLastRow'] },
   selectTableCells: { keys: ['target'] },
@@ -288,8 +288,9 @@ function validCommandIntent(
     case 'resizeObject': case 'moveObject':
       if (!string(payload.handle) || !string(payload.expectVersion) || (command.kind === 'resizeObject'
         ? payload.widthTwips !== undefined
-          ? !positive(payload.widthTwips) || payload.widthEmu !== undefined || payload.heightEmu !== undefined
-          : !positive(payload.widthEmu) || !positive(payload.heightEmu)
+          ? !positive(payload.widthTwips) || payload.widthEmu !== undefined || payload.heightEmu !== undefined || payload.hOffsetEmu !== undefined || payload.vOffsetEmu !== undefined
+          : !positive(payload.widthEmu) || !positive(payload.heightEmu) ||
+            ((payload.hOffsetEmu !== undefined || payload.vOffsetEmu !== undefined) && (!number(payload.hOffsetEmu) || !number(payload.vOffsetEmu)))
         : !number(payload.hOffsetEmu) || !number(payload.vOffsetEmu))) return refuse('invalid-payload');
       break;
     case 'replaceMatches':
@@ -614,7 +615,19 @@ export function preflightDocxCommand(
     if (command.expectVersion && command.basis.version !== context.currentVersion) return refuse('stale-version');
     return { status: 'ready', prepared: { command: structuredClone(command), selection: state.selection, range: null } };
   }
-  if ((command.kind === 'select' || command.kind === 'formatRange') && command.payload.selection === undefined) return refuse('invalid-selection');
+  let objectSelection: DocxCommandSelection | undefined;
+  if (command.kind === 'select' && command.payload.object !== undefined) {
+    // Select a picture by its issued handle: the handle's sticky position finds the embed, and a stale version is refused.
+    const picked = command.payload.object as unknown;
+    if (command.payload.selection !== undefined || !fields(picked, { handle: string, expectVersion: string }) || !object(picked) ||
+      !string(picked.handle) || !string(picked.expectVersion)) return refuse('invalid-payload');
+    if (picked.expectVersion !== engine.proposalEngine.version()) return refuse('stale-version');
+    const target = resolveResidentObject(engine, picked.handle);
+    if (!target || target.kind !== 'image') return refuse('stale-object');
+    const at = { story: target.story, paraId: target.paraId, offset: target.offset };
+    objectSelection = { anchor: at, focus: { ...at, offset: at.offset + 1 } };
+  }
+  if ((command.kind === 'select' || command.kind === 'formatRange') && command.payload.selection === undefined && !objectSelection) return refuse('invalid-selection');
   if (isTableCommandKind(command.kind)) {
     if (readOnly) return refuse('read-only');
     if (command.kind === 'setTableProperties' && command.payload.expectVersion !== undefined &&
@@ -627,7 +640,8 @@ export function preflightDocxCommand(
       command: structuredClone(command), selection: tableResolved.selection, range: tableResolved.range, table: tabled.target,
     } };
   }
-  const resolved = resolveCommandSelection(engine, state, command, context);
+  const resolved = resolveCommandSelection(engine, state,
+    objectSelection ? { ...command, payload: { selection: objectSelection } } as DocxCommandEnvelope : command, context);
   if (!resolved.ok) return refuse(resolved.reason);
   if (command.kind === 'navigateCell') {
     const cellNavigation = resolveCellNavigation(engine, resolved.selection, command.payload, readOnly);
@@ -639,7 +653,7 @@ export function preflightDocxCommand(
   }
   if (command.kind === 'select') {
     return { status: 'ready', prepared: {
-      command: structuredClone(command), selection: resolved.selection, range: resolved.range,
+      command: structuredClone(objectSelection ? { ...command, payload: { selection: objectSelection } } : command), selection: resolved.selection, range: resolved.range,
       cells: cellsForCaret(engine, resolved.selection.focus.story),
     } };
   }
@@ -911,9 +925,10 @@ function applyPreparedDocxCommand(
     const widthEmu = size ? size.widthEmu : Number(segment.payload.width ?? 100) * 9525;
     const heightEmu = size ? size.heightEmu : Number(segment.payload.height ?? 100) * 9525;
     const position = segment.payload.position as Record<string, unknown> | null | undefined;
-    const offsets = command.kind === 'moveObject' ? {
-      horizontal: { relativeTo: 'page', posOffset: command.payload.hOffsetEmu },
-      vertical: { relativeTo: 'page', posOffset: command.payload.vOffsetEmu },
+    const move = command.kind === 'moveObject' ? command.payload : size;
+    const offsets = move?.hOffsetEmu !== undefined ? {
+      horizontal: { relativeTo: 'page', posOffset: move.hOffsetEmu },
+      vertical: { relativeTo: 'page', posOffset: move.vOffsetEmu },
     } : null;
     const placement = !offsets ? {}
       : isAnchoredImagePayload(segment.payload) ? { position: { ...position, ...offsets } }

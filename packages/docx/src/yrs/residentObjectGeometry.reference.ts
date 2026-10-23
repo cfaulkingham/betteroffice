@@ -8,7 +8,7 @@ import { createDisplayListQueries } from '../layout/render/displayListQueries';
 import { deriveDisplayListSelectedCellRects, type DisplayListTableRegion } from '../layout/render/displayListTables';
 import { loadRustDisplayListQueryEngine } from '../layout/render/rustDisplayList';
 import { readResidentRangeHighlights } from './residentRangeHighlights';
-import { imagePlacement, residentImagePaintOrders } from './residentObjectGeometry';
+import { embedSelected, imagePlacement, residentImagePaintOrders } from './residentObjectGeometry';
 import { findImagePrimitiveByDocPos } from '../layout/render/displayListImages';
 
 export interface ResidentObjectRect {
@@ -27,6 +27,9 @@ export interface ResidentObjectGeometry {
   rects: ResidentObjectRect[];
   floating?: boolean;
   behindText?: boolean;
+  noChangeAspect?: boolean;
+  rotation?: number;
+  selected?: boolean;
   paintOrder?: number;
   nested?: boolean;
 }
@@ -190,7 +193,7 @@ export async function readResidentFrameGeometry(
               ?? (prefix === 'hf' ? findImagePrimitiveByDocPos(frame.displayList, position, 'footer', id) : null));
             if (image) objects.push({ kind: 'image', story, handle: issue(engine, 'image', at),
               rects: [{ ...image.rect, pageId: frame.pages[image.rect.pageIndex]!.pageId.toString() }],
-              ...imagePlacement(segment.payload), paintOrder: painted ? paintOrders.get(painted.primitive) : undefined, ...(story !== root ? { nested: true } : {}) });
+              ...imagePlacement(segment.payload), ...(embedSelected(selection, at) ? { selected: true } : {}), paintOrder: painted ? paintOrders.get(painted.primitive) : undefined, ...(story !== root ? { nested: true } : {}) });
           }
           const from = index.positionOf({ story, paraId, offset: 0 }, root);
           const to = index.positionOf({ story, paraId, offset: spans[p]!.length }, root);

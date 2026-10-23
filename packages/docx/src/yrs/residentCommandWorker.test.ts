@@ -18,6 +18,7 @@ import type { ResidentEngineWorkerResponse } from './residentEngineWorkerProtoco
 import type { ResidentReviewTarget } from './residentReview';
 import type { YrsContentControlValue } from './index';
 import type { SectionProperties } from '../types/document';
+import type { LayoutBlock } from '../layout/pagination/types';
 
 const TIMEOUT = 20_000;
 const LAYOUT = JSON.stringify({
@@ -1725,6 +1726,111 @@ test('worker moves a floating image without changing its wrap and flags which im
     expect(floated.outcomes[0]?.status).toBe('applied');
     expect(payload('inline-image')).toMatchObject({ payload: { wrapType: 'square', displayMode: 'float' } });
     expect(images(floated).map(object => object.floating)).toEqual([true, true]);
+  } finally { client.destroy(); }
+}, TIMEOUT);
+
+test('worker preserves picture aspect locks through resize, move, save and reopen', async () => {
+  const picture = (container: 'inline' | 'anchor', id: number, lock: 'frame' | 'picture' | undefined) =>
+    `<w:p><w:r><w:drawing><wp:${container} xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+    (container === 'anchor' ? '<wp:positionH relativeFrom="margin"><wp:posOffset>0</wp:posOffset></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>' : '') +
+    '<wp:extent cx="381000" cy="190500"/>' + (container === 'anchor' ? '<wp:wrapNone/>' : '') +
+    `<wp:docPr id="${id}"/>` + (lock === 'frame' ? '<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>' : '') +
+    '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPicPr>' +
+    (lock === 'picture' ? '<a:picLocks noChangeAspect="1"/>' : '') +
+    '</pic:cNvPicPr></pic:nvPicPr><pic:blipFill><a:blip r:embed="rIdImage"/></pic:blipFill><pic:spPr/></pic:pic></a:graphicData></a:graphic>' +
+    `</wp:${container}></w:drawing></w:r></w:p>`;
+  const { client, engine, initial, init } = await openWorker({ bodyXml:
+    picture('inline', 1, 'frame') + picture('anchor', 2, 'picture') + picture('inline', 3, undefined) + picture('anchor', 4, undefined),
+  });
+  const reopened = new ResidentEngineWorkerClient(startWorker(8302));
+  try {
+    const images = (response: { frame?: typeof initial.frame }) => response.frame!.payload.geometry!.objects.filter(object => object.kind === 'image');
+    const expectLocks = (response: { frame?: typeof initial.frame }) => {
+      expect(images(response)).toHaveLength(4);
+      expect(images(response).map(object => object.noChangeAspect)).toEqual([true, true, undefined, undefined]);
+      for (const object of images(response).slice(2)) expect(object).not.toHaveProperty('noChangeAspect');
+    };
+    expectLocks(initial);
+    const { readResidentFrameGeometry: referenceGeometry } = await import('./residentObjectGeometry.reference');
+    const reference = await referenceGeometry(engine,
+      applyFrameDeltaOwned(null, decodeFrameDelta(initial.frame.payload.frame)), init.selection ?? null, init.layoutRevision);
+    expect(reference.objects.filter(object => object.kind === 'image').map(object => object.noChangeAspect))
+      .toEqual(images(initial).map(object => object.noChangeAspect));
+    expect(engine.storySegments('body').flatMap(segment => segment.kind === 'embed' && segment.embedKind === 'image'
+      ? [segment.payload.noChangeAspect] : [])).toEqual([true, true, undefined, undefined]);
+    expect((engine.yrsBlocksForStory('body') as LayoutBlock[])
+      .flatMap(block => block.kind === 'paragraph' ? block.runs : [])
+      .flatMap(run => run.kind === 'image' ? [run.noChangeAspect] : [])).toEqual([true, true, undefined, undefined]);
+    const resized = await client.edit(intent(1, 0, 'resizeObject', {
+      handle: images(initial)[0]!.handle, widthEmu: 762000, heightEmu: 381000, expectVersion: initial.frame.payload.documentVersion!,
+    }));
+    expect(resized.outcomes[0]?.status).toBe('applied');
+    expectLocks(resized);
+    const moved = await client.edit(intent(2, 1, 'moveObject', {
+      handle: images(resized)[1]!.handle, hOffsetEmu: 95250, vOffsetEmu: 190500, expectVersion: resized.frame!.payload.documentVersion!,
+    }));
+    expect(moved.outcomes[0]?.status).toBe('applied');
+    expectLocks(moved);
+    // Edits rewrite the unlocked pictures' paragraphs too; saving them must not invent a lock.
+    const resizedUnlocked = await client.edit(intent(3, 2, 'resizeObject', {
+      handle: images(moved)[2]!.handle, widthEmu: 762000, heightEmu: 95250, expectVersion: moved.frame!.payload.documentVersion!,
+    }));
+    expect(resizedUnlocked.outcomes[0]?.status).toBe('applied');
+    const movedUnlocked = await client.edit(intent(4, 3, 'moveObject', {
+      handle: images(resizedUnlocked)[3]!.handle, hOffsetEmu: 190500, vOffsetEmu: 285750, expectVersion: resizedUnlocked.frame!.payload.documentVersion!,
+    }));
+    expect(movedUnlocked.outcomes[0]?.status).toBe('applied');
+    expectLocks(movedUnlocked);
+    const saved = await client.save({ comments: [] });
+    const { parseDocx } = await import('../docx/parser');
+    const { documentToYrs } = await import('./documentToYrs');
+    const parsed = await parseDocx(saved.bytes, { preloadFonts: false });
+    const projected = await createYrsSession();
+    try {
+      documentToYrs(projected, parsed);
+      expect(projected.storySegments('body').flatMap(segment => segment.kind === 'embed' && segment.embedKind === 'image'
+        ? [segment.payload.noChangeAspect] : [])).toEqual([true, true, undefined, undefined]);
+      expect(projectionModule.yrsToDocument(projected, parsed).package.document.content
+        .flatMap(block => block.type === 'paragraph' ? block.content : [])
+        .flatMap(content => content.type === 'run' ? content.content : [])
+        .flatMap(content => content.type === 'drawing' ? [content.image.noChangeAspect] : [])).toEqual([true, true, undefined, undefined]);
+    } finally { projected.destroy(); }
+    await reopened.open(new Uint8Array(saved.bytes), { generation: 'd1-command-worker' });
+    const restored = await reopened.commandInit(init);
+    expectLocks(restored);
+    expect(images(restored)[0]!.rects[0]).toMatchObject({ width: 80, height: 40 });
+  } finally { reopened.destroy(); client.destroy(); }
+}, TIMEOUT);
+
+test('worker selects a picture by its handle, refuses a stale version, and flags the selected embed', async () => {
+  const drawing = (id: number) => `<w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+    `<wp:extent cx="381000" cy="190500"/><wp:docPr id="${id}"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPicPr/></pic:nvPicPr>` +
+    '<pic:blipFill><a:blip r:embed="rIdImage"/></pic:blipFill><pic:spPr/></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>';
+  // The second picture is alone in its paragraph, whose selection rects also carry an empty-line marker.
+  const { client, engine, initial } = await openWorker({ bodyXml: `<w:p><w:r><w:t>ab</w:t></w:r>${drawing(1)}</w:p><w:p>${drawing(2)}</w:p>` });
+  try {
+    const images = (response: { frame?: typeof initial.frame }) => response.frame!.payload.geometry!.objects.filter(object => object.kind === 'image');
+    expect(images(initial).map(object => object.selected)).toEqual([undefined, undefined]);
+    const [first, second] = images(initial).map(object => object.handle);
+    const staleVersion = initial.frame.payload.documentVersion!;
+    const paraId = engine.geometryReader.paragraphSpans('body')[0]!.paraId;
+    const start = { story: 'body', paraId, offset: 0 };
+    await editWithFrame(client, intent(1, 0, 'select', { selection: { anchor: start, focus: start } }));
+    const typed = await client.edit(intent(2, 0, 'insertText', { text: 'x' }));
+    expect(typed.outcomes[0]?.status).toBe('applied');
+    // A press on the picture as drawn before the edit: its version is stale, so nothing is selected and no text can be.
+    const stale = await client.edit(intent(3, 1, 'select', { object: { handle: first!, expectVersion: staleVersion } }));
+    expect(stale.outcomes[0]).toMatchObject({ status: 'refused', reason: 'stale-version' });
+    // The handle follows the picture to offset 3 after the insert before it.
+    const selected = await editWithFrame(client, intent(4, 1, 'select', { object: { handle: first!, expectVersion: typed.frame!.payload.documentVersion! } }));
+    expect(images(selected).map(object => object.selected)).toEqual([true, undefined]);
+    const alone = await editWithFrame(client, intent(5, 1, 'select', { object: { handle: second!, expectVersion: typed.frame!.payload.documentVersion! } }));
+    expect(images(alone).map(object => object.selected)).toEqual([undefined, true]);
+    const removed = await client.edit(intent(6, 1, 'deleteForward', {}));
+    expect(removed.outcomes[0]?.status).toBe('applied');
+    // Delete removes the selected picture only; the text before the first picture is intact.
+    expect(engine.storySegments('body').filter(segment => segment.kind === 'embed')).toHaveLength(1);
+    expect(engine.storySegments('body').filter(segment => segment.kind === 'text').map(segment => segment.text).join('')).toBe('xab');
   } finally { client.destroy(); }
 }, TIMEOUT);
 
@@ -3450,5 +3556,57 @@ test('worker picture geometry marks cell anchors as nested', async () => {
     const images = initial.frame.payload.geometry!.objects.filter(object => object.kind === 'image');
     expect(images).toHaveLength(1);
     expect(images[0]).toMatchObject({ floating: true, nested: true });
+  } finally { client.destroy(); }
+}, TIMEOUT);
+
+test('worker commits floating resize position and dimensions in one undo step', async () => {
+  const { client, engine, initial, init } = await openWorker({ prepare: engine => {
+    engine.applyRawOps('body', [{ op: 'insertEmbed', index: 1, kind: 'image', payload: {
+      id: 'resize-position', src: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==', width: 40, height: 20, displayMode: 'float', wrapType: 'behind',
+      position: { behindDoc: true, horizontal: { relativeTo: 'page', posOffset: 952500 }, vertical: { relativeTo: 'page', posOffset: 476250 } },
+    } }]);
+    return { story: 'body', paraId: engine.geometryReader.paragraphSpans('body')[0]!.paraId, offset: 0 };
+  } });
+  const reopened = new ResidentEngineWorkerClient(startWorker(8399));
+  try {
+    const image = (response: { frame?: typeof initial.frame }) => response.frame!.payload.geometry!.objects.find(object => object.kind === 'image')!;
+    const original = image(initial).rects[0]!;
+    expect(original).toMatchObject({ x: 100, y: 50, width: 40, height: 20 });
+    let seq = 0;
+    for (const position of [{ hOffsetEmu: 0 }, { vOffsetEmu: 0 }, { hOffsetEmu: 0, vOffsetEmu: Infinity }]) {
+      const refused = await client.edit(intent(++seq, 0, 'resizeObject', {
+        handle: image(initial).handle, expectVersion: initial.frame.payload.documentVersion!,
+        widthEmu: 285750, heightEmu: 142875, ...position,
+      }));
+      expect(refused.outcomes[0]).toMatchObject({ status: 'refused', reason: 'invalid-payload' });
+      expect(engine.storySegments('body').find(segment => segment.kind === 'embed' && segment.embedKind === 'image'))
+        .toMatchObject({ payload: { width: 40, height: 20 } });
+    }
+    const resized = await client.edit(intent(++seq, 0, 'resizeObject', {
+      handle: image(initial).handle, expectVersion: initial.frame.payload.documentVersion!,
+      widthEmu: 285750, heightEmu: 142875, hOffsetEmu: 1047750, vOffsetEmu: 523875,
+    }));
+    expect(resized.outcomes[0]?.status).toBe('applied');
+    expect(image(resized).rects[0]).toMatchObject({ x: 110, y: 55, width: 30, height: 15 });
+    const saved = await client.save({ comments: [] });
+    await reopened.open(new Uint8Array(saved.bytes), { generation: 'd1-command-worker' });
+    const restored = await reopened.commandInit(init);
+    expect(image(restored).rects[0]).toMatchObject({ x: 110, y: 55, width: 30, height: 15 });
+    const undone = await client.edit(intent(++seq, 1, 'undo', {}));
+    expect(image(undone).rects[0]).toEqual(original);
+    const redone = await client.edit(intent(++seq, 2, 'redo', {}));
+    expect(image(redone).rects[0]).toEqual(image(resized).rects[0]);
+  } finally { reopened.destroy(); client.destroy(); }
+}, TIMEOUT);
+
+test('worker geometry exposes picture rotation for resize admission', async () => {
+  const { client, initial } = await openWorker({ prepare: engine => {
+    engine.applyRawOps('body', [{ op: 'insertEmbed', index: 1, kind: 'image', payload: {
+      id: 'rotated', src: 'data:image/png;base64,', width: 100, height: 50, transform: 'rotate(90deg)',
+    } }]);
+    return { story: 'body', paraId: engine.geometryReader.paragraphSpans('body')[0]!.paraId, offset: 0 };
+  } });
+  try {
+    expect(initial.frame.payload.geometry!.objects.find(object => object.kind === 'image')).toMatchObject({ rotation: 90 });
   } finally { client.destroy(); }
 }, TIMEOUT);

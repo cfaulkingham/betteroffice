@@ -27,6 +27,11 @@ export interface ResidentObjectGeometry {
   floating?: boolean;
   /** Floating images only: painted behind the text, so text over them takes the pointer. */
   behindText?: boolean;
+  /** Images only: the picture's aspect ratio is locked. */
+  noChangeAspect?: boolean;
+  rotation?: number;
+  /** Images only: the worker selection covers exactly this picture's embed. */
+  selected?: boolean;
   /** Image paint order within the page. */
   paintOrder?: number;
   /** Image anchored inside a cell or text box. */
@@ -44,10 +49,20 @@ export function isAnchoredImagePayload(payload: Record<string, unknown>): boolea
   return payload.displayMode === 'float' || ['square', 'tight', 'through', 'behind', 'inFront'].includes(wrap as string);
 }
 
-export function imagePlacement(payload: Record<string, unknown>): Pick<ResidentObjectGeometry, 'floating' | 'behindText'> {
-  if (!isFloatingImagePayload(payload)) return { floating: false };
+/** Whether `selection` covers exactly the one embed at `at`. */
+export function embedSelected(selection: DocxCommandSelection | null, at: YrsLoc): boolean {
+  if (!selection) return false;
+  const { anchor, focus } = selection;
+  return anchor.story === at.story && focus.story === at.story && anchor.paraId === at.paraId && focus.paraId === at.paraId &&
+    Math.min(anchor.offset, focus.offset) === at.offset && Math.max(anchor.offset, focus.offset) === at.offset + 1;
+}
+
+export function imagePlacement(payload: Record<string, unknown>): Pick<ResidentObjectGeometry, 'floating' | 'behindText' | 'noChangeAspect' | 'rotation'> {
+  const rotation = typeof payload.transform === 'string' ? Number(payload.transform.match(/rotate\(([-\d.]+)deg\)/)?.[1] ?? 0) : 0;
+  const properties = { ...(payload.noChangeAspect === true ? { noChangeAspect: true } : {}), ...(rotation ? { rotation } : {}) };
+  if (!isFloatingImagePayload(payload)) return { floating: false, ...properties };
   const position = payload.position as { behindDoc?: unknown } | null | undefined;
-  return { floating: true, behindText: (payload.wrapType ?? payload.wrap) === 'behind' || position?.behindDoc === true };
+  return { floating: true, behindText: (payload.wrapType ?? payload.wrap) === 'behind' || position?.behindDoc === true, ...properties };
 }
 
 export interface ResidentFrameGeometry {
@@ -330,7 +345,7 @@ export async function readResidentFrameGeometry(
         if (image) objects.push({ kind: 'image', story, handle: issue(engine, 'image', at),
           rects: [{ pageIndex: image.pageIndex, x: image.primitive.x, y: image.primitive.y, width: image.primitive.w,
             height: image.primitive.h, pageId: frame.pages[image.pageIndex]!.pageId.toString() }],
-          ...imagePlacement(segment.payload), paintOrder: paintOrders.get(image.primitive), ...(story !== root ? { nested: true } : {}) });
+          ...imagePlacement(segment.payload), ...(embedSelected(selection, at) ? { selected: true } : {}), paintOrder: paintOrders.get(image.primitive), ...(story !== root ? { nested: true } : {}) });
       }
       const boxes = rects(index);
       if (boxes.length) objects.push({ kind: 'text', story,

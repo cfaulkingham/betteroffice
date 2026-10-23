@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { beginPictureDrag, floatingPictureAt, movePictureDrag, pictureDropIntent } from './pictureDrag';
+import { beginPictureDrag, floatingPictureAt, pictureInSelection, movePictureDrag, pictureAt, pictureDropIntent, selectedPicture } from './pictureDrag';
 import type { PeerlessFrameGeometry } from './viewStore';
 
 const rect = (x: number, y: number) => ({ pageId: '1', pageIndex: 0, x, y, width: 40, height: 20 });
@@ -49,6 +49,16 @@ test('a behind-text picture is draggable where its own anchor box is the only te
   expect(floatingPictureAt(behind, 0, 110, 50)).toBeNull();
 });
 
+test('the selected picture follows the worker flag, even when an empty-line marker joins its selection rects', () => {
+  const selected = geometry();
+  const objects = selected.objects!.objects as { kind: string; selected?: boolean }[];
+  (selected.objects as { selection: unknown[] }).selection = [rect(100, 50), { ...rect(96, 50), width: 4 }];
+  objects[1]!.selected = true;
+  expect(pictureInSelection(selected)?.handle).toBe('floating');
+  objects[1]!.selected = undefined;
+  expect(pictureInSelection(selected)).toBeNull();
+});
+
 test('a drag starts past the slop and drops the dialog move at the new page offset', () => {
   const target = floatingPictureAt(geometry(), 0, 120, 60)!;
   let drag = beginPictureDrag(target, 500, 300);
@@ -71,6 +81,29 @@ test('a drag that returns to its start drops nothing', () => {
   expect(pictureDropIntent(drag)).toBeNull();
 });
 
+test('picture selection hits inline and floating images with the same behind-text rule', () => {
+  expect(pictureAt(geometry(), 0, 20, 20)?.handle).toBe('inline');
+  expect(pictureAt(geometry(), 0, 120, 60)?.handle).toBe('floating');
+  const behind = geometry();
+  behind.objects!.objects[1]!.behindText = true;
+  expect(pictureAt(behind, 0, 120, 60)).toBeNull();
+  expect(pictureAt(geometry({ version: 'v0' }), 0, 20, 20)).toBeNull();
+  expect(pictureAt({ ...geometry(), frameEpoch: 4 }, 0, 20, 20)).toBeNull();
+  expect(pictureAt({ ...geometry(), layoutRevision: 4 }, 0, 20, 20)).toBeNull();
+});
+
+test('selection re-finds the sticky image handle in current geometry and clears when absent', () => {
+  const current = geometry();
+  const image = current.objects!.objects[1]!;
+  image.noChangeAspect = true;
+  image.rects[0]!.x = 200;
+  expect(selectedPicture(current, 'floating')).toMatchObject({ rect: { x: 200 }, noChangeAspect: true });
+  current.objects!.objects.splice(1, 1);
+  expect(selectedPicture(current, 'floating')).toBeNull();
+  expect(selectedPicture(geometry({ version: 'old' }), 'floating')).toBeNull();
+  expect(selectedPicture(geometry(), 'reissued-handle')).toBeNull();
+});
+
 for (const [name, first, last] of [
   ['foreground over a later behind-text picture', { behindText: false, paintOrder: 2 }, { behindText: true, paintOrder: 0 }],
   ['higher relativeHeight over later document order', { behindText: true, paintOrder: 1 }, { behindText: true, paintOrder: 0 }],
@@ -82,15 +115,21 @@ for (const [name, first, last] of [
       { handle: 'hidden', kind: 'image', story: 'body', floating: true, rects: [rect(100, 50)], ...last },
     ];
     expect(floatingPictureAt(frame, 0, 120, 60)?.handle).toBe('visible');
+    expect(pictureAt(frame, 0, 120, 60)?.handle).toBe('visible');
   });
 }
 
-test('picture drag does not arm a floating picture anchored in a cell', () => {
-  const frame = geometry();
-  frame.objects!.objects = [{ handle: 'cell-picture', kind: 'image', story: 'body:t0:r0c0',
-    floating: true, nested: true, rects: [rect(100, 50)] }];
-  expect(floatingPictureAt(frame, 0, 120, 60)).toBeNull();
-});
+for (const story of ['body:t0:r0c0', 'body:tb0']) {
+  test(`nested picture in ${story} cannot be selected for dragging or resizing`, () => {
+    const frame = geometry();
+    frame.objects!.objects = [{ handle: 'nested-picture', kind: 'image', story,
+      floating: true, nested: true, selected: true, rects: [rect(100, 50)] }];
+    expect(floatingPictureAt(frame, 0, 120, 60)).toBeNull();
+    expect(pictureAt(frame, 0, 120, 60)).toBeNull();
+    expect(selectedPicture(frame, 'nested-picture')).toBeNull();
+    expect(pictureInSelection(frame)).toBeNull();
+  });
+}
 
 test('an inline picture painted above a behind-text picture keeps the press', () => {
   const frame = geometry();
