@@ -952,6 +952,98 @@ fn write_canonical(out: &mut Vec<u8>, value: &Any) {
     }
 }
 
+/// Embed payload keys, per embed kind, that only steer display. Saves never write them, so they
+/// never mark a paragraph changed.
+const DISPLAY_ONLY_KEYS: &[(&str, &[&str])] = &[("image", &["horizontalRule"])];
+
+fn display_only_keys(kind: &str) -> &'static [&'static str] {
+    DISPLAY_ONLY_KEYS
+        .iter()
+        .find(|(listed, _)| *listed == kind)
+        .map_or(&[], |(_, keys)| keys)
+}
+
+/// The embed kind of the payload held under `key` in a map: an item's `payload` takes the item's
+/// `embedKind` or `kind`, and an opaque drawing's `preview` / `previews` are pictures.
+fn nested_kind<'a>(parent: Option<&str>, key: &str, item_kind: Option<&'a str>) -> Option<&'a str> {
+    match key {
+        "payload" => item_kind,
+        "preview" | "previews" if parent == Some("opaqueDrawing") => Some("image"),
+        _ => None,
+    }
+}
+
+/// `value`, the payload of a `kind` embed when `kind` is set, without its [`DISPLAY_ONLY_KEYS`]
+/// at any depth; `None` when it holds none. Payloads inside JSON strings are not inspected.
+fn without_display_only_keys(kind: Option<&str>, value: &Any) -> Option<Any> {
+    match value {
+        Any::Array(items) => {
+            let stripped: Vec<_> = items
+                .iter()
+                .map(|item| without_display_only_keys(kind, item))
+                .collect();
+            stripped.iter().any(Option::is_some).then(|| {
+                Any::Array(
+                    items
+                        .iter()
+                        .zip(stripped)
+                        .map(|(item, stripped)| stripped.unwrap_or_else(|| item.clone()))
+                        .collect(),
+                )
+            })
+        }
+        Any::Map(map) => {
+            let mut stripped: Option<HashMap<String, Any>> = None;
+            let removed = kind.map_or(&[][..], display_only_keys);
+            for key in removed {
+                if map.contains_key(*key) {
+                    stripped.get_or_insert_with(|| (**map).clone()).remove(*key);
+                }
+            }
+            let item_kind = ["embedKind", "kind"]
+                .iter()
+                .find_map(|key| match map.get(*key) {
+                    Some(Any::String(kind)) => Some(&**kind),
+                    _ => None,
+                });
+            for (key, child) in map
+                .iter()
+                .filter(|(key, _)| !removed.contains(&key.as_str()))
+            {
+                if let Some(child) =
+                    without_display_only_keys(nested_kind(kind, key, item_kind), child)
+                {
+                    stripped
+                        .get_or_insert_with(|| (**map).clone())
+                        .insert(key.clone(), child);
+                }
+            }
+            stripped.map(|map| Any::Map(Arc::new(map)))
+        }
+        _ => None,
+    }
+}
+
+/// Removes [`DISPLAY_ONLY_KEYS`] from every embed payload, including the embeds nested in content
+/// control content, field result projections and opaque drawing previews, before hashing.
+fn strip_display_only_keys(segments: &mut [crate::StorySegment]) {
+    for segment in segments {
+        let crate::SegmentContent::OtherEmbed { kind, payload } = &mut segment.content else {
+            continue;
+        };
+        for key in display_only_keys(kind) {
+            payload.remove(*key);
+        }
+        for (key, value) in payload.iter_mut() {
+            if let Some(stripped) =
+                without_display_only_keys(nested_kind(Some(kind.as_str()), key, None), value)
+            {
+                *value = stripped;
+            }
+        }
+    }
+}
+
 /// Each paragraph's [`UnitState`], hashing its save segments with media tokens expanded, map
 /// keys sorted and nulls kept, and the starts and ends of the `comments` anchored in it relative
 /// to its first segment; and the SHA-256 of those digests in order.
@@ -974,6 +1066,7 @@ fn story_fingerprint_in(
 ) -> Option<([u8; 32], Vec<UnitState>)> {
     use sha2::{Digest, Sha256};
     let mut segments = doc.story_segments_in(txn, story).ok()?;
+    strip_display_only_keys(&mut segments);
     if let Some(media) = doc.media_table() {
         crate::media::write_segment_data_urls(&mut segments, &media).ok()?;
     }
@@ -3546,6 +3639,87 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    #[test]
+    fn a_removed_display_only_key_stays_removed_when_its_value_nests_one() {
+        let map = |entries: Vec<(&str, Any)>| {
+            Any::Map(Arc::new(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.to_owned(), value))
+                    .collect(),
+            ))
+        };
+        let nested = map(vec![
+            ("kind", Any::String("image".into())),
+            ("payload", map(vec![("horizontalRule", Any::Bool(true))])),
+        ]);
+        let picture = map(vec![
+            ("src", Any::String("media:0".into())),
+            ("horizontalRule", nested),
+        ]);
+        let Some(Any::Map(stripped)) = without_display_only_keys(Some("image"), &picture) else {
+            panic!("the rule key is stripped");
+        };
+        assert!(!stripped.contains_key("horizontalRule"));
+        assert!(stripped.contains_key("src"));
+    }
+
+    #[test]
+    fn display_only_keys_leave_the_fingerprint_unchanged() {
+        let fingerprint = |kind: &str, payload: Vec<(String, Any)>| {
+            let doc = EditingDoc::new(7);
+            doc.create_story("body", "", "Normal", "left").unwrap();
+            doc.apply_raw_ops(
+                "body",
+                vec![crate::RawOp::InsertEmbed {
+                    index: 0,
+                    kind: kind.into(),
+                    payload,
+                    attrs: Default::default(),
+                }],
+                &ctx(),
+            )
+            .unwrap();
+            story_fingerprint(&doc, "body", &BTreeMap::new()).unwrap()
+        };
+        let picture = |rule: bool| {
+            let mut payload = vec![("src".to_owned(), Any::String("media:0".into()))];
+            if rule {
+                payload.push(("horizontalRule".to_owned(), Any::Bool(true)));
+            }
+            payload
+        };
+        let content_control = |kind: &str, rule: bool| {
+            let item = HashMap::from([
+                ("kind".to_owned(), Any::String(kind.into())),
+                (
+                    "payload".to_owned(),
+                    Any::Map(Arc::new(picture(rule).into_iter().collect())),
+                ),
+            ]);
+            vec![(
+                "content".to_owned(),
+                Any::Array(Arc::from(vec![Any::Map(Arc::new(item))])),
+            )]
+        };
+        assert_eq!(
+            fingerprint("image", picture(true)),
+            fingerprint("image", picture(false))
+        );
+        assert_eq!(
+            fingerprint("sdt", content_control("image", true)),
+            fingerprint("sdt", content_control("image", false))
+        );
+        assert_ne!(
+            fingerprint("shape", picture(true)),
+            fingerprint("shape", picture(false))
+        );
+        assert_ne!(
+            fingerprint("sdt", content_control("shape", true)),
+            fingerprint("sdt", content_control("shape", false))
+        );
     }
 
     fn session(story: &str, key: &str) -> ParagraphRef {
