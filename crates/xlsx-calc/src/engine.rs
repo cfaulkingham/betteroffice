@@ -1544,6 +1544,87 @@ mod tests {
         );
     }
 
+    /// a year-first date reads alike in every locale, so arithmetic coerces it
+    /// to its serial, time of day included, under the workbook's date system.
+    #[test]
+    fn arithmetic_on_year_first_date_text_reads_its_serial() {
+        let (mut wb, s) = one_sheet();
+        put_text(&mut wb, s, "A1", "2017-04-27");
+        put_num(&mut wb, s, "A2", 41_309.0);
+        put_text(&mut wb, s, "A3", "2017/4/27 18:00");
+        put_text(&mut wb, s, "A4", "2017-02-30");
+        put_formula(&mut wb, s, "B1", "A1-A2");
+        put_formula(&mut wb, s, "B2", "A3-A1");
+        put_formula(&mut wb, s, "B3", "-A1");
+        put_formula(&mut wb, s, "B4", "A1%");
+        put_formula(&mut wb, s, "B5", "A4+1");
+        rebuild_and_recalc_all(&mut wb, None);
+        assert_eq!(value(&wb, s, "B1"), num(1_543.0));
+        assert_eq!(value(&wb, s, "B2"), num(0.75));
+        assert_eq!(value(&wb, s, "B3"), num(-42_852.0));
+        assert_eq!(value(&wb, s, "B4"), num(428.52));
+        assert_eq!(
+            value(&wb, s, "B5"),
+            CellValue::Error {
+                value: ErrorValue::Value
+            }
+        );
+
+        let (mut wb, s) = one_sheet();
+        wb.date_system = xlsx_model::DateSystem::V1904;
+        put_text(&mut wb, s, "A1", "2017-04-27");
+        put_formula(&mut wb, s, "B1", "A1+0");
+        rebuild_and_recalc_all(&mut wb, None);
+        assert_eq!(value(&wb, s, "B1"), num(41_390.0));
+    }
+
+    /// excel trims only ascii spaces off date text, so other unicode spaces,
+    /// full-width digits and number-like clock junk leave it text.
+    #[test]
+    fn year_first_date_text_with_foreign_spacing_stays_text() {
+        let (mut wb, s) = one_sheet();
+        let texts = [
+            "\u{a0}2024-03-05",
+            "2024-03-05\u{a0}",
+            "\u{3000}2024-03-05",
+            "2024-03-05\u{2009}18:00",
+            "2024-03-05 \u{a0}18:00",
+            "2024-03-05 18:00\u{a0}",
+            "\u{ff12}024-03-05",
+            "2024-03-05 1e1:00",
+            "2024-03-05 +6:00",
+        ];
+        for (row, text) in texts.iter().enumerate() {
+            let row = row + 1;
+            put_text(&mut wb, s, &format!("A{row}"), text);
+            put_cached_formula(
+                &mut wb,
+                s,
+                &format!("B{row}"),
+                &format!("A{row}+0"),
+                CellValue::Error {
+                    value: ErrorValue::Value,
+                },
+            );
+        }
+        put_text(&mut wb, s, "C1", "  2024-03-05  ");
+        put_text(&mut wb, s, "C2", "2024-03-05   18:00 ");
+        put_formula(&mut wb, s, "D1", "C1+0");
+        put_formula(&mut wb, s, "D2", "C2+0");
+        rebuild_and_recalc_all(&mut wb, None);
+        for (row, text) in texts.iter().enumerate() {
+            assert_eq!(
+                value(&wb, s, &format!("B{}", row + 1)),
+                CellValue::Error {
+                    value: ErrorValue::Value
+                },
+                "{text:?}"
+            );
+        }
+        assert_eq!(value(&wb, s, "D1"), num(45_356.0));
+        assert_eq!(value(&wb, s, "D2"), num(45_356.75));
+    }
+
     #[test]
     fn an_array_formula_over_date_text_keeps_its_cached_rectangle() {
         for (formula, first, second) in [
