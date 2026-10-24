@@ -73,6 +73,19 @@ impl EvaluationBudget {
     pub(crate) fn refused(&self) -> bool {
         self.refused.get()
     }
+
+    fn can_consume(&self, count: u64) -> bool {
+        count <= self.remaining.get()
+    }
+
+    fn can_consume_text(&self, bytes: u64) -> bool {
+        bytes <= self.text.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> u64 {
+        self.remaining.get()
+    }
 }
 
 /// an open array evaluation; see [`EvalContext::array_scope`].
@@ -231,6 +244,24 @@ impl<'a> EvalContext<'a> {
             parse_cache: self.parse_cache,
             name_index: self.name_index,
         }
+    }
+
+    /// whether `consume_cells(count)` would be granted; charges nothing.
+    pub(crate) fn can_consume(&self, count: u64) -> bool {
+        count <= self.remaining_cell_visits.get()
+            && self
+                .shared_budget
+                .as_ref()
+                .is_none_or(|budget| budget.can_consume(count))
+    }
+
+    /// whether `consume_text(bytes)` would be granted; charges nothing.
+    pub(crate) fn can_consume_text(&self, bytes: u64) -> bool {
+        bytes <= self.remaining_text_bytes.get()
+            && self
+                .shared_budget
+                .as_ref()
+                .is_none_or(|budget| budget.can_consume_text(bytes))
     }
 
     pub(crate) fn consume_cells(&self, count: u64) -> bool {
