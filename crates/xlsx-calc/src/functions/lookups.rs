@@ -316,6 +316,15 @@ pub(crate) fn index_area(args: &[Expr], ctx: &EvalContext<'_>) -> Result<Area, E
         return Err(ErrorValue::Value);
     }
     let area = crate::eval::required_area(&args[0], ctx)?;
+    index_within(area, args, ctx)
+}
+
+/// the part of `area`, `INDEX`'s resolved first argument, its indexes pick.
+pub(crate) fn index_within(
+    area: Area,
+    args: &[Expr],
+    ctx: &EvalContext<'_>,
+) -> Result<Area, ErrorValue> {
     let first = axis_index(args, ctx, 1)?;
     let second = match args.len() {
         3 => Some(axis_index(args, ctx, 2)?),
@@ -541,7 +550,10 @@ pub(crate) fn exact_hit(value: &CellValue, target: &CellValue, reference: bool) 
 }
 
 /// XLOOKUP(value, lookup_array, return_array, [if_not_found], ...): exact-match
-/// subset; a missing value returns `if_not_found` or #N/A.
+/// subset; a missing value returns `if_not_found` or #N/A. a lookup or return
+/// array the formula computes is an array rather than a reference, so the
+/// array form answers for it, reusing whichever argument did resolve. a
+/// reference argument that fails to resolve is the answer, in argument order.
 pub(crate) fn xlookup(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
     if args.len() < 3 || args.len() > 6 {
         return err(ErrorValue::Value);
@@ -550,13 +562,24 @@ pub(crate) fn xlookup(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
     if let CellValue::Error { value } = target {
         return err(value);
     }
-    let lookup = match crate::eval::required_area(&args[1], ctx) {
-        Ok(a) => a,
+    let resolve = |arg: &Expr| crate::eval::resolve_area(arg, ctx).transpose();
+    let lookup = match resolve(&args[1]) {
+        Ok(lookup) => lookup,
         Err(error) => return err(error),
     };
-    let result = match crate::eval::required_area(&args[2], ctx) {
-        Ok(a) => a,
-        Err(error) => return err(error),
+    let result = match lookup.map(|_| resolve(&args[2])) {
+        Some(Ok(result)) => result,
+        Some(Err(error)) => return err(error),
+        None => None,
+    };
+    let (Some(lookup), Some(result)) = (lookup, result) else {
+        // a result computed beside a lookup reference answers with its error
+        // before the lookup is read
+        let data = lookup.map(|_| crate::array::evaluate_array(&args[2], ctx));
+        if let Some(error) = data.as_ref().and_then(crate::Value::as_error) {
+            return err(error);
+        }
+        return crate::array::xlookup_beside(args, ctx, target, lookup, data).into_scalar();
     };
     if lookup.cell_count() != result.cell_count() {
         return err(ErrorValue::Value);
