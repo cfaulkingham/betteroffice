@@ -607,6 +607,7 @@ function createHyperlink(attributes: Attrs): Hyperlink | null {
       type: 'hyperlink',
       anchor: href.slice(1),
       tooltip: asString(link.tooltip) || undefined,
+      ...(typeof link.history === 'boolean' ? { history: link.history } : {}),
       children: [],
     };
   }
@@ -614,6 +615,7 @@ function createHyperlink(attributes: Attrs): Hyperlink | null {
     type: 'hyperlink',
     href,
     tooltip: asString(link.tooltip) || undefined,
+    ...(typeof link.history === 'boolean' ? { history: link.history } : {}),
     rId: asString(link.rId) || undefined,
     children: [],
   };
@@ -1387,7 +1389,9 @@ function buildParagraphContent(
       const currentKey = currentHyperlink
         ? currentHyperlink.href || (currentHyperlink.anchor ? `#${currentHyperlink.anchor}` : '')
         : null;
-      if (!currentHyperlink || currentKey !== linkKey) {
+      const history = asObject(item.attributes.hyperlink)?.history;
+      const linkHistory = typeof history === 'boolean' ? history : undefined;
+      if (!currentHyperlink || currentKey !== linkKey || currentHyperlink.history !== linkHistory) {
         flushHyperlink();
         currentHyperlink = createHyperlink(item.attributes);
       }
@@ -2401,6 +2405,7 @@ function tableFromPayload(context: SaveContext, payload: TablePayload): Table {
     const attrs = { ...TABLE_ROW_ATTR_DEFAULTS, ...(rowPayload.trPr ?? {}) } as TableRowSaveAttrs;
     const row: TableRow = {
       type: 'tableRow',
+      ...(attrs._extraAttributes ? { extraAttributes: attrs._extraAttributes } : {}),
       formatting: tableRowAttrsToFormatting(attrs),
       cells,
     };

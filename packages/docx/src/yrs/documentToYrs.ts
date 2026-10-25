@@ -699,6 +699,7 @@ function hyperlinkMark(hyperlink: Hyperlink): MarkDescriptor {
       href: hyperlink.href || (hyperlink.anchor ? `#${hyperlink.anchor}` : ''),
       tooltip: hyperlink.tooltip ?? null,
       rId: hyperlink.rId ?? null,
+      ...(typeof hyperlink.history === 'boolean' ? { history: hyperlink.history } : {}),
     },
   };
 }
@@ -1590,6 +1591,7 @@ function projectRow(
     }
   }
   if (row.propertyChanges?.length) attrs.trPrChange = row.propertyChanges;
+  if (row.extraAttributes) attrs._extraAttributes = row.extraAttributes;
 
   const columnWidths = table.columnWidths;
   const totalWidth = columnWidths?.reduce((sum, width) => sum + width, 0) ?? 0;
