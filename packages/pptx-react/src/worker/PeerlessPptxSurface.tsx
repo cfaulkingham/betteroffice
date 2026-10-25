@@ -321,10 +321,10 @@ export function PeerlessPptxSurface(props: PptxAsyncEditorInternalProps) {
         {presentation && !failure && props.collaboration?.presence && <PeerlessPresence run={presentation} presence={props.collaboration.presence} />}
         {presentation && !review.diff && <Overlays run={presentation} commands={commands} inputRef={inputRef} preview={shapes.preview}
           insertion={insertion.echo?.rect ?? null} onError={(error) => callbacks.current.onError?.(error)} />}
-        {presentation && <PeerlessReview run={presentation} state={review} proposals={proposals} commands={commands}
-          onError={(error) => callbacks.current.onError?.(error)} exit={() => { setReview({ ...review, presenting: false }); focus(); }} />}
       </div>
       {plugins.managed && <PluginDock host={plugins.host} placement="right" activations={plugins.activations.filter((entry) => entry.plugin.panel?.placement === 'right')} available={available} />}
+      {presentation && <PeerlessReview run={presentation} stage={stage} state={review} proposals={proposals} commands={commands}
+        onError={(error) => callbacks.current.onError?.(error)} exit={() => { setReview({ ...review, presenting: false }); focus(); }} />}
     </div>
     {plugins.managed && <PluginDock host={plugins.host} placement="bottom" activations={plugins.activations.filter((entry) => entry.plugin.panel?.placement === 'bottom')} available={available} />}
     {presentation && <PeerlessNotes run={presentation} onError={(error) => callbacks.current.onError?.(error)} />}
@@ -334,7 +334,8 @@ export function PeerlessPptxSurface(props: PptxAsyncEditorInternalProps) {
 const noProposals: Proposal[] = [];
 
 const styles: Record<string, CSSProperties> = {
-  editor: { position: 'relative', display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 },
+  editor: { position: 'relative', display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0,
+    color: '#172033', fontFamily: 'ui-sans-serif, system-ui, sans-serif' },
   toolbarShell: { display: 'flex', alignItems: 'center', flex: '0 0 auto' },
   toolbar: { flex: '1 1 auto', minWidth: 0 },
   workspace: { display: 'flex', flex: 1, minHeight: 0 },
