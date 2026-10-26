@@ -836,6 +836,7 @@ fn write_spill(
         _ => Vec::new(),
     };
     let changed_before = changed.len();
+    let mut anchor_changed = false;
     let mut moved = Vec::new();
     for at in retired {
         write_spilled_cell(
@@ -850,6 +851,7 @@ fn write_spill(
         if row == anchor.row && col == anchor.col {
             if write_if_changed(wb, (u.0, row, col), value) {
                 changed.push((u.0, anchor));
+                anchor_changed = true;
             }
             continue;
         }
@@ -858,7 +860,13 @@ fn write_spill(
     if let Some(sheet) = wb.sheet_mut(u.0) {
         sheet.set_array_formula(anchor, range);
     }
-    if changed.len() != changed_before || previous != Some(range) {
+    // the anchor holds a formula, which no criteria index reads, so only
+    // spilled or retired cells and a moved range drop the indexes
+    debug_assert!(
+        !budget.criteria_index_covers(u.0, anchor),
+        "a criteria index covers the formula cell {anchor:?}"
+    );
+    if changed.len() - changed_before > usize::from(anchor_changed) || previous != Some(range) {
         budget.begin_spill_round();
     }
     Some(moved)
