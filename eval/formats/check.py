@@ -3638,6 +3638,57 @@ def accept_chart_title_overlay(expected, actual, original, spec):
                 deleted[0].set('val', '0')
 
 
+def accept_slide_reply_roots(expected, actual, spec):
+    def parent_of(node):
+        return node.find('.//p15:parentCm', NS)
+    def comment(comments, author, index):
+        return next((n for n in comments if n.get('authorId') == author and n.get('idx') == index), None)
+    def author_identity(package, node):
+        part = related(package, 'ppt/presentation.xml', 'commentAuthors')
+        if part is None or part not in package.namelist():
+            return None
+        author = next((n for n in package.root(part) if n.get('id') == node.get('authorId')), None)
+        return (author.get('name'), author.get('initials')) if author is not None else None
+    for change in spec.get('comments', []):
+        parts = []
+        for package in (expected, actual):
+            slides = slide_parts(package)
+            part = related(package, slides[change['slide'] - 1], 'comments') if change['slide'] <= len(slides) else None
+            parts.append(package.root(part) if part is not None and part in package.namelist() else None)
+        if None in parts:
+            continue
+        targets = [[n for n in comments if n.findtext('p:text', namespaces=NS) == change['comment']] for comments in parts]
+        if any(len(found) != 1 for found in targets):
+            continue
+        target = targets[0][0]
+        thread = parent_of(target)
+        root = comment(parts[0], thread.get('authorId'), thread.get('idx')) if thread is not None else None
+        if root is None or parent_of(root) is not None:
+            continue
+        identity = author_identity(expected, root)
+        if identity is None:
+            continue
+        reply = next((n for n in reversed(parts[0]) if n.findtext('p:text', namespaces=NS) == change['text']
+                      and (author_identity(expected, n) or (None,))[0] == change['author']
+                      and parent_of(n) is not None
+                      and parent_of(n).get('authorId') == target.get('authorId')
+                      and parent_of(n).get('idx') == target.get('idx')), None)
+        if reply is None:
+            continue
+        for saved_reply in parts[1]:
+            saved_parent = parent_of(saved_reply)
+            if saved_reply.findtext('p:text', namespaces=NS) != change['text'] or saved_parent is None:
+                continue
+            saved_root = comment(parts[1], saved_parent.get('authorId'), saved_parent.get('idx'))
+            if (saved_root is not None and parent_of(saved_root) is None
+                    and saved_root.findtext('p:text', namespaces=NS) == root.findtext('p:text', namespaces=NS)
+                    and author_identity(actual, saved_root) == identity):
+                expected_parent = parent_of(reply)
+                expected_parent.set('authorId', root.get('authorId'))
+                expected_parent.set('idx', root.get('idx'))
+                break
+
+
 def accept_full_calc_on_load(expected, actual):
     calculation = expected.root('xl/workbook.xml').find('s:calcPr', NS)
     saved_calculation = actual.root('xl/workbook.xml').find('s:calcPr', NS)
@@ -3680,6 +3731,7 @@ def check_complex(task, source, revised):
         else:
             accept_layout_placeholder_prompts(expected, actual, spec)
             accept_table_frames(expected, actual)
+            accept_slide_reply_roots(expected, actual, spec)
             complex_slide_metadata(original, expected, spec)
             complex_slide_metadata(original, actual, spec)
             normalize_complex_slide_comments(expected, spec, original)
