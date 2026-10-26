@@ -40,6 +40,7 @@ pub(crate) struct EvaluationBudget {
     remaining: Cell<u64>,
     text: Cell<u64>,
     refused: Cell<bool>,
+    pub(crate) currency_coercion: crate::coercion::CurrencyCoercion,
     settling: Cell<bool>,
     #[cfg(test)]
     pub(crate) criteria_index_enabled: Cell<bool>,
@@ -69,6 +70,7 @@ impl EvaluationBudget {
             remaining: Cell::new(cells),
             text: Cell::new(bytes),
             refused: Cell::new(false),
+            currency_coercion: crate::coercion::CurrencyCoercion::default(),
             settling: Cell::new(false),
             #[cfg(test)]
             criteria_index_enabled: Cell::new(true),
@@ -158,6 +160,7 @@ pub struct EvalContext<'a> {
     bindings: Rc<RefCell<Vec<Binding>>>,
     lambda_depth: Rc<Cell<usize>>,
     shared_budget: Option<Rc<EvaluationBudget>>,
+    currency_coercion: crate::coercion::CurrencyCoercion,
     pub(crate) criteria_cache: Rc<RefCell<CriteriaCache>>,
     pub(crate) spill_index: Option<&'a DepGraph>,
     /// recalc-wide parse memo; `None` for one-off `evaluate` calls.
@@ -210,10 +213,25 @@ impl<'a> EvalContext<'a> {
             bindings: Rc::new(RefCell::new(Vec::new())),
             lambda_depth: Rc::new(Cell::new(0)),
             shared_budget: None,
+            currency_coercion: provider
+                .workbook()
+                .map(crate::coercion::CurrencyCoercion::from_workbook)
+                .unwrap_or_default(),
             criteria_cache: Rc::new(RefCell::new(CriteriaCache::default())),
             parse_cache: None,
             name_index: None,
             spill_index: None,
+        }
+    }
+
+    pub(crate) fn parse_number(&self, raw: &str) -> Option<f64> {
+        parse_num(raw).or_else(|| self.currency_coercion.currency_number(raw))
+    }
+
+    pub(crate) fn number(&self, value: &CellValue) -> Result<f64, ErrorValue> {
+        match value {
+            CellValue::Text { value } => self.parse_number(value).ok_or(ErrorValue::Value),
+            _ => to_number(value),
         }
     }
 
@@ -237,6 +255,10 @@ impl<'a> EvalContext<'a> {
             bindings: Rc::new(RefCell::new(Vec::new())),
             lambda_depth: Rc::new(Cell::new(0)),
             shared_budget: None,
+            currency_coercion: provider
+                .workbook()
+                .map(crate::coercion::CurrencyCoercion::from_workbook)
+                .unwrap_or_default(),
             criteria_cache: Rc::new(RefCell::new(CriteriaCache::default())),
             parse_cache: None,
             name_index: None,
@@ -267,6 +289,7 @@ impl<'a> EvalContext<'a> {
             array_depth: Rc::new(Cell::new(0)),
             bindings: Rc::new(RefCell::new(Vec::new())),
             lambda_depth: Rc::new(Cell::new(0)),
+            currency_coercion: budget.currency_coercion.clone(),
             criteria_cache: Rc::clone(&budget.criteria_cache),
             shared_budget: Some(budget),
             parse_cache: None,
@@ -295,6 +318,7 @@ impl<'a> EvalContext<'a> {
             bindings: Rc::clone(&self.bindings),
             lambda_depth: Rc::clone(&self.lambda_depth),
             shared_budget: self.shared_budget.clone(),
+            currency_coercion: self.currency_coercion.clone(),
             criteria_cache: Rc::clone(&self.criteria_cache),
             parse_cache: self.parse_cache,
             name_index: self.name_index,
@@ -936,7 +960,7 @@ fn date_text_gap(operand: &CellValue, ctx: &EvalContext<'_>) {
 }
 
 fn operand(value: &CellValue, ctx: &EvalContext<'_>) -> Result<f64, ErrorValue> {
-    to_number(value).or_else(|error| {
+    ctx.number(value).or_else(|error| {
         year_first_serial(value, ctx).ok_or_else(|| {
             date_text_gap(value, ctx);
             error
@@ -967,7 +991,10 @@ pub(crate) fn coerced(
             value: ErrorValue::Value
         }
     ) {
-        if let Some(serial) = year_first_serial(value, ctx) {
+        if let Ok(serial) = ctx
+            .number(value)
+            .or_else(|_| year_first_serial(value, ctx).ok_or(ErrorValue::Value))
+        {
             return apply(&num(serial));
         }
         date_text_gap(value, ctx);

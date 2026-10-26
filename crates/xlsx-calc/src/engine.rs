@@ -15,8 +15,8 @@ use std::rc::Rc;
 
 use xlsx_model::progress::tick as progress;
 use xlsx_model::{
-    Cell, CellProvider, CellRange, CellRef, CellValue, ColId, DefinedName, ErrorValue, RowId,
-    SheetId, Table, Workbook,
+    CellProvider, CellRange, CellRef, CellValue, ColId, DefinedName, ErrorValue, RowId, SheetId,
+    Table, Workbook,
 };
 
 use crate::array::{Spill, charged_spill, evaluate_spill};
@@ -254,24 +254,35 @@ fn run_recalc(
     context: RecalcContext,
     recomputed: Option<&mut HashSet<Key>>,
 ) -> RecalcResult {
-    run_recalc_with_budget(
-        wb,
-        graph,
-        recompute,
-        context,
-        recomputed,
-        Rc::new(EvaluationBudget::new(MAX_RECALCULATION_CELL_VISITS)),
-    )
+    let mut budget = EvaluationBudget::new(MAX_RECALCULATION_CELL_VISITS);
+    budget.currency_coercion = crate::coercion::CurrencyCoercion::from_workbook(wb);
+    run_recalc_with_budget(wb, graph, recompute, context, recomputed, Rc::new(budget))
 }
 
 fn run_recalc_with_budget(
     wb: &mut Workbook,
     graph: &DepGraph,
-    recompute: HashSet<Key>,
+    mut recompute: HashSet<Key>,
     context: RecalcContext,
     mut recomputed: Option<&mut HashSet<Key>>,
     budget: Rc<EvaluationBudget>,
 ) -> RecalcResult {
+    {
+        let mut previous = graph
+            .currency_coercion
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // every builder records the evidence it was built over; a graph that
+        // recorded none takes the current evidence as the one its values
+        // were computed with
+        if previous
+            .as_ref()
+            .is_some_and(|previous| *previous != budget.currency_coercion)
+        {
+            recompute.extend(graph.formula_cells().map(|(sheet, cell)| key(sheet, cell)));
+        }
+        *previous = Some(budget.currency_coercion.clone());
+    }
     let mut pass = Pass {
         graph,
         name_index: graph.names_match(&wb.defined_names).then_some(graph),
@@ -617,6 +628,10 @@ fn starts(at: u32, size: u32) -> std::ops::RangeInclusive<u32> {
 }
 
 impl CellProvider for ReadLog<'_> {
+    fn workbook(&self) -> Option<&Workbook> {
+        Some(self.inner)
+    }
+
     fn value(&self, sheet: SheetId, at: CellRef) -> CellValue {
         self.note(sheet, at);
         self.inner.value(sheet, at)
@@ -947,20 +962,7 @@ fn write_if_changed(wb: &mut Workbook, u: Key, value: CellValue) -> bool {
     }
     if let Some(sheet) = wb.sheet_mut(u.0) {
         let at = cell_of(u);
-        if let Some(cell) = sheet.cell_mut(at) {
-            cell.value = value;
-            if *cell == Cell::default() {
-                sheet.set_cell(at, Cell::default());
-            }
-        } else {
-            sheet.set_cell(
-                at,
-                Cell {
-                    value,
-                    ..Cell::default()
-                },
-            );
-        }
+        sheet.set_calculated_value(at, value);
     }
     true
 }
