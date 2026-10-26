@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
 use pptx_edit::{CommentFlavor, DeckSession, EditCtx};
+use yrs::updates::decoder::Decode;
+use yrs::{Map, ReadTxn, Transact};
 
 fn fixture() -> Vec<u8> {
     let parts = [
@@ -322,4 +324,345 @@ fn concurrent_legacy_replies_by_new_authors_save_identically_on_both_peers() {
             .count(),
         2
     );
+}
+
+const ROOT_EXT: &str = r#"<p:extLst mod="1"><p:ext uri="{C676402C-5697-4E1C-873F-D02D1690AC5C}"><p15:threadingInfo xmlns:p15="http://schemas.microsoft.com/office/powerpoint/2012/main" timeZoneBias="-180"/></p:ext><p:ext uri="custom"><x:data xmlns:x="urn:comment-test" value="root"/></p:ext></p:extLst>"#;
+
+fn extended_discussion(flavor: CommentFlavor) -> Vec<u8> {
+    let seed = DeckSession::open(&source(flavor), 520).unwrap();
+    let root = seed.comments().unwrap().remove(0);
+    seed.reply_to_comment(
+        &EditCtx::local("test"),
+        &root.id,
+        "Writer",
+        "WR",
+        "Reply",
+        "2026-01-01T11:00:00Z",
+    )
+    .unwrap();
+    let mut entries = parts(&seed.save().unwrap());
+    for (path, bytes) in &mut entries {
+        if !path.starts_with("ppt/comments/") {
+            continue;
+        }
+        let xml = String::from_utf8(bytes.clone()).unwrap();
+        *bytes = match flavor {
+            CommentFlavor::Legacy => xml
+                .replace("<p:cm ", "<p:cm custom=\"keep\" ")
+                .replace("</p:cm>", "<x:extra xmlns:x=\"urn:comment-test\"/></p:cm>")
+                .replacen("</p:cm>", &format!("{ROOT_EXT}</p:cm>"), 1)
+                .replace("<p:extLst>", "<p:extLst mod=\"2\">")
+                .replace("timeZoneBias=\"0\"", "timeZoneBias=\"-120\""),
+            CommentFlavor::Modern => xml
+                .replace("</p188:reply>", "<p188:extLst mod=\"2\"><x:data xmlns:x=\"urn:comment-test\" value=\"reply\"/></p188:extLst></p188:reply>")
+                .replace("</p188:cm>", "<p188:extLst mod=\"1\"><x:data xmlns:x=\"urn:comment-test\" value=\"root\"/></p188:extLst></p188:cm>"),
+        }
+        .into_bytes();
+    }
+    ooxml_opc::rezip_parts(&entries.into_iter().collect::<Vec<_>>()).unwrap()
+}
+
+fn assert_copied_extensions(source: &[u8], saved: &[u8], flavor: CommentFlavor) {
+    let original = parts(source);
+    let output = parts(saved);
+    for (path, bytes) in original
+        .iter()
+        .filter(|(path, _)| path.starts_with("ppt/comments/"))
+    {
+        assert_eq!(&output[path], bytes);
+    }
+    let copied = output
+        .iter()
+        .find(|(path, _)| path.starts_with("ppt/comments/") && !original.contains_key(*path))
+        .unwrap();
+    let xml = String::from_utf8(copied.1.clone()).unwrap();
+    match flavor {
+        CommentFlavor::Legacy => {
+            assert!(xml.contains(ROOT_EXT), "{xml}");
+            assert!(xml.contains("<p:extLst mod=\"2\">"), "{xml}");
+            assert!(xml.contains("timeZoneBias=\"-120\""), "{xml}");
+            let parsed = pptx_parse::parse_pptx(saved).unwrap();
+            let root = parsed
+                .comments
+                .iter()
+                .find(|comment| {
+                    comment.slide_part_path != "ppt/slides/slide1.xml"
+                        && comment.parent_id.is_none()
+                })
+                .unwrap();
+            let index = root.id.rsplit_once(':').unwrap().1;
+            assert!(
+                xml.contains(&format!(
+                    "<p15:parentCm authorId=\"{}\" idx=\"{index}\"",
+                    root.author_id
+                )),
+                "{xml}"
+            );
+            assert_ne!(root.id, "0:1");
+            let source_xml =
+                String::from_utf8(original["ppt/comments/comment1.xml"].clone()).unwrap();
+            let originals = pptx_parse::parse_pptx(source).unwrap();
+            for comment in parsed.comments.iter().filter(|comment| {
+                comment.slide_part_path == root.slide_part_path && comment.text != "Later reply"
+            }) {
+                let original = originals
+                    .comments
+                    .iter()
+                    .find(|item| item.text == comment.text)
+                    .unwrap();
+                let old_index = original.id.rsplit_once(':').unwrap().1;
+                let new_index = comment.id.rsplit_once(':').unwrap().1;
+                let fragment = source_xml
+                    .split("<p:cm ")
+                    .skip(1)
+                    .map(|fragment| fragment.split_once("</p:cm>").unwrap().0)
+                    .find(|fragment| {
+                        fragment.contains(&format!("<p:text>{}</p:text>", comment.text))
+                    })
+                    .unwrap();
+                let mut expected = format!("<p:cm {fragment}</p:cm>").replacen(
+                    &format!("idx=\"{old_index}\""),
+                    &format!("idx=\"{new_index}\""),
+                    1,
+                );
+                if let Some(parent) = &comment.parent_id {
+                    let (author, index) = parent.rsplit_once(':').unwrap();
+                    expected = expected.replace(
+                        "<p15:parentCm authorId=\"0\" idx=\"1\"",
+                        &format!("<p15:parentCm authorId=\"{author}\" idx=\"{index}\""),
+                    );
+                }
+                assert!(xml.contains(&expected), "{expected}\n{xml}");
+            }
+        }
+        CommentFlavor::Modern => {
+            for extension in [
+                r#"<p188:extLst mod="1"><x:data xmlns:x="urn:comment-test" value="root"/></p188:extLst>"#,
+                r#"<p188:extLst mod="2"><x:data xmlns:x="urn:comment-test" value="reply"/></p188:extLst>"#,
+            ] {
+                assert!(xml.contains(extension), "{xml}");
+            }
+        }
+    }
+    let reopened = DeckSession::open(saved, 523).unwrap();
+    assert_eq!(parts(&reopened.save().unwrap()), output);
+}
+
+#[test]
+fn duplicated_comments_preserve_extensions_in_both_flavors() {
+    for flavor in [CommentFlavor::Legacy, CommentFlavor::Modern] {
+        let source = extended_discussion(flavor);
+        let session = DeckSession::open(&source, 521).unwrap();
+        session
+            .duplicate_slide(&EditCtx::local("test"), &session.slide_ids().unwrap()[0], 1)
+            .unwrap();
+        assert_copied_extensions(&source, &session.save().unwrap(), flavor);
+    }
+}
+
+#[test]
+fn replying_to_a_copied_legacy_root_preserves_extensions_and_threads() {
+    let source = extended_discussion(CommentFlavor::Legacy);
+    let session = DeckSession::open(&source, 522).unwrap();
+    let ctx = EditCtx::local("test");
+    let copy = session
+        .duplicate_slide(&ctx, &session.slide_ids().unwrap()[0], 1)
+        .unwrap();
+    let root = session
+        .comments()
+        .unwrap()
+        .into_iter()
+        .find(|comment| comment.slide_id == copy.slide_id && comment.parent_id.is_none())
+        .unwrap();
+    session
+        .reply_to_comment(
+            &ctx,
+            &root.id,
+            "Later",
+            "LA",
+            "Later reply",
+            "2026-01-01T12:00:00Z",
+        )
+        .unwrap();
+    let saved = session.save().unwrap();
+    assert_copied_extensions(&source, &saved, CommentFlavor::Legacy);
+    let reopened = DeckSession::open(&saved, 524).unwrap();
+    let copied = reopened
+        .comments()
+        .unwrap()
+        .into_iter()
+        .filter(|comment| comment.slide_id != session.slide_ids().unwrap()[0])
+        .collect::<Vec<_>>();
+    let root = copied
+        .iter()
+        .find(|comment| comment.parent_id.is_none())
+        .unwrap();
+    assert_eq!(
+        copied
+            .iter()
+            .filter(|comment| comment.parent_id.as_ref() == Some(&root.id))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn recorded_duplicate_without_source_metadata_recovers_extensions_on_save() {
+    let source = extended_discussion(CommentFlavor::Legacy);
+    let session = DeckSession::open(&source, 525).unwrap();
+    session
+        .duplicate_slide(&EditCtx::local("test"), &session.slide_ids().unwrap()[0], 1)
+        .unwrap();
+    let recorded = yrs::Doc::new();
+    recorded
+        .transact_mut()
+        .apply_update(yrs::Update::decode_v1(&session.encode_state_as_update_v1()).unwrap())
+        .unwrap();
+    let mut txn = recorded.transact_mut();
+    let comments = txn.get_map("pptx:comments").unwrap();
+    let copies = comments
+        .iter(&txn)
+        .filter(|(id, _)| id.starts_with("comment:copy:"))
+        .map(|(id, value)| (id.to_owned(), value.cast::<yrs::MapRef>().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(copies.len(), 2);
+    for (id, entry) in copies {
+        let mut keys = entry.iter(&txn).map(|(key, _)| key).collect::<Vec<_>>();
+        keys.sort();
+        let mut expected = vec![
+            "author",
+            "copyOrigin",
+            "created",
+            "id",
+            "initials",
+            "resolved",
+            "slideId",
+            "text",
+            "x",
+            "y",
+        ];
+        if session
+            .comments()
+            .unwrap()
+            .iter()
+            .find(|comment| comment.id == id)
+            .unwrap()
+            .parent_id
+            .is_some()
+        {
+            expected.push("parentId");
+        }
+        expected.sort();
+        assert_eq!(keys, expected);
+        // State recorded by 0.5.0 carries no copy origin.
+        entry.remove(&mut txn, "copyOrigin");
+    }
+    drop(txn);
+    let update = recorded
+        .transact()
+        .encode_state_as_update_v1(&yrs::StateVector::default());
+    let restored = DeckSession::open_from_update_with_source(&update, &source, 526).unwrap();
+    let before_save = restored.encode_state_as_update_v1();
+    assert_copied_extensions(&source, &restored.save().unwrap(), CommentFlavor::Legacy);
+    assert_eq!(restored.encode_state_as_update_v1(), before_save);
+    assert_eq!(
+        parts(&restored.save().unwrap()),
+        parts(&restored.save().unwrap())
+    );
+}
+
+fn copied_comment_xmls(source: &[u8], saved: &[u8]) -> Vec<String> {
+    let original = parts(source);
+    parts(saved)
+        .iter()
+        .filter(|(path, _)| path.starts_with("ppt/comments/") && !original.contains_key(*path))
+        .map(|(_, bytes)| String::from_utf8(bytes.clone()).unwrap())
+        .collect()
+}
+
+fn assert_comment_extensions(xml: &str, flavor: CommentFlavor) {
+    match flavor {
+        CommentFlavor::Legacy => {
+            assert!(xml.contains(ROOT_EXT), "{xml}");
+            assert!(xml.contains("<p:extLst mod=\"2\">"), "{xml}");
+            assert!(xml.contains("timeZoneBias=\"-120\""), "{xml}");
+        }
+        CommentFlavor::Modern => {
+            for extension in [
+                r#"<p188:extLst mod="1"><x:data xmlns:x="urn:comment-test" value="root"/></p188:extLst>"#,
+                r#"<p188:extLst mod="2"><x:data xmlns:x="urn:comment-test" value="reply"/></p188:extLst>"#,
+            ] {
+                assert!(xml.contains(extension), "{xml}");
+            }
+        }
+    }
+}
+
+#[test]
+fn duplicate_of_duplicate_keeps_extensions_in_both_flavors() {
+    for flavor in [CommentFlavor::Legacy, CommentFlavor::Modern] {
+        let source = extended_discussion(flavor);
+        let session = DeckSession::open(&source, 527).unwrap();
+        let ctx = EditCtx::local("test");
+        let first = session.slide_ids().unwrap()[0].clone();
+        let copy = session.duplicate_slide(&ctx, &first, 1).unwrap();
+        session.duplicate_slide(&ctx, &copy.slide_id, 2).unwrap();
+        let saved = session.save().unwrap();
+        assert_copied_extensions(&source, &saved, flavor);
+        let copied = copied_comment_xmls(&source, &saved);
+        assert_eq!(copied.len(), 2, "{copied:?}");
+        for xml in &copied {
+            assert_comment_extensions(xml, flavor);
+        }
+    }
+}
+
+#[test]
+fn deleting_a_duplicate_before_save_keeps_source_and_leaves_no_stray_comments_part() {
+    for flavor in [CommentFlavor::Legacy, CommentFlavor::Modern] {
+        let source = extended_discussion(flavor);
+        let session = DeckSession::open(&source, 528).unwrap();
+        let ctx = EditCtx::local("test");
+        let first = session.slide_ids().unwrap()[0].clone();
+        let copy = session.duplicate_slide(&ctx, &first, 1).unwrap();
+        session.delete_slide(&ctx, &copy.slide_id).unwrap();
+        let saved = session.save().unwrap();
+        let original = parts(&source);
+        let output = parts(&saved);
+        let original_parts: Vec<_> = original
+            .keys()
+            .filter(|path| path.starts_with("ppt/comments/"))
+            .collect();
+        assert_eq!(
+            output
+                .keys()
+                .filter(|path| path.starts_with("ppt/comments/"))
+                .count(),
+            original_parts.len()
+        );
+        for path in original_parts {
+            assert_eq!(&output[path], &original[path], "{path}");
+            assert_comment_extensions(&String::from_utf8(output[path].clone()).unwrap(), flavor);
+        }
+        assert_eq!(session.comments().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn deleting_intermediate_duplicate_keeps_extensions_on_surviving_copy_in_both_flavors() {
+    for flavor in [CommentFlavor::Legacy, CommentFlavor::Modern] {
+        let source = extended_discussion(flavor);
+        let session = DeckSession::open(&source, 529).unwrap();
+        let ctx = EditCtx::local("test");
+        let first = session.slide_ids().unwrap()[0].clone();
+        let copy = session.duplicate_slide(&ctx, &first, 1).unwrap();
+        session.duplicate_slide(&ctx, &copy.slide_id, 2).unwrap();
+        session.delete_slide(&ctx, &copy.slide_id).unwrap();
+        let saved = session.save().unwrap();
+        assert_copied_extensions(&source, &saved, flavor);
+        let copied = copied_comment_xmls(&source, &saved);
+        assert_eq!(copied.len(), 1, "{copied:?}");
+        assert_comment_extensions(&copied[0], flavor);
+        assert_eq!(session.comments().unwrap().len(), 4);
+    }
 }

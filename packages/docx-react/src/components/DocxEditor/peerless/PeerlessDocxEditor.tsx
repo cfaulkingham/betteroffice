@@ -154,6 +154,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
   const [zoom, setZoom] = useState(() => clampZoom(initialZoom));
   const { t } = useTranslation();
   const [tableGridlines, setTableGridlines] = useState(props.showTableGridlines === true);
+  const [dragSelecting, setDragSelecting] = useState(false);
   const [gridlinesProp, setGridlinesProp] = useState(props.showTableGridlines);
   if (gridlinesProp !== props.showTableGridlines) {
     setGridlinesProp(props.showTableGridlines);
@@ -456,6 +457,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
       released = true;
       signal.removeEventListener('abort', abort);
       if (releaseResident.current === abort) releaseResident.current = null;
+      svgImages?.close();
       stopFonts(); stopMemory(); disposeFonts(); client.destroy();
       if (worker.current === client) { worker.current = null; fontAbort.current?.abort(); fontJob.current = null; fontSource.current = null; }
     };
@@ -606,9 +608,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
       const decoding = svgImages;
       svgImages = undefined;
       signal.addEventListener('abort', () => decoding.close(), { once: true });
-      void decoding.done.then(() => {
-        const late = decoding.take();
-        if (!late.length) return;
+      decoding.flushTo((late) => {
         if (signal.aborted) {
           for (const { image } of late) image.close();
           return;
@@ -1087,10 +1087,10 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
     return bounds && rect ? { ...item, fixedY: bounds.y + rect.y } : { ...item, hidden: true };
   });
   const selected = shellState.view?.workerSelection;
-  const floating = documentReady && !effectiveReadOnly && !workerComments.adding && !!selected &&
+  const floating = documentReady && !effectiveReadOnly && !workerComments.adding && !dragSelecting && !!selected &&
     (selected.focus.story === 'body' || selected.focus.story.startsWith('body:')) && selected.anchor.story === selected.focus.story &&
     (selected.anchor.paraId !== selected.focus.paraId || selected.anchor.offset !== selected.focus.offset) &&
-    (shellState.view?.geometry?.coversThroughSeq ?? -1) >= (shellState.view?.throughSeq ?? 0) ? selectionAnchor() : null;
+    !!shellState.view && geometryMatchesDocument(shellState.view) ? selectionAnchor() : null;
   const hostProposalItems = workerProposalSidebarItems(controller, currentReview, geometry,
     documentReady && props.allowHostProposals === true && props.showHostProposalsInSidebar === true && (commentsOpen || dotsMode), reportRecoverableError);
   const reviewItems = [...positionedComments, ...hostProposalItems].filter(item => item.review).sort((first, second) => first.review!.change.from - second.review!.change.from);
@@ -1249,7 +1249,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
       {shellState.status === 'failed' && shellState.error ? <ParseError message={shellState.error.message} /> : sessionOptions ? (
         <PeerlessPagedEditor sessionOptions={sessionOptions} zoom={zoom} onReady={onReady} autoFocus={!effectiveReadOnly}
           overlay={workerCollaboration.overlay(displayWindow)}
-          displayWindow={displayWindow} onDisplayWindowChange={showWindow} onClipboard={onClipboard} onPasteFragment={onPasteFragment} highlights={searchState.highlights} onNavigateCell={controller.navigateCell} onPartPoint={onPartPoint} pictures={pictureMoves}
+          displayWindow={displayWindow} onDisplayWindowChange={showWindow} onClipboard={onClipboard} onPasteFragment={onPasteFragment} highlights={searchState.highlights} onNavigateCell={controller.navigateCell} onPartPoint={onPartPoint} onDragSelectionChange={setDragSelecting} pictures={pictureMoves}
           pageMirror={props.pageMirror} pageOverlays={<>{partChrome}<WorkerContentControls controller={controller} onError={reportRecoverableError} /></>} />
       ) : hasSource ? null : placeholder ?? <DefaultPlaceholder />}
     </div>} />

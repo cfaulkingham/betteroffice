@@ -3,6 +3,9 @@
 
 mod order;
 
+#[cfg(test)]
+mod criteria_index_differential;
+
 use order::{Step, topo_order};
 
 use std::borrow::Cow;
@@ -12,8 +15,8 @@ use std::rc::Rc;
 
 use xlsx_model::progress::tick as progress;
 use xlsx_model::{
-    Cell, CellProvider, CellRange, CellRef, CellValue, ColId, DefinedName, ErrorValue, RowId,
-    SheetId, Table, Workbook,
+    CellProvider, CellRange, CellRef, CellValue, ColId, DefinedName, ErrorValue, RowId, SheetId,
+    Table, Workbook,
 };
 
 use crate::array::{Spill, charged_spill, evaluate_spill};
@@ -249,13 +252,42 @@ fn run_recalc(
     graph: &DepGraph,
     recompute: HashSet<Key>,
     context: RecalcContext,
-    mut recomputed: Option<&mut HashSet<Key>>,
+    recomputed: Option<&mut HashSet<Key>>,
 ) -> RecalcResult {
+    let mut budget = EvaluationBudget::new(MAX_RECALCULATION_CELL_VISITS);
+    budget.currency_coercion = crate::coercion::CurrencyCoercion::from_workbook(wb);
+    run_recalc_with_budget(wb, graph, recompute, context, recomputed, Rc::new(budget))
+}
+
+fn run_recalc_with_budget(
+    wb: &mut Workbook,
+    graph: &DepGraph,
+    mut recompute: HashSet<Key>,
+    context: RecalcContext,
+    mut recomputed: Option<&mut HashSet<Key>>,
+    budget: Rc<EvaluationBudget>,
+) -> RecalcResult {
+    {
+        let mut previous = graph
+            .currency_coercion
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // every builder records the evidence it was built over; a graph that
+        // recorded none takes the current evidence as the one its values
+        // were computed with
+        if previous
+            .as_ref()
+            .is_some_and(|previous| *previous != budget.currency_coercion)
+        {
+            recompute.extend(graph.formula_cells().map(|(sheet, cell)| key(sheet, cell)));
+        }
+        *previous = Some(budget.currency_coercion.clone());
+    }
     let mut pass = Pass {
         graph,
         name_index: graph.names_match(&wb.defined_names).then_some(graph),
         context,
-        budget: Rc::new(EvaluationBudget::new(MAX_RECALCULATION_CELL_VISITS)),
+        budget,
         changed: Vec::new(),
         cycle_cells: Vec::new(),
         limited_cells: Vec::new(),
@@ -263,7 +295,10 @@ fn run_recalc(
     };
     let mut pending = recompute;
 
-    for _ in 0..MAX_SPILL_ROUNDS {
+    for round in 0..MAX_SPILL_ROUNDS {
+        if round > 0 {
+            pass.budget.begin_spill_round();
+        }
         if let Some(recomputed) = &mut recomputed {
             recomputed.extend(pending.iter().copied());
         }
@@ -390,6 +425,7 @@ impl Pass<'_> {
     /// are circular and settle at `circular_value`, and the member waiting on
     /// the first of them runs again with that value.
     fn settle(&mut self, wb: &mut Workbook, members: &[Key]) {
+        self.budget.set_settling(true);
         let ids: HashMap<Key, usize> = members.iter().enumerate().map(|(id, &u)| (u, id)).collect();
         let spills = Spills::new(wb, members);
         let mut settled = vec![false; members.len()];
@@ -449,6 +485,7 @@ impl Pass<'_> {
                 }
             }
         }
+        self.budget.set_settling(false);
     }
 
     fn write(&mut self, wb: &mut Workbook, u: Key, value: Option<NodeValue>, limited: bool) {
@@ -591,6 +628,10 @@ fn starts(at: u32, size: u32) -> std::ops::RangeInclusive<u32> {
 }
 
 impl CellProvider for ReadLog<'_> {
+    fn workbook(&self) -> Option<&Workbook> {
+        Some(self.inner)
+    }
+
     fn value(&self, sheet: SheetId, at: CellRef) -> CellValue {
         self.note(sheet, at);
         self.inner.value(sheet, at)
@@ -692,6 +733,7 @@ fn eval_node_with(
     ctx.date_system = wb.date_system;
     ctx.parse_cache = Some(graph.asts());
     ctx.name_index = name_index;
+    ctx.spill_index = Some(graph);
     let value = match authored {
         Some(_) => NodeValue::Spill(evaluate_spill(&expr, &ctx, cell, authored)),
         None => NodeValue::Scalar(computed(evaluate(&expr, &ctx))),
@@ -793,6 +835,7 @@ fn write_spill(
         (Some(previous), Some(sheet)) => retired_cells(sheet, previous, anchor, range, budget)?,
         _ => Vec::new(),
     };
+    let changed_before = changed.len();
     let mut moved = Vec::new();
     for at in retired {
         write_spilled_cell(
@@ -814,6 +857,9 @@ fn write_spill(
     }
     if let Some(sheet) = wb.sheet_mut(u.0) {
         sheet.set_array_formula(anchor, range);
+    }
+    if changed.len() != changed_before || previous != Some(range) {
+        budget.begin_spill_round();
     }
     Some(moved)
 }
@@ -916,20 +962,7 @@ fn write_if_changed(wb: &mut Workbook, u: Key, value: CellValue) -> bool {
     }
     if let Some(sheet) = wb.sheet_mut(u.0) {
         let at = cell_of(u);
-        if let Some(cell) = sheet.cell_mut(at) {
-            cell.value = value;
-            if *cell == Cell::default() {
-                sheet.set_cell(at, Cell::default());
-            }
-        } else {
-            sheet.set_cell(
-                at,
-                Cell {
-                    value,
-                    ..Cell::default()
-                },
-            );
-        }
+        sheet.set_calculated_value(at, value);
     }
     true
 }
@@ -1428,7 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn indirect_in_r1c1_style_keeps_its_cached_result() {
+    fn indirect_in_r1c1_style_resolves_like_a1() {
         let (mut wb, s) = one_sheet();
         put_num(&mut wb, s, "A1", 5.0);
         put_cached_formula(&mut wb, s, "B1", "INDIRECT(\"R1C1\",FALSE)", num(8.0));
@@ -1438,12 +1471,12 @@ mod tests {
         put_cached_formula(&mut wb, s, "B5", "INDIRECT(\"Nowhere!A1\")", num(-1.0));
         put_cached_formula(&mut wb, s, "B6", "INDIRECT(\"'[1]Book'!Rate\")", num(0.25));
         rebuild_and_recalc_all(&mut wb, None);
-        assert_eq!(value(&wb, s, "B1"), num(8.0));
-        assert_eq!(value(&wb, s, "B2"), num(9.0));
+        assert_eq!(value(&wb, s, "B1"), num(5.0));
+        assert_eq!(value(&wb, s, "B2"), num(6.0));
         let reference = CellValue::Error {
             value: ErrorValue::Ref,
         };
-        assert_eq!(value(&wb, s, "B3"), reference);
+        assert_eq!(value(&wb, s, "B3"), num(5.0));
         assert_eq!(value(&wb, s, "B4"), num(5.0));
         assert_eq!(value(&wb, s, "B5"), reference);
         assert_eq!(value(&wb, s, "B6"), num(0.25));
