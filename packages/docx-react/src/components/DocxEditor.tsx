@@ -168,6 +168,7 @@ import { type PrintOptions } from './ui/PrintPreview';
 import { useFindReplace } from './dialogs/FindReplaceDialog';
 import { useHyperlinkDialog } from './dialogs/HyperlinkDialog';
 import { DefaultLoadingIndicator, DefaultPlaceholder, ParseError } from './DocxEditorHelpers';
+import { clampZoom } from '../commands/evaluate';
 import { type DocxInput } from '@betteroffice/docx/utils';
 import type { FontDefinition, ScrollToParaIdOptions } from '@betteroffice/docx/utils';
 import { useFontLifecycle, useFontLoadScope } from '../hooks/useFontLifecycle';
@@ -275,7 +276,7 @@ export interface DocxEditorBaseProps extends DocxEditorPluginProps {
   onMemoryPressure?: (pressure: DocxMemoryPressure) => void;
   /**
    * Levels for `onMemoryPressure`, 75% and 90% of 4 GiB by default, and an
-   * optional limit on the resident worker's allocations.
+   * optional limit on the document worker's allocations.
    */
   memoryBudget?: DocxMemoryBudget;
   /** Callback when fonts are loaded */
@@ -303,7 +304,7 @@ export interface DocxEditorBaseProps extends DocxEditorPluginProps {
   showRuler?: boolean;
   /** Unit for ruler display (default: 'inch') */
   rulerUnit?: 'inch' | 'cm';
-  /** Initial zoom level (default: 1.0) */
+  /** Initial zoom level, clamped to 0.1 (10%) through 5 (500%) (default: 1.0) */
   initialZoom?: number;
   /** Whether to show hidden (vanished) text in the layout (default: false) */
   showHiddenText?: boolean;
@@ -615,7 +616,7 @@ export interface DocxEditorRef {
    * first pages before the rest is laid out. See {@link whenLayoutComplete}.
    */
   getTotalPages: () => number;
-  /** The editor's wasm memories on the main thread and in its resident worker. */
+  /** The editor's wasm memories on the main thread and in its document worker. */
   getMemoryStats: () => DocxMemoryStats;
   /**
    * Resolves with the page count once the whole document, as it is now, is laid out and its
@@ -879,7 +880,7 @@ export const DocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(function Do
 });
 
 function DocxSyncApiRefusal(props: Pick<DocxEditorProps, 'onError' | 'className' | 'style'>) {
-  const [error] = useState(() => new PeerlessSyncApiError('onChange(Document)'));
+  const [error] = useState(() => new PeerlessSyncApiError('onChange(Document)', 'onDocumentChange with the async reads'));
   const latest = useRef(props.onError);
   latest.current = props.onError;
   const reported = useRef(false);
@@ -996,7 +997,7 @@ const LegacyDocxEditor = forwardRef<DocxEditorRef, DocxEditorBaseProps>(function
   const [state, setState] = useState<EditorState>({
     isLoading: !!documentBuffer,
     parseError: null,
-    zoom: initialZoom,
+    zoom: clampZoom(initialZoom),
     paragraphIndentLeft: 0,
     paragraphIndentRight: 0,
     paragraphFirstLineIndent: 0,
@@ -1872,6 +1873,7 @@ const LegacyDocxEditor = forwardRef<DocxEditorRef, DocxEditorBaseProps>(function
       void commands.complete(source, () => runBridgeCommand(command));
     },
     focusActiveEditor,
+    i18n,
   });
 
   const {

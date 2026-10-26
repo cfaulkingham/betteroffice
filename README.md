@@ -48,7 +48,7 @@ This fork maintains the editor and engine changes used by [Field Station](https:
 
 ## Packages
 
-### Documents — `.docx`
+### Documents (`.docx`)
 
 | package | registry | what it does |
 |---|---|---|
@@ -57,7 +57,7 @@ This fork maintains the editor and engine changes used by [Field Station](https:
 | [`@betteroffice/docx-react`](https://www.npmjs.com/package/@betteroffice/docx-react) | npm | drop-in React .docx editor |
 | [`betteroffice-docx`](https://pypi.org/project/betteroffice-docx/) | PyPI | Python API for reading, editing, laying out, and rasterizing DOCX documents |
 
-### Spreadsheets — `.xlsx`
+### Spreadsheets (`.xlsx`)
 
 | package | registry | what it does |
 |---|---|---|
@@ -66,7 +66,7 @@ This fork maintains the editor and engine changes used by [Field Station](https:
 | [`@betteroffice/xlsx-react`](https://www.npmjs.com/package/@betteroffice/xlsx-react) | npm | drop-in React spreadsheet editor |
 | [`betteroffice-xlsx`](https://pypi.org/project/betteroffice-xlsx/) | PyPI | Python API for opening, recalculating, styling, rendering, and saving XLSX workbooks |
 
-### Presentations — `.pptx`
+### Presentations (`.pptx`)
 
 | package | registry | what it does |
 |---|---|---|
@@ -99,6 +99,10 @@ What to install for which language, with a first example each:
 [npm](https://docs.betteroffice.dev/docs/javascript),
 [crates.io](https://docs.betteroffice.dev/docs/rust),
 [PyPI](https://docs.betteroffice.dev/docs/python).
+
+## Upgrading to 0.5
+
+In 0.5 the default editor in `@betteroffice/docx-react`, `@betteroffice/xlsx-react` and `@betteroffice/pptx-react` runs its engine in a worker, and the editor API is async. Apps that only mount an editor and use `onSave` need no code change. [Migrating to 0.5](https://docs.betteroffice.dev/docs/migrating-to-0-5) covers the opt-outs, the replacement for each synchronous call, and the hosting requirements.
 
 <!-- BEGIN GENERATED VISUAL FIDELITY -->
 ## Benchmarks
@@ -165,13 +169,13 @@ Generic: shell and Python with python-docx, openpyxl and python-pptx, no network
 
 ## Structure
 
-- `crates/` — the Rust engines
-- `packages/` — the TypeScript editor packages
-- `bindings/` — the Python bindings
-- `e2e/` — browser tests, corpus scenarios, and the shared test harness
-- `apps/web` — [betteroffice.dev](https://betteroffice.dev) (Next.js on Cloudflare Workers)
-- `apps/demo` — editor playground
-- `apps/docs` — documentation
+- `crates/`: the Rust engines
+- `packages/`: the TypeScript editor packages
+- `bindings/`: the Python bindings
+- `e2e/`: browser tests, corpus scenarios, and the shared test harness
+- `apps/web`: [betteroffice.dev](https://betteroffice.dev) (Next.js on Cloudflare Workers)
+- `apps/demo`: editor playground
+- `apps/docs`: documentation
 
 ## Development
 
@@ -195,4 +199,4 @@ Contributions are welcome. We ask for a one-time signature of the [Contributor L
 
 ## License
 
-[Apache-2.0](LICENSE) — third-party attribution in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+[Apache-2.0](LICENSE). Third-party attribution in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

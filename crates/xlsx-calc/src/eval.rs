@@ -12,6 +12,7 @@ use xlsx_model::{CellProvider, CellRef, CellValue, DateSystem, ErrorValue, Sheet
 
 use crate::TableSpec;
 use crate::array::{Binding, evaluate_array};
+use crate::graph::DepGraph;
 use crate::parser::{BinaryOp, Expr, UnaryOp, parse_formula};
 use crate::reference::table_rect;
 
@@ -72,6 +73,19 @@ impl EvaluationBudget {
     pub(crate) fn refused(&self) -> bool {
         self.refused.get()
     }
+
+    fn can_consume(&self, count: u64) -> bool {
+        count <= self.remaining.get()
+    }
+
+    fn can_consume_text(&self, bytes: u64) -> bool {
+        bytes <= self.text.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> u64 {
+        self.remaining.get()
+    }
 }
 
 /// an open array evaluation; see [`EvalContext::array_scope`].
@@ -122,6 +136,9 @@ pub struct EvalContext<'a> {
     shared_budget: Option<Rc<EvaluationBudget>>,
     /// recalc-wide parse memo; `None` for one-off `evaluate` calls.
     pub(crate) parse_cache: Option<&'a ParseCache>,
+    /// a graph whose names match the provider's, looked up instead of
+    /// scanning them; `None` reads names through the provider.
+    pub(crate) name_index: Option<&'a DepGraph>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -146,6 +163,7 @@ impl<'a> EvalContext<'a> {
             lambda_depth: Rc::new(Cell::new(0)),
             shared_budget: None,
             parse_cache: None,
+            name_index: None,
         }
     }
 
@@ -170,6 +188,7 @@ impl<'a> EvalContext<'a> {
             lambda_depth: Rc::new(Cell::new(0)),
             shared_budget: None,
             parse_cache: None,
+            name_index: None,
         }
     }
 
@@ -198,6 +217,7 @@ impl<'a> EvalContext<'a> {
             lambda_depth: Rc::new(Cell::new(0)),
             shared_budget: Some(budget),
             parse_cache: None,
+            name_index: None,
         }
     }
 
@@ -222,7 +242,26 @@ impl<'a> EvalContext<'a> {
             lambda_depth: Rc::clone(&self.lambda_depth),
             shared_budget: self.shared_budget.clone(),
             parse_cache: self.parse_cache,
+            name_index: self.name_index,
         }
+    }
+
+    /// whether `consume_cells(count)` would be granted; charges nothing.
+    pub(crate) fn can_consume(&self, count: u64) -> bool {
+        count <= self.remaining_cell_visits.get()
+            && self
+                .shared_budget
+                .as_ref()
+                .is_none_or(|budget| budget.can_consume(count))
+    }
+
+    /// whether `consume_text(bytes)` would be granted; charges nothing.
+    pub(crate) fn can_consume_text(&self, bytes: u64) -> bool {
+        bytes <= self.remaining_text_bytes.get()
+            && self
+                .shared_budget
+                .as_ref()
+                .is_none_or(|budget| budget.can_consume_text(bytes))
     }
 
     pub(crate) fn consume_cells(&self, count: u64) -> bool {
@@ -618,10 +657,11 @@ fn bind_defined_name(
     if !ctx.consume_cells(1) {
         return Err(ErrorValue::Num);
     }
-    let defined = ctx
-        .provider
-        .defined_name(key.0, name)
-        .ok_or(ErrorValue::Name)?;
+    let defined = match ctx.name_index {
+        Some(graph) => graph.defined_name(key.0, name),
+        None => ctx.provider.defined_name(key.0, name),
+    }
+    .ok_or(ErrorValue::Name)?;
     let formula = defined
         .formula
         .strip_prefix('=')
@@ -782,7 +822,22 @@ fn date_text_gap(operand: &CellValue, ctx: &EvalContext<'_>) {
 }
 
 fn operand(value: &CellValue, ctx: &EvalContext<'_>) -> Result<f64, ErrorValue> {
-    to_number(value).inspect_err(|_| date_text_gap(value, ctx))
+    to_number(value).or_else(|error| {
+        year_first_serial(value, ctx).ok_or_else(|| {
+            date_text_gap(value, ctx);
+            error
+        })
+    })
+}
+
+/// text that spells a date year first, as the serial an operator reads.
+fn year_first_serial(value: &CellValue, ctx: &EvalContext<'_>) -> Option<f64> {
+    match value {
+        CellValue::Text { value } => {
+            crate::functions::datetime::year_first_date_text(value, ctx.date_system)
+        }
+        _ => None,
+    }
 }
 
 /// a numeric operator over one value; see [`date_text_gap`].
@@ -798,6 +853,9 @@ pub(crate) fn coerced(
             value: ErrorValue::Value
         }
     ) {
+        if let Some(serial) = year_first_serial(value, ctx) {
+            return apply(&num(serial));
+        }
         date_text_gap(value, ctx);
     }
     result
@@ -1134,6 +1192,37 @@ pub(crate) fn required_area(arg: &Expr, ctx: &EvalContext<'_>) -> Result<Area, E
     }
 }
 
+/// the areas a `(a,b)` union designates, nested unions flattened in order;
+/// `None` when `arg` is not a union.
+pub(crate) fn union_areas(
+    arg: &Expr,
+    ctx: &EvalContext<'_>,
+) -> Option<Result<Vec<Area>, ErrorValue>> {
+    match arg {
+        Expr::FuncCall {
+            func: Some(crate::functions::Func::Union),
+            args,
+            ..
+        } => Some(member_areas(args, ctx)),
+        _ => None,
+    }
+}
+
+/// every member of a union must be a reference, all on one sheet.
+fn member_areas(members: &[Expr], ctx: &EvalContext<'_>) -> Result<Vec<Area>, ErrorValue> {
+    let mut areas = Vec::new();
+    for member in members {
+        match union_areas(member, ctx) {
+            Some(nested) => areas.extend(nested?),
+            None => areas.push(required_area(member, ctx)?),
+        }
+    }
+    if areas.iter().any(|area| area.sheet != areas[0].sheet) {
+        return Err(ErrorValue::Value);
+    }
+    Ok(areas)
+}
+
 /// interpret an argument as a rectangular reference (1x1 for single cells);
 /// `None` for non-references, unknown sheets, and reference functions whose
 /// result is #REF!.
@@ -1183,6 +1272,38 @@ pub(crate) fn as_area(arg: &Expr, ctx: &EvalContext<'_>) -> Option<Area> {
             ctx.inside_defined_name(&definition, as_area)
         }
         _ => None,
+    }
+}
+
+/// an argument resolved as a reference once: its rectangle, the error a
+/// reference function in it reports, or `None` for a value to compute instead.
+/// a caller that keeps the error never evaluates a failed reference again.
+pub(crate) fn resolve_area(arg: &Expr, ctx: &EvalContext<'_>) -> Option<Result<Area, ErrorValue>> {
+    match arg {
+        Expr::FuncCall { name, args, .. } if name.eq_ignore_ascii_case("OFFSET") => {
+            Some(crate::functions::lookups::offset_area(args, ctx))
+        }
+        Expr::FuncCall { name, args, .. } if name.eq_ignore_ascii_case("INDIRECT") => {
+            Some(crate::functions::lookups::indirect_area(args, ctx))
+        }
+        // a computed source is no reference, so the array form indexes it
+        Expr::FuncCall { name, args, .. }
+            if name.eq_ignore_ascii_case("INDEX") && (2..=3).contains(&args.len()) =>
+        {
+            let area = resolve_area(&args[0], ctx)?;
+            Some(area.and_then(|area| crate::functions::lookups::index_within(area, args, ctx)))
+        }
+        Expr::RangeJoin { start, end } => Some(range_join_area(start, end, ctx)),
+        Expr::TableRef { table, spec } => Some(table_area(table, spec, ctx)),
+        Expr::Name { scope, name } => {
+            if let Some(binding) = bound(scope, name, ctx) {
+                return binding.reference().and_then(|expr| resolve_area(expr, ctx));
+            }
+            let key = defined_name_key(scope, name, ctx).ok()?;
+            let definition = bind_defined_name(key, name, ctx).ok()?;
+            ctx.inside_defined_name(&definition, resolve_area)
+        }
+        _ => as_area(arg, ctx).map(Ok),
     }
 }
 
@@ -1514,6 +1635,186 @@ mod tests {
         assert!(context.exhausted());
     }
 
+    fn charged(formula: &str, workbook: &Workbook) -> (CellValue, u64) {
+        let context = EvalContext::new(workbook, SheetId(0));
+        let value = evaluate(&parse_formula(formula).unwrap(), &context);
+        let spent = MAX_EVALUATION_CELL_VISITS - context.remaining_cell_visits.get();
+        (value, spent)
+    }
+
+    /// `XLOOKUP` resolves each reference argument once, so an `OFFSET` whose
+    /// height sums a long column costs that column one read, and `IFERROR`
+    /// keeps the answer under a budget one read fits in.
+    #[test]
+    fn xlookup_resolves_each_reference_once() {
+        let mut workbook = Workbook::default();
+        let mut sheet = Sheet::new("Data");
+        sheet.set_cell(CellRef::new(599_999, 0), number(1.0));
+        sheet.set_cell(CellRef::new(0, 2), number(1.0));
+        sheet.set_cell(CellRef::new(0, 3), number(42.0));
+        workbook.sheets.push(sheet);
+        let answer = CellValue::Number { value: 42.0 };
+        let (_, column) = charged("SUM(A:A)", &workbook);
+        let (value, plain) = charged("_xlfn.XLOOKUP(1,C1,D1)", &workbook);
+        assert_eq!(value, answer);
+        assert!(plain <= 2, "{plain}");
+        let (value, offset) = charged("_xlfn.XLOOKUP(1,OFFSET(C1,0,0,SUM(A:A)),D1)", &workbook);
+        assert_eq!(value, answer);
+        assert!(offset <= column + plain, "{offset} > {column} + {plain}");
+        let guarded = "IFERROR(_xlfn.XLOOKUP(1,OFFSET(C1,0,0,SUM(A:A)),D1),0)";
+        assert_eq!(charged(guarded, &workbook).0, answer);
+    }
+
+    #[test]
+    fn xlookup_short_circuits_an_error_key_before_resolving_references() {
+        let mut workbook = Workbook::default();
+        let mut sheet = Sheet::new("Data");
+        sheet.set_cell(CellRef::new(599_999, 0), number(1.0));
+        sheet.set_cell(CellRef::new(0, 2), number(1.0));
+        sheet.set_cell(CellRef::new(0, 3), number(42.0));
+        workbook.sheets.push(sheet);
+        let formula = "IFERROR(IFERROR(XLOOKUP(NA(),OFFSET(C1,0,0,SUM(A:A)),D1),42)+SUM(A:A),0)";
+        assert_eq!(
+            charged(formula, &workbook).0,
+            CellValue::Number { value: 43.0 }
+        );
+    }
+
+    #[test]
+    fn xlookup_short_circuits_an_error_lookup_before_resolving_the_result() {
+        let mut workbook = Workbook::default();
+        let mut sheet = Sheet::new("Data");
+        sheet.set_cell(CellRef::new(599_999, 0), number(1.0));
+        sheet.set_cell(CellRef::new(0, 3), number(42.0));
+        workbook.sheets.push(sheet);
+        let formula = "IFERROR(IFERROR(XLOOKUP(1,NA(),OFFSET(D1,0,0,SUM(A:A))),42)+SUM(A:A),0)";
+        assert_eq!(
+            charged(formula, &workbook).0,
+            CellValue::Number { value: 43.0 }
+        );
+    }
+
+    #[test]
+    fn xlookup_reuses_the_key_when_delegating_to_arrays() {
+        let mut workbook = Workbook::default();
+        let mut sheet = Sheet::new("Data");
+        sheet.set_cell(CellRef::new(599_999, 0), number(1.0));
+        workbook.sheets.push(sheet);
+        let formula = "IFERROR(XLOOKUP(SUM(A:A),{1},{42},SUM(A:A)),0)";
+        assert_eq!(
+            charged(formula, &workbook).0,
+            CellValue::Number { value: 42.0 }
+        );
+    }
+
+    #[test]
+    fn xlookup_resolves_a_failed_reference_once() {
+        let mut workbook = Workbook::default();
+        let mut sheet = Sheet::new("Data");
+        sheet.set_cell(CellRef::new(299_999, 0), number(1.0));
+        sheet.set_cell(CellRef::new(0, 2), number(1.0));
+        sheet.set_cell(CellRef::new(0, 3), number(42.0));
+        workbook.sheets.push(sheet);
+        workbook
+            .defined_names
+            .push(defined_name("rng", "OFFSET(C1,0,0,0*SUM(A:A))"));
+        let (_, column) = charged("SUM(A:A)", &workbook);
+        let wrong: Vec<_> = [
+            (
+                "IFERROR(XLOOKUP(1,OFFSET(C1,0,0,0*SUM(A:A)),D1),SUM(A:A))",
+                1.0,
+            ),
+            (
+                "IFERROR(XLOOKUP(1,INDEX(OFFSET(C1,0,0,SUM(A:A)),2),D1),SUM(A:A))",
+                1.0,
+            ),
+            ("IFERROR(XLOOKUP(1,rng,D1),SUM(A:A))", 1.0),
+            (
+                "IFERROR(XLOOKUP(1,{1},OFFSET(D1,0,0,0*SUM(A:A))),SUM(A:A))",
+                1.0,
+            ),
+            (
+                "IFERROR(XLOOKUP(1,{1},INDEX(OFFSET(D1,0,0,SUM(A:A)),2)),SUM(A:A))",
+                1.0,
+            ),
+            ("IFERROR(XLOOKUP(1,{1},rng),SUM(A:A))", 1.0),
+            ("XLOOKUP(1,{1},INDEX(OFFSET(D1,0,0,SUM(A:A)),1))", 42.0),
+            (
+                "IFERROR(XLOOKUP(1,C1,+OFFSET(D1,0,0,0*SUM(A:A))),SUM(A:A))",
+                1.0,
+            ),
+            ("IFERROR(XLOOKUP(1,C1,+rng),SUM(A:A))", 1.0),
+        ]
+        .into_iter()
+        .map(|(formula, answer)| (formula, answer, charged(formula, &workbook)))
+        .filter(|(_, answer, (value, spent))| {
+            *value != CellValue::Number { value: *answer } || *spent > 2 * column + 2
+        })
+        .collect();
+        assert!(wrong.is_empty(), "{column} per column: {wrong:?}");
+    }
+
+    /// a result argument that fails answers before the lookup reference is
+    /// read, as excel takes the arguments in order.
+    #[test]
+    fn xlookup_reports_a_failed_result_before_reading_the_lookup() {
+        let mut workbook = Workbook::default();
+        let mut sheet = Sheet::new("Data");
+        sheet.set_cell(CellRef::new(599_999, 0), number(1.0));
+        workbook.sheets.push(sheet);
+        let refused = || CellValue::Error {
+            value: ErrorValue::Ref,
+        };
+        let name = || CellValue::Error {
+            value: ErrorValue::Name,
+        };
+        let value = || CellValue::Error {
+            value: ErrorValue::Value,
+        };
+        let one = || CellValue::Number { value: 1.0 };
+        let wrong: Vec<_> = [
+            ("XLOOKUP(1,A1:B600000,OFFSET(D1,0,0,0))", refused()),
+            ("IFERROR(XLOOKUP(1,A:A,OFFSET(D1,0,0,0)),SUM(A:A))", one()),
+            ("XLOOKUP(1,A1:B600000,unknown_name)", name()),
+            ("IFERROR(XLOOKUP(1,A:A,unknown_name),SUM(A:A))", one()),
+            ("XLOOKUP(1,A1:B600000,Missing!D1)", refused()),
+            ("IFERROR(XLOOKUP(1,A:A,Missing!D1),SUM(A:A))", one()),
+            ("XLOOKUP(1,A1:B600000,#REF!)", refused()),
+            ("IFERROR(XLOOKUP(1,A:A,NA()),SUM(A:A))", one()),
+            ("XLOOKUP(1,A1:B600000,42)", value()),
+            ("XLOOKUP(1,{1;2},A1:B600000)", value()),
+            ("IFERROR(XLOOKUP(1,A:A,42),SUM(A:A))", one()),
+            ("IFERROR(XLOOKUP(1,{1;2},A:A),SUM(A:A))", one()),
+            ("IFERROR(XLOOKUP(0,42,A:A),SUM(A:A))", one()),
+        ]
+        .into_iter()
+        .map(|(formula, answer)| (formula, charged(formula, &workbook).0, answer))
+        .filter(|(_, value, answer)| value != answer)
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
+    /// a whole column stands for its used rows only beside a block computed
+    /// over as many rows, so otherwise it is checked as written.
+    #[test]
+    fn xlookup_checks_a_whole_column_beside_one_cell_as_written() {
+        let mut workbook = Workbook::default();
+        let mut sheet = Sheet::new("Data");
+        sheet.set_cell(CellRef::new(0, 0), number(1.0));
+        workbook.sheets.push(sheet);
+        let refused = CellValue::Error {
+            value: ErrorValue::Value,
+        };
+        let formulas = [
+            "XLOOKUP(0,A:A,42)",
+            "XLOOKUP(1,A:A,42)",
+            "XLOOKUP(1,A:A,{10;20})",
+        ];
+        for formula in formulas {
+            assert_eq!(charged(formula, &workbook).0, refused, "{formula}");
+        }
+    }
+
     #[test]
     fn rejects_ranges_over_the_evaluation_budget() {
         let mut workbook = Workbook::default();
@@ -1597,18 +1898,115 @@ mod tests {
     }
 
     #[test]
-    fn exact_lookup_stops_after_the_first_match() {
+    fn exact_lookup_over_an_empty_column_stays_in_budget() {
         let mut workbook = Workbook::default();
         workbook.sheets.push(Sheet::new("Data"));
+        let na = CellValue::Error {
+            value: ErrorValue::NA,
+        };
         let expression = parse_formula("VLOOKUP(0,A1:B1048576,2,FALSE)").unwrap();
         let context = EvalContext::new(&workbook, SheetId(0));
-        assert_eq!(evaluate(&expression, &context), CellValue::Empty);
+        assert_eq!(evaluate(&expression, &context), na);
         assert!(!context.exhausted());
 
         let expression = parse_formula("XLOOKUP(0,A1:A1048576,B1:B1048576)").unwrap();
         let context = EvalContext::new(&workbook, SheetId(0));
-        assert_eq!(evaluate(&expression, &context), CellValue::Empty);
+        assert_eq!(evaluate(&expression, &context), na);
         assert!(!context.exhausted());
+
+        // misses over whole columns read only the used rows, so two of them fit
+        let expression = parse_formula("IFNA(XLOOKUP(0,A:A,B:B),XLOOKUP(1,A:A,B:B))").unwrap();
+        let context = EvalContext::new(&workbook, SheetId(0));
+        assert_eq!(evaluate(&expression, &context), na);
+        assert!(!context.exhausted());
+    }
+
+    fn array_answers(workbook: &Workbook, formulas: &[(&str, CellValue)]) -> Vec<String> {
+        formulas
+            .iter()
+            .filter_map(|(formula, answer)| {
+                let context = EvalContext::new(workbook, SheetId(0));
+                let expression = parse_formula(formula).unwrap();
+                let value = crate::array::evaluate_array(&expression, &context);
+                let value = value.into_scalar();
+                let exhausted = context.exhausted();
+                (value != *answer || exhausted)
+                    .then(|| format!("{formula}: {value:?}, exhausted {exhausted}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn array_exact_lookup_resolves_its_reference_once() {
+        let mut workbook = Workbook::default();
+        let mut sheet = Sheet::new("Data");
+        sheet.set_cell(CellRef::new(0, 0), number(1.0));
+        sheet.set_cell(CellRef::new(0, 1), number(42.0));
+        sheet.set_cell(CellRef::new(599_999, 2), number(0.0));
+        workbook.sheets.push(sheet);
+        workbook
+            .defined_names
+            .push(defined_name("rng", "OFFSET(A1,0,0,1+SUM(C1:C600000))"));
+        let found = CellValue::Number { value: 42.0 };
+        let first = CellValue::Number { value: 1.0 };
+        // an array formula takes the array forms of both lookups
+        let wrong = array_answers(
+            &workbook,
+            &[
+                (
+                    "XLOOKUP({1},OFFSET(A1,0,0,1+SUM(C1:C600000)),B1)",
+                    found.clone(),
+                ),
+                ("XMATCH({1},OFFSET(A1,0,0,1+SUM(C1:C600000)))", first),
+                ("XLOOKUP({1},rng,B1)", found.clone()),
+                (
+                    "XLOOKUP({1},INDEX(A1:A2,1+SUM(C1:C600000)+(A1:A2=0)),B1)",
+                    found,
+                ),
+            ],
+        );
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn array_exact_lookup_keeps_both_forms_of_index() {
+        let text = |value: &str| Cell {
+            value: CellValue::Text {
+                value: value.into(),
+            },
+            ..Cell::default()
+        };
+        let second = CellValue::Number { value: 2.0 };
+        let mut workbook = Workbook::default();
+        let mut sheet = Sheet::new("Data");
+        let fruit = ["  pear ", "apple", "pear", "apple"];
+        for (row, value) in fruit.into_iter().enumerate() {
+            sheet.set_cell(CellRef::new(row as u32, 0), text(value));
+        }
+        workbook.sheets.push(sheet);
+        let mut wrong = array_answers(
+            &workbook,
+            &[
+                (
+                    "_xlfn.LET(_xlpm.d,A1:A4,_xlfn.XMATCH(\"pear\",INDEX(_xlpm.d,{2;3})))",
+                    second.clone(),
+                ),
+                (
+                    "_xlfn.LET(_xlpm.d,A1:A4,_xlfn.XLOOKUP(\"pear\",INDEX(_xlpm.d,{2;3}),{10;20}))",
+                    CellValue::Number { value: 20.0 },
+                ),
+            ],
+        );
+        let mut workbook = Workbook::default();
+        let mut sheet = Sheet::new("Data");
+        sheet.set_cell(CellRef::new(0, 0), number(10.0));
+        sheet.set_cell(CellRef::new(0, 1), number(20.0));
+        sheet.set_cell(CellRef::new(0, 2), number(1.0));
+        sheet.set_cell(CellRef::new(1, 2), number(2.0));
+        workbook.sheets.push(sheet);
+        let more = array_answers(&workbook, &[("XMATCH(20,INDEX(A1:B2,C1:C2,0))", second)]);
+        wrong.extend(more);
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

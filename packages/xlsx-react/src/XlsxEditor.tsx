@@ -103,14 +103,13 @@ import {
 import { EditorChromeContext } from './components/EditorToolbarContext';
 import type { BorderStyle } from './components/Toolbar';
 import { FormulaBarContext, type FormulaBarBinding } from './components/toolbar/FormulaBar';
-import { ToolbarCommandButton } from './components/toolbar/ToolbarCommand';
 import {
   toolbarRailStyle,
   toolbarSeparatorStyle,
   toolbarTheme,
 } from '../../../shared/react-toolbar/theme';
 import { ToolbarIcon } from './components/ui/ToolbarIcon';
-import { ToolbarButtonBase, ToolbarGroup } from './components/ui/ToolbarPrimitives';
+import { ToolbarButtonBase } from './components/ui/ToolbarPrimitives';
 import {
   expandRangeToMergedCells,
   PresenceStrip,
@@ -136,9 +135,10 @@ import { useXlsxPluginHost } from './plugins/useXlsxPluginHost';
 
 import { LEGACY_SYNC_API } from './runtimeOptions';
 import { warnXlsxEngine, type XlsxEngineWarning } from './engineWarnings';
+import { initialZoomScale } from './commands/evaluate';
+import type { EditableSessionWorkbookProps } from './worker/useEditableSessionWorkbook';
 import { createInThreadAsyncEditorApi } from './createInThreadAsyncEditorApi';
-
-export const PEERLESS_FLAG = 'asyncApi' as const;
+import { WorkbookFailure } from './components/WorkbookFailure';
 
 export interface XlsxPointPosition {
   sheet: number;
@@ -257,18 +257,31 @@ export interface XlsxEditorCollaborationOptions {
   provider?: CollaborationAwareness | null;
 }
 
-/**
- * Props for {@link XlsxEditor}.
- */
-export interface XlsxInThreadEditorProps extends XlsxEditorPluginProps {
+export interface XlsxDocumentChange { version: string }
+
+interface XlsxHostProps {
+  /** Receives the version after a committed edit changes the workbook. */
+  onDocumentChange?: (change: XlsxDocumentChange) => void;
+  /** Whether Save also downloads a copy. Defaults to true without onSave, false with it. */
+  downloadOnSave?: boolean;
+  /** Initial scale, clamped to the supported zoom range. Defaults to 1. */
+  initialZoom?: number;
+  /** Rendered while a supplied file is opening. */
+  loadingIndicator?: React.ReactNode;
+  /** Inline style overrides for the editor root. */
+  style?: React.CSSProperties;
+}
+
+/** Props for XlsxEditor. */
+export interface XlsxInThreadEditorProps extends XlsxEditorPluginProps, XlsxHostProps {
   /** @deprecated False selects the in-thread engine. */
   experimentalWorkerOpen?: false;
   onError?: (error: Error) => void;
   /** Raw .xlsx bytes to open. When omitted the shell paints a demo frame. */
-  file?: Uint8Array;
+  file?: Uint8Array | ArrayBuffer;
   /** Download name for the save button; falls back to `workbook.xlsx`. */
   fileName?: string;
-  /** Receive saved bytes instead of triggering a browser download. */
+  /** Receives saved workbook bytes. */
   onSave?: (bytes: Uint8Array) => void;
   /** Return true for built-in saving; false or void handles/cancels the request. */
   onSaveRequest?: () => boolean | void | Promise<boolean | void>;
@@ -305,7 +318,7 @@ export interface XlsxInThreadEditorProps extends XlsxEditorPluginProps {
 }
 
 /** @deprecated Removed in 0.6.0. Use XlsxAsyncEditorProps. */
-export type XlsxWorkerViewerProps = Omit<XlsxInThreadEditorProps, 'onReady' | 'readOnly' | 'collaboration' | 'experimentalWorkerOpen'> & {
+export type XlsxWorkerViewerProps = Omit<XlsxInThreadEditorProps, 'onReady' | 'readOnly' | 'collaboration' | 'experimentalWorkerOpen' | keyof XlsxHostProps> & {
   /** @deprecated Removed in 0.6.0. Omit for the async editor. */
   [LEGACY_SYNC_API]: true;
   readOnly: true;
@@ -322,8 +335,6 @@ export type XlsxWorkerEditorProps = Omit<XlsxWorkerViewerProps, 'onReady' | 'rea
 };
 
 export type XlsxAsyncEditorProps = Omit<XlsxInThreadEditorProps, 'onReady' | 'experimentalWorkerOpen'> & {
-  /** @internal */
-  [PEERLESS_FLAG]?: true;
   /** @deprecated Removed in 0.6.0. Omit for the async editor. */
   [LEGACY_SYNC_API]?: false;
   /** @deprecated False selects the in-thread engine. */
@@ -332,7 +343,7 @@ export type XlsxAsyncEditorProps = Omit<XlsxInThreadEditorProps, 'onReady' | 'ex
 };
 
 /** @deprecated Removed in 0.6.0. Use XlsxAsyncEditorProps. */
-export type XlsxLegacyEditorProps = XlsxInThreadEditorProps & {
+export type XlsxLegacyEditorProps = Omit<XlsxInThreadEditorProps, keyof XlsxHostProps> & {
   /** @deprecated Removed in 0.6.0. Omit for the async editor. */
   [LEGACY_SYNC_API]: true;
 };
@@ -583,12 +594,6 @@ const xlsxToolbarStyles: Record<string, React.CSSProperties> = {
     overflowX: 'auto',
     overflowY: 'hidden',
   },
-  group: {
-    display: 'inline-flex',
-    alignItems: 'center',
-    gap: 1,
-    flex: '0 0 auto',
-  },
   host: {
     flex: '0 0 auto',
   },
@@ -628,7 +633,7 @@ function useSyncedState<T>(initial: T) {
   return [value, set, ref] as const;
 }
 
-function XlsxAsyncEditorSession(props: XlsxAsyncEditorProps) {
+function XlsxAsyncEditorSession(props: Omit<XlsxAsyncEditorProps, 'file'> & { file?: Uint8Array }) {
   const inThread = props.experimentalWorkerOpen === false;
   const identity = useMemo(() => ({}), [props.file, props.collaboration, inThread]);
   const start = () => ({ identity, reason: inThread ? 'deprecated' as const
@@ -641,13 +646,15 @@ function XlsxAsyncEditorSession(props: XlsxAsyncEditorProps) {
   return engine.reason ? <XlsxAsyncInThreadSession {...props} /> : <XlsxWorkerEditor {...props} backend="peerless" />;
 }
 
-function XlsxAsyncInThreadSession(props: XlsxAsyncEditorProps) {
+function XlsxAsyncInThreadSession(props: Omit<XlsxAsyncEditorProps, 'file'> & { file?: Uint8Array }) {
+  const latest = useRef(props);
+  latest.current = props;
   const current = useRef<XlsxEditorApi | null>(null);
   const ready = useCallback((api: XlsxEditorApi) => {
     current.current = api;
     const cleanup = props.onReady?.(createInThreadAsyncEditorApi(api, props.collaboration !== undefined, () => {
       if (current.current !== api) throw new XlsxCommandAdmissionError('document-replaced');
-    }));
+    }, () => latest.current.onSave));
     return () => {
       if (current.current === api) current.current = null;
       cleanup?.();
@@ -663,8 +670,10 @@ export function XlsxEditor(props: XlsxWorkerEditorProps): React.JSX.Element;
 export function XlsxEditor(props: WorkerSessionProps): React.JSX.Element;
 export function XlsxEditor(props: XlsxEditorProps): React.JSX.Element;
 export function XlsxEditor(props: XlsxEditorProps | XlsxLegacyEditorProps | XlsxWorkerViewerProps | XlsxWorkerEditorProps | WorkerSessionProps): React.JSX.Element {
+  const file = useMemo(() => props.file instanceof ArrayBuffer ? new Uint8Array(props.file) : props.file, [props.file]);
+  const normalized = { ...props, file };
   return <LocaleProvider i18n={props.i18n}>
-    {props[LEGACY_SYNC_API] === true ? <LegacyXlsxEditor {...props} /> : <XlsxAsyncEditorSession {...props} />}
+    {normalized[LEGACY_SYNC_API] === true ? <LegacyXlsxEditor {...normalized} /> : <XlsxAsyncEditorSession {...normalized} />}
   </LocaleProvider>;
 }
 
@@ -681,17 +690,22 @@ function LegacyXlsxEditor(props: GeneralEditorSessionProps | XlsxLegacyEditorPro
   const editor = session.editor || !props.readOnly;
   if (choice !== session || choice.editor !== editor) setChoice({ ...session, editor });
   useEffect(() => { if (session.reason && session.reason !== 'in-thread') warnXlsxEngine(session.reason); }, [session.reason]);
-  return session.reason ? <XlsxEditorContent {...props as XlsxInThreadEditorProps} />
-    : editor ? <XlsxWorkerEditor {...props as XlsxWorkerEditorProps} />
-    : <XlsxSessionViewer {...props as XlsxWorkerViewerProps} />;
+  return session.reason ? <XlsxEditorContent {...props as Omit<XlsxInThreadEditorProps, 'file'> & { file?: Uint8Array }} />
+    : editor ? <XlsxWorkerEditor {...props as EditableSessionWorkbookProps} />
+    : <XlsxSessionViewer {...props as XlsxWorkerViewerProps & { file?: Uint8Array }} />;
 }
 
 function XlsxEditorContent({
   file,
   fileName,
   onSave,
+  downloadOnSave,
   onSaveRequest,
   onChange,
+  onDocumentChange,
+  initialZoom,
+  loadingIndicator,
+  style,
   onError,
   clipboard,
   onPrint,
@@ -706,7 +720,7 @@ function XlsxEditorContent({
   plugins,
   pluginGrants,
   onPluginError,
-}: XlsxInThreadEditorProps) {
+}: Omit<XlsxInThreadEditorProps, 'file'> & { file?: Uint8Array }) {
   const { t } = useTranslation();
   const collaborationEnabled = collaboration !== undefined;
   const collaborationClientId = collaboration?.clientId;
@@ -773,6 +787,16 @@ function XlsxEditorContent({
   onErrorRef.current = onError;
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
+  const onDocumentChangeRef = useRef(onDocumentChange);
+  onDocumentChangeRef.current = onDocumentChange;
+  const lastDocumentVersionRef = useRef<string | null>(null);
+  const notifyDocumentChange = useCallback((opened: WorkbookHandle) => {
+    const version = opened.version();
+    if (version === lastDocumentVersionRef.current) return false;
+    lastDocumentVersionRef.current = version;
+    onDocumentChangeRef.current?.({ version });
+    return true;
+  }, []);
   const readOnlyRef = useRef(readOnly);
   readOnlyRef.current = readOnly;
 
@@ -788,7 +812,7 @@ function XlsxEditorContent({
   const [editing, setEditing] = useState<EditState | null>(null);
   const [focusedCell, setFocusedCell] = useState<CellEdit | null>(null);
   const [formulaDraft, setFormulaDraft] = useState<string | null>(null);
-  const [zoom, setZoom, zoomRef] = useSyncedState(1);
+  const [zoom, setZoom, zoomRef] = useSyncedState(initialZoomScale(initialZoom));
   const [revision, setRevision] = useState(0);
   const [dragging, setDragging] = useState(false);
   // the selected chart, and the live pointer offset while it is dragged.
@@ -1055,12 +1079,13 @@ function XlsxEditorContent({
       if (readOnlyRef.current) return readOnlyRefusal(opened);
       const result = commit(() => opened.applyEdits(request));
       if (result.ok && result.applied) {
+        notifyDocumentChange(opened);
         onChangeRef.current?.();
         commandController.refresh();
       }
       return result;
     },
-    [commandController]
+    [commandController, notifyDocumentChange]
   );
 
   // re-read the pending proposal list and queue a repaint — ghosts paint into
@@ -1196,7 +1221,8 @@ function XlsxEditorContent({
             handle.applyUpdate(collaborationInitialUpdate.slice());
           }
           handleRef.current = handle;
-          unsubscribeUpdates = handle.onUpdate(() => {
+          lastDocumentVersionRef.current = handle.version();
+          unsubscribeUpdates = handle.onUpdate((_update, _origin, { fromPeer }) => {
             if (disposed || !handle) return;
             cellClipboard.changed();
             mutationRef.current += 1;
@@ -1206,6 +1232,7 @@ function XlsxEditorContent({
               setStaleFor({});
               refreshProposals();
               setError(null);
+              if (notifyDocumentChange(handle) && fromPeer) onChangeRef.current?.();
             } catch (e) {
               setError(e instanceof Error ? e.message : String(e));
             }
@@ -1301,6 +1328,7 @@ function XlsxEditorContent({
     beginPluginLoad,
     commandController,
     coordinator,
+    notifyDocumentChange,
     refreshProposals,
     selectCells,
   ]);
@@ -1537,9 +1565,12 @@ function XlsxEditorContent({
       setSheetInfo(result.sheetInfo);
       setRevision((r) => r + 1);
       refreshProposals();
-      if (result.applied) onChangeRef.current?.();
+      if (result.applied) {
+        notifyDocumentChange(handleRef.current!);
+        onChangeRef.current?.();
+      }
     },
-    [refreshProposals, cellClipboard]
+    [refreshProposals, cellClipboard, notifyDocumentChange]
   );
 
   // before a command runs, an arrow burst lands and a composition ends.
@@ -1985,9 +2016,9 @@ function XlsxEditorContent({
   const deliverSave = useCallback(
     (bytes: Uint8Array) => {
       if (onSave) onSave(bytes);
-      else downloadBytes(bytes, fileName ?? 'workbook.xlsx', XLSX_MIME);
+      if (downloadOnSave ?? !onSave) downloadBytes(bytes, fileName ?? 'workbook.xlsx', XLSX_MIME);
     },
-    [onSave, fileName]
+    [onSave, fileName, downloadOnSave]
   );
   hostPointRef.current = (clientX, clientY) => {
     const painted = paintedRef.current;
@@ -2675,15 +2706,6 @@ function XlsxEditorContent({
     <EditorToolbar mode="commands">
       <EditorToolbar.Toolbar />
       <div style={xlsxToolbarStyles.rail} role="group" aria-label={t('toolbar.formulaBarLabel')}>
-        <ToolbarGroup style={xlsxToolbarStyles.group} label={t('toolbar.fileActionsLabel')}>
-          <ToolbarCommandButton id="save">
-            <ToolbarIcon name="save" size={18} />
-          </ToolbarCommandButton>
-          <ToolbarCommandButton id="exportPng" label="Export visible sheet as PNG">
-            <ToolbarIcon name="image" size={18} /><span style={{ fontSize: 12 }}>PNG</span>
-          </ToolbarCommandButton>
-        </ToolbarGroup>
-        <div style={toolbarSeparatorStyle} aria-hidden="true" />
         <EditorToolbar.FormulaBar />
         <div style={toolbarSeparatorStyle} aria-hidden="true" />
         <PresenceStrip
@@ -2764,10 +2786,12 @@ function XlsxEditorContent({
         color: '#202124',
         background: '#ffffff',
         fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+        ...style,
       }}
     >
       {menuSearchOpen && !readOnly && <MenuSearch commands={menuCommands} onClose={() => { setMenuSearchOpen(false); rootRef.current?.querySelector<HTMLButtonElement>('[data-testid="xlsx-search-menus"]')?.focus(); }} />}
       {exportError && <div role="alert" style={{ padding: 8, color: '#b00020' }}>{exportError} <button type="button" onClick={() => setExportError(null)}>Dismiss</button></div>}
+      {file && !handleRef.current && !error && loadingIndicator}
       {toolbarContent != null && (
         <div
           data-testid="xlsx-toolbar"
@@ -3031,23 +3055,7 @@ function XlsxEditorContent({
         </div>
       )}
 
-      {error && (
-        <div
-          data-testid="xlsx-error"
-          role="alert"
-          style={{
-            position: 'absolute',
-            inset: 0,
-            display: 'grid',
-            placeItems: 'center',
-            padding: 16,
-            textAlign: 'center',
-            color: '#b00020',
-          }}
-        >
-          {t('editor.openError')}: {error}
-        </div>
-      )}
+      {error && <WorkbookFailure kind="open" details={error} />}
 
       {sheetInfo && sheetInfo.sheetNames.length > 0 && (
         <SheetTabs

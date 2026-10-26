@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { act, render, waitFor } from '@testing-library/react';
 import { useCallback, useEffect, useState } from 'react';
 import type { AsyncCollaborationReplica } from '@betteroffice/pptx';
-import { CollaborationProvider, type CollaborationTransportEvent } from '@betteroffice/pptx/editor';
+import { CollaborationProvider, type CollaborationTransportEvent } from '@betteroffice/pptx';
 import { open, story } from './worker/peerlessTestHarness';
 import * as wasm from '../../pptx/src/wasm/loader';
 import { workerEditorSessionOpener } from './worker/useEditableSessionPresentation';
@@ -18,20 +18,29 @@ test('default readiness uses one worker engine and no eager main-thread engine',
   const warn = spyOn(console, 'warn');
   try {
     const { api, view } = await open();
-    expect(view.getByTestId('pptx-peerless-editor')).toBeTruthy();
+    expect(view.getByTestId('pptx-worker-editor')).toBeTruthy();
     expect(hybrid).not.toHaveBeenCalled();
     expect(engines).toHaveBeenCalledTimes(1);
     expect(warn).not.toHaveBeenCalled();
     expect(() => Reflect.get(api, 'handle')).toThrow('handleAsync');
-    expect(() => Reflect.get(api, 'save')()).toThrow('saveAsync');
     expect(() => Reflect.get(api, 'handle')).toThrow('legacySyncApi');
-    expect(() => Reflect.get(api, 'save')()).toThrow('legacySyncApi');
+    expect(await api.save()).toBeInstanceOf(Uint8Array);
     expect(await api.saveAsync()).toBeInstanceOf(Uint8Array);
     expect((await story(api)).paragraphs).not.toHaveLength(0);
   } finally { hybrid.mockRestore(); engines.mockRestore(); warn.mockRestore(); }
 });
 
-for (const operation of ['handle', 'save', 'host'] as const) {
+test('save resolves the bytes like the deprecated saveAsync alias without calling onSave', async () => {
+  const onSave = mock((_bytes: Uint8Array) => {});
+  const { api } = await open({ onSave });
+  const saved = await api.save();
+  expect(saved).toBeInstanceOf(Uint8Array);
+  expect(saved.byteLength).toBeGreaterThan(0);
+  expect(await api.saveAsync()).toEqual(saved);
+  expect(onSave).not.toHaveBeenCalled();
+});
+
+for (const operation of ['handle', 'host'] as const) {
   test(`onReady ${operation} failures reach onError and the console once`, async () => {
     const initial = await open();
     initial.view.unmount();
@@ -40,7 +49,6 @@ for (const operation of ['handle', 'save', 'host'] as const) {
     const onError = mock((_error: Error) => { throw new Error('Host error handler failed'); });
     const onReady = mock((api: PptxAsyncEditorApi) => {
       if (operation === 'handle') Reflect.get(api, 'handle');
-      if (operation === 'save') Reflect.get(api, 'save')();
       throw hostError;
     });
     const view = render(<PptxEditor fonts={[]} file={initial.bytes} onReady={onReady} onError={onError} />);
@@ -279,11 +287,11 @@ for (const capability of ['Worker', 'OffscreenCanvas', 'experimentalWorkerOpen']
         onReady: (value: PptxAsyncEditorApi) => { api = value; } };
       const fallback = render(<PptxEditor {...props} />);
       await waitFor(() => expect(api).toBeDefined());
-      expect(fallback.queryByTestId('pptx-peerless-editor')).toBeNull();
+      expect(fallback.queryByTestId('pptx-worker-editor')).toBeNull();
       expect(opener).not.toHaveBeenCalled();
       expect(hybrid).not.toHaveBeenCalled();
       expect('handle' in api!).toBe(false);
-      expect('save' in api!).toBe(false);
+      expect(await api!.save()).toBeInstanceOf(Uint8Array);
       expect(await api!.saveAsync()).toBeInstanceOf(Uint8Array);
       expect(await api!.goToSlide(2)).toBe(true);
       await act(async () => { fallback.rerender(<PptxEditor {...props} readOnly />); });

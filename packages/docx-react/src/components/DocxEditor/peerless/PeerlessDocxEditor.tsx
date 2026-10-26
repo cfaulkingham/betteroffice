@@ -1,4 +1,4 @@
-import { ResidentSourceWorkerClient as ResidentEngineWorkerClient, takePreloadedResidentSourceWorker as takePreloadedResidentEngineWorker } from '@betteroffice/docx/worker';
+import { DocxSourceWorkerClient as ResidentEngineWorkerClient, takePreloadedDocxSourceWorker as takePreloadedResidentEngineWorker } from '@betteroffice/docx/worker';
 import { useWorkerHeaderFooterEditing } from '../hooks/useHeaderFooterEditing';
 import { InlineHeaderFooterEditor } from '../../InlineHeaderFooterEditor';
 import { WorkerContentControls } from './WorkerContentControls';
@@ -19,15 +19,15 @@ import { buildResidentRegionLayoutRequest } from '@betteroffice/docx/editor';
 import { createRustMeasureSource, type ResidentFontRequirement } from '@betteroffice/docx/layout';
 import { extractEmbeddedFontFaces, sanitizeHref, toArrayBuffer, type DocxInput } from '@betteroffice/docx/utils';
 import { HyperlinkPopup, type HyperlinkPopupData } from '../../ui/HyperlinkPopup';
-import { toast } from 'sonner';
+import { Toaster, toast } from 'sonner';
 import {
   residentCaretSnapshotForFrame,
   type DocxCommandFrame,
   type DocxCommandPageIdentity,
-  type ResidentCommandConnection,
+  type DocxCommandConnection,
   type YrsResidentFontRegistration,
 } from '@betteroffice/docx/yrs';
-import { createResidentCommandConnection, discardCommandPresentation, SessionFailure, type ResidentCommandCheckpoint } from '@betteroffice/docx/worker';
+import { createDocxCommandConnection, discardCommandPresentation, SessionFailure, type DocxCommandCheckpoint } from '@betteroffice/docx/worker';
 import type { DocxEditorProps, DocxEditorRef } from '../../DocxEditor';
 import { createPeerlessShellController } from './shellController';
 import { registerTableActionExecutor } from './browserHarness';
@@ -39,6 +39,7 @@ import { DocxEditorShell } from '../DocxEditorShell';
 import { DocxEditorToolbar } from '../DocxEditorToolbar';
 import { EditorChromeContext } from '../../EditorToolbarContext';
 import { DefaultLoadingIndicator, DefaultPlaceholder, ParseError } from '../../DocxEditorHelpers';
+import { clampZoom } from '../../../commands/evaluate';
 import { PluginOverlays } from '../../../plugins/PluginOverlays';
 import { managedSidebarItems, mergeSidebarItems } from '../../../plugins/PluginSidebarItems';
 import { UnifiedSidebar } from '../../UnifiedSidebar';
@@ -56,7 +57,9 @@ import { yrsSelectionState } from '../hooks/useSelectionTracker';
 import type { PagedEditorRef } from '../PagedEditor';
 import { openPrintWindow } from '@betteroffice/docx';
 import { createWorkerPrintCapture, printBitmap } from './printPages';
+import { openReportIssue } from '../../reportIssue';
 import { decodeCommandFrameDeltas } from './frameDeltas';
+import { decodeSvgMedia, type SvgMediaDecode } from './svgMedia';
 import { useWorkerContextMenu } from './useWorkerContextMenu';
 import { useWorkerComments, WorkerCommentButton } from './useWorkerComments';
 import { useControllableBoolean } from '../hooks/useControllableBoolean';
@@ -73,17 +76,27 @@ import type { PeerlessDocumentSource, PeerlessEditSessionBinding, UsePeerlessEdi
 import { peerlessPreviewPaint, releaseWorkerPreview, WorkerDocumentPreview, workerPreviewPages, type WorkerPreviewJob } from './WorkerDocumentPreview';
 import { fontEnvironmentForRegistrations, prepareWorkerFontEnvironment } from './workerFonts';
 import type { Document } from '@betteroffice/docx/types/document';
-import type { ResidentFontEnvironment } from '@betteroffice/docx/yrs';
+import type { DocxFontEnvironment } from '@betteroffice/docx/yrs';
 import { PeerlessPagedEditor } from './PeerlessPagedEditor';
 import type { PeerlessPropertyIntent } from './inputEvents';
 import { useWorkerCollaboration } from './useWorkerCollaboration';
-import type { PeerlessFrameGeometry, PeerlessViewIdentity } from './viewStore';
+import { geometryMatchesDocument, type PeerlessFrameGeometry, type PeerlessViewIdentity } from './viewStore';
+import { useTranslation } from '../../../i18n';
 
 const PREVIEW_CUT = { blocks: 200, paragraphBudget: 256 };
 const SIDEBAR_EDGE = 16;
 type ResidentResume = Parameters<NonNullable<UsePeerlessEditSessionOptions['recovery']>['reopen']>[0];
 
 /** @internal */
+/** Events that would type into the document; while it opens they are answered with the typing-paused notice. */
+const typingEvents = ['paste', 'beforeinput', 'compositionstart'] as const;
+const isDocumentInput = (target: EventTarget | null) => target instanceof HTMLTextAreaElement && target.classList.contains('paged-editor__input');
+/** Keys that type or edit text, AltGr and Option characters included; other shortcuts, navigation and Tab keep working. */
+function typingKey({ key, ctrlKey, metaKey, altKey }: React.KeyboardEvent): boolean {
+  if ((ctrlKey || metaKey) && !(ctrlKey && altKey)) return /^[vx]$/i.test(key);
+  return key.length === 1 || key === 'Enter' || key === 'Backspace' || key === 'Delete' || key === 'Process' || key === 'Dead';
+}
+
 export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(function PeerlessDocxEditor(props, ref) {
   const errorHandler = useRef(props.onError);
   errorHandler.current = props.onError;
@@ -138,7 +151,8 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
   const releaseResident = useRef<(() => void) | null>(null);
   const openContext = useRef<{ signal: AbortSignal; getRasterScale?: () => number } | null>(null);
   const sourceComments = useRef<NonNullable<DocxEditorProps['comments']>>([]);
-  const [zoom, setZoom] = useState(initialZoom);
+  const [zoom, setZoom] = useState(() => clampZoom(initialZoom));
+  const { t } = useTranslation();
   const [tableGridlines, setTableGridlines] = useState(props.showTableGridlines === true);
   const [gridlinesProp, setGridlinesProp] = useState(props.showTableGridlines);
   if (gridlinesProp !== props.showTableGridlines) {
@@ -147,17 +161,18 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
   }
   const [hyperlinkPopup, setHyperlinkPopup] = useState<HyperlinkPopupData | null>(null);
   const linkGesture = useRef(0);
-  const focus = useCallback(() => host.current?.querySelector<HTMLTextAreaElement>('.paged-editor__peerless-input')?.focus({ preventScroll: true }), []);
+  // Until the document input exists, the scroll container takes focus so keys reach the editor's typing-paused notice.
+  const focus = useCallback(() => (host.current?.querySelector<HTMLTextAreaElement>('.paged-editor__input') ?? scroller.current)?.focus({ preventScroll: true }), []);
   const read = useCallback<ResidentEngineWorkerClient['documentRead']>((request) => {
-    if (!worker.current) return Promise.reject(new Error('Peer-less worker is not ready'));
+    if (!worker.current) return Promise.reject(new Error('The document worker is not ready'));
     return worker.current.documentRead(request);
   }, []);
   const readAt = useCallback<ResidentEngineWorkerClient['documentReadAt']>((request, token) => {
-    if (!worker.current) return Promise.reject(new Error('Peer-less worker is not ready'));
+    if (!worker.current) return Promise.reject(new Error('The document worker is not ready'));
     return worker.current.documentReadAt(request, token);
   }, []);
   const save = useCallback(async () => {
-    if (!worker.current) throw new Error('Peer-less worker is not ready');
+    if (!worker.current) throw new Error('The document worker is not ready');
     return (await worker.current.save(props.comments ? { comments: [...props.comments], commentsSource: 'host' } : { comments: [...sourceComments.current] })).bytes;
   }, [props.comments]);
   const printCaptures = useRef(new Set<ReturnType<typeof createWorkerPrintCapture>>());
@@ -168,7 +183,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
       if (!popup) throw new Error('Print window was blocked');
       const current = active.current;
       const client = worker.current;
-      if (!current || !client) throw new Error('Peer-less worker is not ready');
+      if (!current || !client) throw new Error('The document worker is not ready');
       capture = createWorkerPrintCapture(current.binding, printBitmap, () => active.current === current && !popup.closed);
       printCaptures.current.add(capture);
       const pages = await capture.collect(
@@ -191,7 +206,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
       throw error;
     } finally { if (capture) printCaptures.current.delete(capture); }
   }, [props.onPrint, reportRecoverableError]);
-  const prepareFontFamily = useRef<(family: string) => Promise<ResidentFontEnvironment>>(async () => { throw new Error('Worker fonts are unavailable'); });
+  const prepareFontFamily = useRef<(family: string) => Promise<DocxFontEnvironment>>(async () => { throw new Error('Worker fonts are unavailable'); });
   const [commentsOpen, setCommentsOpen] = useControllableBoolean(props.commentsSidebarOpen, props.onCommentsSidebarOpenChange);
   const [expandedSidebarItem, setExpandedSidebarItem] = useState<string | null>(null);
   const controllerOptions = { ...recoverableProps, zoom, focus, read, readAt, save, loadBuffer, loadDocument, print, onZoom: setZoom, isDark,
@@ -223,6 +238,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
     if (id === 'imageProperties') return propertyDialogs.openImage();
     if (id === 'find' || id === 'replace') { search.open(id === 'replace'); return { ok: true, status: 'opened' }; }
     if (id === 'print') { await print(); return { ok: true, status: 'executed' }; }
+    if (id === 'reportIssue') { openReportIssue(); return { ok: true, status: 'opened' }; }
     return fileIO.perform(id);
   }, readPositionAtPoint: async (x, y) => { await pluginGeometry.update(); return pluginGeometry.geometry()?.readPositionAtPoint(x, y) ?? null; },
     currentPage: navigation.readCurrentPage, scrollToPage: navigation.scrollToPage, scrollToParagraph: navigation.scrollToParagraph,
@@ -239,6 +255,24 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
     return () => { current = false; };
   }, [controller, shellState.status, shellState.view, props.plugins?.length, props.showHostProposalsInSidebar, reportRecoverableError]);
   const effectiveReadOnly = readOnly || (props.mode ?? shellState.mode) === 'viewing';
+  const opening = hasSource && !shellState.error && shellState.status !== 'ready';
+  const [typingPaused, setTypingPaused] = useState(false);
+  useEffect(() => { if (!opening) setTypingPaused(false); }, [opening]);
+  useEffect(() => {
+    const active = scroller.current?.ownerDocument.activeElement;
+    if (opening && !effectiveReadOnly && (!active || active === scroller.current?.ownerDocument.body)) scroller.current?.focus({ preventScroll: true });
+  }, [opening, sourceKey, effectiveReadOnly]);
+  useEffect(() => {
+    const element = scroller.current;
+    if (!opening || effectiveReadOnly || !element) return;
+    const pause = (event: Event) => {
+      if (isDocumentInput(event.target)) return;
+      event.preventDefault();
+      setTypingPaused(true);
+    };
+    for (const type of typingEvents) element.addEventListener(type, pause);
+    return () => { for (const type of typingEvents) element.removeEventListener(type, pause); };
+  }, [opening, effectiveReadOnly]);
   const parts = useWorkerHeaderFooterEditing(controller, reportRecoverableError);
   const propertyDialogs = useWorkerPropertyDialogs(controller, recoverableProps);
   const rulers = useWorkerRulerControls(controller, reportRecoverableError, props.showRuler === true);
@@ -251,6 +285,10 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
   const sentReservationsRef = useRef<() => DocxReservationsPayload | null>(() => null);
   const [pluginGeometry] = useState(() => createWorkerPluginGeometry(controller, () => host.current, () => overlayRef.current, () => redrawGeometry(value => value + 1),
     (target, focus, expectVersion) => navigation.revealParagraph(target.paraId, target.story, focus, expectVersion), () => sentReservationsRef.current()));
+  const [displayWindow, setDisplayWindow] = useState<readonly [number, number]>([0, 3]);
+  const showWindow = useCallback((next: readonly [number, number]) =>
+    setDisplayWindow((current) => current[0] === next[0] && current[1] === next[1] ? current : next), []);
+  useLayoutEffect(() => { pluginGeometry.setDisplayWindow(displayWindow); }, [pluginGeometry, displayWindow]);
   const setPluginLayer = useCallback((element: HTMLDivElement | null) => { overlayRef.current = element; setOverlayLayer(element); }, []);
   const [pluginHost] = useState<DocxPluginHost>(() => createDocxPluginHost({
     pagedEditorRef: { current: null }, writeMode: () => controller.environment().readOnly ? 'viewing' : controller.environment().mode,
@@ -306,18 +344,23 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
       if (layout) pluginHost.geometryPresented(layout);
       pluginHost.syncCommands();
     } else { pluginHost.close('document-replaced'); setExpandedSidebarItem(null); }
-  }, [shellState, documentReady, pluginHost, props.mode, effectiveReadOnly, pluginGeometry, overlayLayer, geometryRevision]);
+  }, [shellState, documentReady, pluginHost, props.mode, effectiveReadOnly, pluginGeometry, overlayLayer, geometryRevision, displayWindow]);
   const pluginSidebarItemCount = props.pluginSidebarItems?.length ?? 0;
   useLayoutEffect(() => { if (activations.length || pluginSidebarItemCount || props.onRenderedDomContextReady || props.showHostProposalsInSidebar) void pluginGeometry.update().catch(() => {}); },
     [shellState.view, zoom, overlayLayer, pluginGeometry, activations.length, pluginSidebarItemCount, props.onRenderedDomContextReady, props.showHostProposalsInSidebar]);
   useLayoutEffect(() => {
     const scrollerElement = scroller.current;
     const refresh = () => pluginHost.geometryChanged();
-    scrollerElement?.addEventListener('scroll', refresh, { passive: true });
+    let frame: number | null = null;
+    const scroll = () => { if (frame === null) frame = requestAnimationFrame(() => { frame = null; refresh(); }); };
+    scrollerElement?.addEventListener('scroll', scroll, { passive: true });
     window.addEventListener('resize', refresh);
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(refresh);
     for (const element of [scrollerElement, host.current, overlayRef.current]) if (element) observer?.observe(element);
-    return () => { observer?.disconnect(); scrollerElement?.removeEventListener('scroll', refresh); window.removeEventListener('resize', refresh); };
+    return () => {
+      observer?.disconnect(); if (frame !== null) cancelAnimationFrame(frame);
+      scrollerElement?.removeEventListener('scroll', scroll); window.removeEventListener('resize', refresh);
+    };
   }, [pluginHost, overlayLayer]);
   useEffect(() => () => { loadRequest.current?.reject(new Error('Editor was closed')); loadRequest.current = null;
     pluginHost.close('unmounted'); pluginGeometry.dispose(); search.dispose(); controller.dispose(); }, [controller, pluginHost, search]);
@@ -325,10 +368,8 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
   const retained = useRef<RetainedFrame | null>(null);
   const pageIndexes = useRef(new Map<string, number>());
   const prepared = useRef(new WeakMap<DocxCommandFrame, PeerlessFrameGeometry>());
-  const [displayWindow, setDisplayWindow] = useState<readonly [number, number]>([0, 3]);
-  useLayoutEffect(() => { pluginGeometry.setDisplayWindow(displayWindow); }, [pluginGeometry, displayWindow]);
   const renderEnvironment = useRef({ theme: null as DocxEditorProps['theme'], requested: '' });
-  const fontSource = useRef<{ document: Document; layoutInput: string; families: string[]; initial: ResidentFontEnvironment;
+  const fontSource = useRef<{ document: Document; layoutInput: string; families: string[]; initial: DocxFontEnvironment;
     signature: string | null; provider: DocxEditorProps['measurementFontProvider'] } | null>(null);
   const fontAbort = useRef<AbortController | null>(null);
   const fontJob = useRef<{ signature: string; provider: DocxEditorProps['measurementFontProvider'] } | null>(null);
@@ -373,9 +414,9 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
   }, [documentBuffer, sourceGeneration, reportError]);
 
   const openResident = useCallback(async (input: PeerlessDocumentSource, signal: AbortSignal, getRasterScale?: () => number,
-    resume?: ResidentResume): Promise<ResidentCommandConnection> => {
+    resume?: ResidentResume): Promise<DocxCommandConnection> => {
     signal.throwIfAborted();
-    const checkpoint = resume?.checkpoint as ResidentCommandCheckpoint | undefined;
+    const checkpoint = resume?.checkpoint as DocxCommandCheckpoint | undefined;
     if (checkpoint && !checkpoint.recoveryState) {
       throw new SessionFailure('message', 'Cannot restore DOCX checkpoint command-local state and proposals');
     }
@@ -394,6 +435,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
     let nextFontId = 0;
     let measurement: ReturnType<typeof createRustMeasureSource> | undefined;
     let initialFrame: DocxCommandFrame | undefined;
+    let svgImages: SvgMediaDecode | undefined;
     let disposed = false;
     const disposeFonts = () => {
       if (disposed) return;
@@ -532,6 +574,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
         return await new Promise<never>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
       }
       signal.throwIfAborted();
+      svgImages = decodeSvgMedia(opened.svgMedia);
       if (collaboration) workerCollaboration.opened(client, opened);
       const metadata = opened.document;
       sourceComments.current = metadata.package.document.comments ?? [];
@@ -541,6 +584,8 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
       if (!resume && settings.current.previewFirstPage === true && !previewed) {
         try { await withinPreviewBudget((live) => showPreview(opening, live)); } catch (error) { previewFailed(error); }
       }
+      // Pictures still decoding follow the first frame, so they never hold the document back.
+      const hostImages = svgImages.take();
       const initial = await client.commandInit({
         session: resume?.session ?? crypto.randomUUID(), incarnation: resume?.incarnation ?? 1, epoch: resume?.epoch ?? 1,
         ...(resume ? { version: resume.checkpoint?.version ?? 0, throughSeq: resume.checkpoint?.throughSeq ?? 0,
@@ -553,10 +598,25 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
         layoutInput: JSON.stringify(layout),
         layoutWithRegions: true, layoutRevision: 1, extras: JSON.stringify({ fontChains: config.fontChains }),
         displayWindow: [0, 3], provisionalPages: 3,
+        ...(hostImages.length ? { hostImages } : {}),
       });
       initialFrame = initial.frame;
-      const connection = await createResidentCommandConnection(client, initial);
+      const connection = await createDocxCommandConnection(client, initial);
       signal.throwIfAborted();
+      const decoding = svgImages;
+      svgImages = undefined;
+      signal.addEventListener('abort', () => decoding.close(), { once: true });
+      void decoding.done.then(() => {
+        const late = decoding.take();
+        if (!late.length) return;
+        if (signal.aborted) {
+          for (const { image } of late) image.close();
+          return;
+        }
+        client.provideHostImages(late).catch(() => {
+          for (const { image } of late) image.close();
+        });
+      });
       const families = [...new Set([...requirements.map(item => item.family),
         ...(metadata.package.fontTable?.fonts ?? []).map(font => font.name)])];
       fontSource.current = { document: metadata, layoutInput: JSON.stringify(layout), families,
@@ -579,6 +639,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
       abort();
       throw error;
     } finally {
+      svgImages?.close();
       disposeFonts();
     }
   }, [controller, workerCollaboration.openOptions, workerCollaboration.begin, workerCollaboration.opened]);
@@ -660,7 +721,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
       await current.binding.admission.whenCompositionSettled?.();
       await current.binding.session.flush();
       if (!isCurrent()) return;
-      let payload: ResidentFontEnvironment;
+      let payload: DocxFontEnvironment;
       if (opened.signature === null && !fonts?.length && provider === opened.provider) payload = structuredClone(opened.initial);
       else {
         const requirements = JSON.parse(await client.fontRequirements(opened.layoutInput)) as ResidentFontRequirement[];
@@ -827,7 +888,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
         isCurrent: () => active.current === current,
         readCapture: () => current.clipboard!.read(),
         writeNative: (capture) => {
-          const input = host.current?.querySelector('.paged-editor__peerless-input');
+          const input = host.current?.querySelector('.paged-editor__input');
           if (!data || active.current !== current || document.activeElement !== input || !navigator.userActivation?.isActive ||
             current.clipboard?.take() !== capture) return false;
           const replay = { capture, written: false };
@@ -840,15 +901,11 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
         readClipboardSlice: (selection) => controller.read({ kind: 'clipboardSlice', selection }),
         write: (text) => navigator.clipboard.writeText(text),
         writeSlice: async (text, html) => {
-          try {
-            if (typeof ClipboardItem === 'undefined' || !navigator.clipboard.write) throw new Error('ClipboardItem unavailable');
-            await navigator.clipboard.write([new ClipboardItem({
-              'text/plain': new Blob([text], { type: 'text/plain' }),
-              'text/html': new Blob([html], { type: 'text/html' }),
-            })]);
-          } catch {
-            await navigator.clipboard.writeText(text);
-          }
+          if (typeof ClipboardItem === 'undefined' || !navigator.clipboard.write) throw new Error('ClipboardItem unavailable');
+          await navigator.clipboard.write([new ClipboardItem({
+            'text/plain': new Blob([text], { type: 'text/plain' }),
+            'text/html': new Blob([html], { type: 'text/html' }),
+          })]);
         } });
       if (copied) { if (cut) props.onCut?.(); else props.onCopy?.(); }
     } catch (error) { reportRecoverableError(error instanceof Error ? error : new Error(String(error))); }
@@ -874,9 +931,10 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
     setExpanded: setExpandedSidebarItem, selectionAnchor, focus, onError: reportRecoverableError });
   const pictureMoves = useMemo(() => ({
     canMove: () => { const environment = controller.environment(); return !environment.readOnly && environment.mode === 'editing'; },
+    canMoveInline: () => { const environment = controller.environment(); return !props.collaboration && !environment.readOnly && environment.mode === 'editing'; },
     move: (intent: PeerlessPropertyIntent) => {
       const environment = controller.environment();
-      if (environment.readOnly || environment.mode !== 'editing') return;
+      if (environment.readOnly || environment.mode !== 'editing' || intent.kind === 'moveEmbed' && props.collaboration) return;
       void controller.submit(intent).then(result => { if (!result.ok) reportRecoverableError(new Error(result.failure.message)); },
         error => reportRecoverableError(error instanceof Error ? error : new Error(String(error))));
     },
@@ -886,7 +944,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
       void controller.submit(intent).then(result => { if (!result.ok) reportRecoverableError(new Error(result.failure.message)); },
         error => reportRecoverableError(error instanceof Error ? error : new Error(String(error))));
     },
-  }), [controller, reportRecoverableError]);
+  }), [controller, reportRecoverableError, props.collaboration]);
   const contextMenu = useWorkerContextMenu({ binding: () => active.current?.binding ?? null,
     environment: controller.environment, commands: controller.commands.store, clipboard: onClipboard,
     submit: controller.submit, onWrapImage: (handle, wrap) => propertyDialogs.applyImageWrap(wrap, handle),
@@ -939,7 +997,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
     const region = band === 'header' || band === 'footer' ? { kind: band } : { kind: 'body' as const };
     const hit = clickCount === 1 && page.displayPage ? findDisplayListHyperlinkAtPoint({ pages: [page.displayPage] }, 0, x, y, region) : null;
     const href = sanitizeHref(hit?.href ?? '');
-    const bounds = host.current?.querySelector('[data-peerless-pages-host]')?.getBoundingClientRect();
+    const bounds = host.current?.querySelector('[data-docx-pages-host]')?.getBoundingClientRect();
     const hostBounds = host.current?.getBoundingClientRect();
     if (!hit || !href || !bounds || !hostBounds) return false;
     const data = { href, displayText: hit.displayText, tooltip: hit.tooltip, position: {
@@ -958,7 +1016,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
     }).catch(error => reportRecoverableError(error instanceof Error ? error : new Error(String(error))));
     return true;
   };
-  const activeBox = shellState.view?.geometry && parts.activePart && shellState.view.geometry.coversThroughSeq === shellState.view.throughSeq ?
+  const activeBox = shellState.view?.geometry && parts.activePart && geometryMatchesDocument(shellState.view) ?
     shellState.view.geometry.parts?.find(part => part.story === parts.activePart?.story && part.pageIndex === parts.activePart.page) : undefined;
   const activePage = activeBox && shellState.view?.geometry?.pages.find(page => page.page.pageId === activeBox.pageId);
   const partChrome = activeBox && activePage && (activeBox.kind === 'header' || activeBox.kind === 'footer') ?
@@ -966,7 +1024,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
       left: activePage.bounds.x + activeBox.x, width: activeBox.width, height: activeBox.height }}
       onClose={() => { void parts.close(); }} onRemove={effectiveReadOnly ? undefined : () => { void parts.remove(); }} /> :
     activeBox && activePage ? <div data-docx-escape-layer style={{ position: 'absolute', left: activePage.bounds.x + activeBox.x,
-      top: activePage.bounds.y + activeBox.y - 24, zIndex: 10 }}><button type="button" onClick={() => { void parts.close(); }}>Close note</button>{!effectiveReadOnly && <button type="button" onClick={() => { void propertyDialogs.openNotes(); }}>Note properties</button>}</div> : null;
+      top: activePage.bounds.y + activeBox.y - 24, zIndex: 10 }}><button type="button" onClick={() => { void parts.close(); }}>{t('editor.closeNote')}</button>{!effectiveReadOnly && <button type="button" onClick={() => { void propertyDialogs.openNotes(); }}>{t('editor.noteProperties')}</button>}</div> : null;
   const ignore = () => {};
   const horizontalRulerProps = {
     sectionProps: rulers.sectionProps, zoom, unit: props.rulerUnit ?? 'inch', editable: rulers.editable,
@@ -1135,7 +1193,7 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
       renderDock={(placement, available) => <PluginDock host={pluginHost} placement={placement}
         activations={activations.filter((activation) => activation.plugin.panel?.placement === placement)} available={available} />}
       overlays={<>{contextMenu.element}<PluginOverlays host={pluginHost} activations={activations} target={host.current}
-        layerRef={setPluginLayer} heldGeometry={documentReady ? pluginGeometry.geometry() : null} /></>} dialogs={<>{propertyDialogs.element}<FindReplaceDialog isOpen={searchState.isOpen} replaceMode={searchState.replaceMode}
+        layerRef={setPluginLayer} heldGeometry={documentReady ? pluginGeometry.geometry() : null} /><Toaster position="bottom-right" /></>} dialogs={<>{propertyDialogs.element}<FindReplaceDialog isOpen={searchState.isOpen} replaceMode={searchState.replaceMode}
         onClose={(text, options) => { search.close(text, options); focus(); }} currentResult={searchState.result}
         onFind={(text, options) => { void search.find(text, options).catch((error) => reportRecoverableError(error)); return null; }}
         onFindNext={() => { search.host.searchNext(); return search.getSnapshot().result?.matches[search.getSnapshot().result!.currentIndex] ?? null; }}
@@ -1143,11 +1201,22 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
         onReplace={(text) => search.replace(text).then(count => count > 0).catch((error) => { reportRecoverableError(error); return false; })}
         onReplaceAll={async (query, text, options) => { try { await search.find(query, options); return await search.replace(text, true); }
           catch (error) { reportRecoverableError(error instanceof Error ? error : new Error(String(error))); return 0; } }} /></>} fileInputs={<><input ref={fileIO.imageInput} type="file" accept="image/*" hidden data-testid="docx-image-input" onChange={fileIO.imageChange} /><input ref={fileIO.input} type="file" accept=".docx" hidden data-testid="docx-file-input" onChange={fileIO.change} /></>}
-      loadingIndicator={hasSource && !shellState.error && shellState.status !== 'ready' && !shellState.previewPainted ? loadingIndicator ?? <DefaultLoadingIndicator /> : null}
+      loadingIndicator={opening && (!shellState.previewPainted || typingPaused) ? <>
+        {!shellState.previewPainted && (loadingIndicator ?? <DefaultLoadingIndicator />)}
+        {typingPaused && <div style={{ position: 'absolute', top: 64, left: 0, right: 0, display: 'flex', justifyContent: 'center' }}>
+          <div role="status" aria-live="polite" data-testid="docx-typing-paused" style={{ padding: '8px 14px', borderRadius: 6, fontSize: 14,
+            background: '#fff7e0', color: '#4a3500', border: '1px solid #e8c15a', boxShadow: '0 1px 3px #0002' }}>{t('errors.stillOpening')}</div>
+        </div>}
+      </> : null}
       scrollContainerProps={{ tabIndex: 0, onKeyDown: (event) => {
+        if (opening && !effectiveReadOnly && !isDocumentInput(event.target) && typingKey(event)) {
+          event.preventDefault();
+          setTypingPaused(true);
+          return;
+        }
         if ((event.key !== 'PageUp' && event.key !== 'PageDown') || event.defaultPrevented ||
           event.ctrlKey || event.metaKey || event.altKey || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229 ||
-          !(event.target instanceof HTMLTextAreaElement) || !event.target.classList.contains('paged-editor__peerless-input')) return;
+          !(event.target instanceof HTMLTextAreaElement) || !event.target.classList.contains('paged-editor__input')) return;
         event.preventDefault();
         event.currentTarget.scrollTop += event.currentTarget.clientHeight * (event.key === 'PageDown' ? 0.9 : -0.9);
       } }}
@@ -1176,11 +1245,11 @@ export const PeerlessDocxEditor = forwardRef<DocxEditorRef, DocxEditorProps>(fun
           }
         }}
         onEdit={(displayText, href) => { void propertyDialogs.applyPopupLink(displayText, href, hyperlinkPopup?.tooltip).then(applied => { if (applied) setHyperlinkPopup(null); }); }}
-        onRemove={() => { void propertyDialogs.removeLinkAtCaret().then(applied => { if (applied) { setHyperlinkPopup(null); toast('Link removed'); } }); }} />
+        onRemove={() => { void propertyDialogs.removeLinkAtCaret().then(applied => { if (applied) { setHyperlinkPopup(null); toast(t('editor.linkRemoved')); } }); }} />
       {shellState.status === 'failed' && shellState.error ? <ParseError message={shellState.error.message} /> : sessionOptions ? (
         <PeerlessPagedEditor sessionOptions={sessionOptions} zoom={zoom} onReady={onReady} autoFocus={!effectiveReadOnly}
           overlay={workerCollaboration.overlay(displayWindow)}
-          displayWindow={displayWindow} onDisplayWindowChange={setDisplayWindow} onClipboard={onClipboard} onPasteFragment={onPasteFragment} highlights={searchState.highlights} onNavigateCell={controller.navigateCell} onPartPoint={onPartPoint} pictures={pictureMoves}
+          displayWindow={displayWindow} onDisplayWindowChange={showWindow} onClipboard={onClipboard} onPasteFragment={onPasteFragment} highlights={searchState.highlights} onNavigateCell={controller.navigateCell} onPartPoint={onPartPoint} pictures={pictureMoves}
           pageMirror={props.pageMirror} pageOverlays={<>{partChrome}<WorkerContentControls controller={controller} onError={reportRecoverableError} /></>} />
       ) : hasSource ? null : placeholder ?? <DefaultPlaceholder />}
     </div>} />

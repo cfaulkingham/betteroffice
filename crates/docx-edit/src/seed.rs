@@ -1428,6 +1428,16 @@ impl StyleResolver {
         self.styles.get(style_id)
     }
 
+    /// The paragraph style a break at the end of a `style_id` paragraph starts (`w:next`): `None`
+    /// when it names the same style or no known paragraph style. `None` means the default style.
+    #[cfg_attr(not(feature = "wasm"), allow(dead_code))]
+    pub(crate) fn next_paragraph_style(&self, style_id: Option<&str>) -> Option<String> {
+        let current = style_id.or(self.default_paragraph.as_deref())?;
+        let next = string(field(self.style(current), "next"))?;
+        (next != current && string(field(self.style(next), "type")) == Some("paragraph"))
+            .then(|| next.to_owned())
+    }
+
     fn default_style(&self, style_type: &str) -> Option<&Value> {
         let id = match style_type {
             "paragraph" => self.default_paragraph.as_deref(),
@@ -2228,7 +2238,8 @@ pub(crate) fn image_payload(image: &Value) -> JsonObject {
             .map(emu_to_pixels),
         "layoutInCell": nullish(field(Some(image), "layoutInCell")),
         "noChangeAspect": nullish(field(Some(image), "noChangeAspect")),
-        "allowOverlap": nullish(field(Some(image), "allowOverlap"))
+        "allowOverlap": nullish(field(Some(image), "allowOverlap")),
+        "horizontalRule": nullish(field(Some(image), "horizontalRule"))
     }))
 }
 
@@ -2456,14 +2467,15 @@ fn hyperlink_mark(hyperlink: &Value) -> Mark {
                 .map(|value| format!("#{value}"))
         })
         .unwrap_or_default();
-    mark(
-        "hyperlink",
-        ordered_object([
-            ("href", Value::String(href)),
-            ("tooltip", nullish(field(Some(hyperlink), "tooltip"))),
-            ("rId", nullish(field(Some(hyperlink), "rId"))),
-        ]),
-    )
+    let mut attrs = ordered_object([
+        ("href", Value::String(href)),
+        ("tooltip", nullish(field(Some(hyperlink), "tooltip"))),
+        ("rId", nullish(field(Some(hyperlink), "rId"))),
+    ]);
+    if let Some(Value::Bool(history)) = field(Some(hyperlink), "history") {
+        attrs.push(("history".to_owned(), Value::Bool(*history)));
+    }
+    mark("hyperlink", attrs)
 }
 
 fn note_ref_unit(id: &Value, note_type: &str, marks: &[Mark]) -> InlineUnit {
@@ -2650,6 +2662,14 @@ fn run_content_to_units(
                 payload.insert(
                     "previews".to_owned(),
                     json!(previews.iter().map(image_payload).collect::<Vec<_>>()),
+                );
+            }
+            if let Some(text_box) =
+                field(Some(content), "textBox").filter(|value| value.is_object())
+            {
+                payload.insert(
+                    "textBoxJson".to_owned(),
+                    Value::String(source_json(text_box, source)),
                 );
             }
             vec![embed_unit(
@@ -4671,6 +4691,9 @@ fn project_row<'a>(
             "trPrChange".to_owned(),
             field(Some(row), "propertyChanges").unwrap().clone(),
         );
+    }
+    if let Some(attributes) = field(Some(row), "extraAttributes") {
+        attrs.insert("_extraAttributes".to_owned(), attributes.clone());
     }
     let widths: Vec<Option<f64>> = array(field(Some(table), "columnWidths"))
         .iter()
@@ -7786,6 +7809,37 @@ mod tests {
         assert!(numeric_field_instruction(" 123 "));
         for instruction in ["", "= 0", "QUOTE 0", "PAGE", "CustomField", "123abc"] {
             assert!(!numeric_field_instruction(instruction));
+        }
+    }
+
+    #[test]
+    fn next_paragraph_style_follows_w_next_to_another_paragraph_style() {
+        let styles = StyleResolver::new(Some(&json!({"styles":[
+            {"type":"paragraph","styleId":"Normal","default":true,"next":"Normal"},
+            {"type":"paragraph","styleId":"Heading1","next":"Normal"},
+            {"type":"paragraph","styleId":"Heading2"},
+            {"type":"paragraph","styleId":"Quote","next":"Emphasis"},
+            {"type":"character","styleId":"Emphasis"},
+            {"type":"paragraph","styleId":"Body","next":"Missing"},
+            {"type":"paragraph","styleId":"Default","next":"Heading2"}
+        ]})));
+        assert_eq!(
+            styles.next_paragraph_style(Some("Heading1")).as_deref(),
+            Some("Normal")
+        );
+        assert_eq!(
+            styles.next_paragraph_style(Some("Default")).as_deref(),
+            Some("Heading2")
+        );
+        for id in [
+            Some("Normal"),
+            Some("Heading2"),
+            Some("Quote"),
+            Some("Body"),
+            Some("Unknown"),
+            None,
+        ] {
+            assert_eq!(styles.next_paragraph_style(id), None, "{id:?}");
         }
     }
 

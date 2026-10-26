@@ -98,6 +98,7 @@ interface YrsImageAttrs {
   layoutInCell?: boolean;
   noChangeAspect?: boolean;
   allowOverlap?: boolean;
+  horizontalRule?: boolean;
   effectExtentTop?: number;
   effectExtentRight?: number;
   effectExtentBottom?: number;
@@ -606,6 +607,7 @@ function createHyperlink(attributes: Attrs): Hyperlink | null {
       type: 'hyperlink',
       anchor: href.slice(1),
       tooltip: asString(link.tooltip) || undefined,
+      ...(typeof link.history === 'boolean' ? { history: link.history } : {}),
       children: [],
     };
   }
@@ -613,6 +615,7 @@ function createHyperlink(attributes: Attrs): Hyperlink | null {
     type: 'hyperlink',
     href,
     tooltip: asString(link.tooltip) || undefined,
+    ...(typeof link.history === 'boolean' ? { history: link.history } : {}),
     rId: asString(link.rId) || undefined,
     children: [],
   };
@@ -825,6 +828,7 @@ function imageFromPayload(payload: Attrs): Image {
   if (attrs.layoutInCell != null) image.layoutInCell = attrs.layoutInCell;
   if (attrs.noChangeAspect != null) image.noChangeAspect = attrs.noChangeAspect;
   if (attrs.allowOverlap != null) image.allowOverlap = attrs.allowOverlap;
+  if (attrs.horizontalRule != null) image.horizontalRule = attrs.horizontalRule;
 
   const padding: NonNullable<Image['padding']> = {};
   if (attrs.effectExtentTop != null) padding.top = pixelsToEmu(attrs.effectExtentTop);
@@ -895,6 +899,7 @@ function opaqueDrawingRunFromPayload(
   const previews = Array.isArray(payload.previews)
     ? payload.previews.map(asObject).filter((image): image is Attrs => !!image).map(imageFromPayload)
     : [];
+  const textBox = storedShape(payload.textBoxJson);
   const formatting = format(attributes);
   return {
     type: 'run',
@@ -902,6 +907,7 @@ function opaqueDrawingRunFromPayload(
       type: 'opaqueDrawing', kind, xml,
       ...(preview ? { preview: imageFromPayload(preview) } : {}),
       ...(previews.length ? { previews } : {}),
+      ...(textBox ? { textBox } : {}),
     }],
     ...(Object.keys(formatting).length > 0 ? { formatting } : {}),
   };
@@ -1383,7 +1389,9 @@ function buildParagraphContent(
       const currentKey = currentHyperlink
         ? currentHyperlink.href || (currentHyperlink.anchor ? `#${currentHyperlink.anchor}` : '')
         : null;
-      if (!currentHyperlink || currentKey !== linkKey) {
+      const history = asObject(item.attributes.hyperlink)?.history;
+      const linkHistory = typeof history === 'boolean' ? history : undefined;
+      if (!currentHyperlink || currentKey !== linkKey || currentHyperlink.history !== linkHistory) {
         flushHyperlink();
         currentHyperlink = createHyperlink(item.attributes);
       }
@@ -2397,6 +2405,7 @@ function tableFromPayload(context: SaveContext, payload: TablePayload): Table {
     const attrs = { ...TABLE_ROW_ATTR_DEFAULTS, ...(rowPayload.trPr ?? {}) } as TableRowSaveAttrs;
     const row: TableRow = {
       type: 'tableRow',
+      ...(attrs._extraAttributes ? { extraAttributes: attrs._extraAttributes } : {}),
       formatting: tableRowAttrsToFormatting(attrs),
       cells,
     };

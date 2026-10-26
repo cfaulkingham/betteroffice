@@ -253,6 +253,7 @@ fn run_recalc(
 ) -> RecalcResult {
     let mut pass = Pass {
         graph,
+        name_index: graph.names_match(&wb.defined_names).then_some(graph),
         context,
         budget: Rc::new(EvaluationBudget::new(MAX_RECALCULATION_CELL_VISITS)),
         changed: Vec::new(),
@@ -352,6 +353,9 @@ enum NodeValue {
 /// one recalc: the budget its evaluations share and what they found.
 struct Pass<'g> {
     graph: &'g DepGraph,
+    /// the graph again when its names are the workbook's, so evaluation looks
+    /// names up there rather than scanning the workbook's table.
+    name_index: Option<&'g DepGraph>,
     context: RecalcContext,
     budget: Rc<EvaluationBudget>,
     changed: Vec<(SheetId, CellRef)>,
@@ -367,7 +371,14 @@ impl Pass<'_> {
         #[cfg(test)]
         FORMULA_EVALUATIONS.with(|count| count.set(count.get() + 1));
         progress();
-        let (value, limited) = eval_node(wb, u, self.context, Rc::clone(&self.budget), self.graph);
+        let (value, limited) = eval_node(
+            wb,
+            u,
+            self.context,
+            Rc::clone(&self.budget),
+            self.graph,
+            self.name_index,
+        );
         self.write(wb, u, value, limited);
     }
 
@@ -409,6 +420,7 @@ impl Pass<'_> {
                     self.context,
                     Rc::clone(&self.budget),
                     self.graph,
+                    self.name_index,
                 );
                 let Some(target) = log.first.get() else {
                     self.write(wb, u, value, limited);
@@ -606,7 +618,14 @@ impl CellProvider for ReadLog<'_> {
     }
 
     fn used_rows(&self, sheet: SheetId) -> RowId {
-        self.inner.used_rows(sheet)
+        let spilled = self.inner.sheet(sheet).map_or(0, |sheet| {
+            sheet
+                .array_formulas()
+                .map(|(_, range)| range.end.row.saturating_add(1))
+                .max()
+                .unwrap_or(0)
+        });
+        self.inner.used_rows(sheet).max(spilled)
     }
 
     fn used_cols(&self, sheet: SheetId) -> ColId {
@@ -639,8 +658,9 @@ fn eval_node(
     context: RecalcContext,
     budget: Rc<EvaluationBudget>,
     graph: &DepGraph,
+    name_index: Option<&DepGraph>,
 ) -> (Option<NodeValue>, bool) {
-    eval_node_with(wb, wb, u, context, budget, graph)
+    eval_node_with(wb, wb, u, context, budget, graph, name_index)
 }
 
 /// evaluate one node, reading cells through `provider` while `wb` supplies the
@@ -652,6 +672,7 @@ fn eval_node_with(
     context: RecalcContext,
     budget: Rc<EvaluationBudget>,
     graph: &DepGraph,
+    name_index: Option<&DepGraph>,
 ) -> (Option<NodeValue>, bool) {
     let Some(expr) = graph.ast(u.0, cell_of(u)) else {
         return (None, false);
@@ -670,6 +691,7 @@ fn eval_node_with(
     ctx.rand_seed = context.rand_seed.map(|seed| cell_random_seed(seed, u));
     ctx.date_system = wb.date_system;
     ctx.parse_cache = Some(graph.asts());
+    ctx.name_index = name_index;
     let value = match authored {
         Some(_) => NodeValue::Spill(evaluate_spill(&expr, &ctx, cell, authored)),
         None => NodeValue::Scalar(computed(evaluate(&expr, &ctx))),
@@ -1522,6 +1544,87 @@ mod tests {
         );
     }
 
+    /// a year-first date reads alike in every locale, so arithmetic coerces it
+    /// to its serial, time of day included, under the workbook's date system.
+    #[test]
+    fn arithmetic_on_year_first_date_text_reads_its_serial() {
+        let (mut wb, s) = one_sheet();
+        put_text(&mut wb, s, "A1", "2017-04-27");
+        put_num(&mut wb, s, "A2", 41_309.0);
+        put_text(&mut wb, s, "A3", "2017/4/27 18:00");
+        put_text(&mut wb, s, "A4", "2017-02-30");
+        put_formula(&mut wb, s, "B1", "A1-A2");
+        put_formula(&mut wb, s, "B2", "A3-A1");
+        put_formula(&mut wb, s, "B3", "-A1");
+        put_formula(&mut wb, s, "B4", "A1%");
+        put_formula(&mut wb, s, "B5", "A4+1");
+        rebuild_and_recalc_all(&mut wb, None);
+        assert_eq!(value(&wb, s, "B1"), num(1_543.0));
+        assert_eq!(value(&wb, s, "B2"), num(0.75));
+        assert_eq!(value(&wb, s, "B3"), num(-42_852.0));
+        assert_eq!(value(&wb, s, "B4"), num(428.52));
+        assert_eq!(
+            value(&wb, s, "B5"),
+            CellValue::Error {
+                value: ErrorValue::Value
+            }
+        );
+
+        let (mut wb, s) = one_sheet();
+        wb.date_system = xlsx_model::DateSystem::V1904;
+        put_text(&mut wb, s, "A1", "2017-04-27");
+        put_formula(&mut wb, s, "B1", "A1+0");
+        rebuild_and_recalc_all(&mut wb, None);
+        assert_eq!(value(&wb, s, "B1"), num(41_390.0));
+    }
+
+    /// excel trims only ascii spaces off date text, so other unicode spaces,
+    /// full-width digits and number-like clock junk leave it text.
+    #[test]
+    fn year_first_date_text_with_foreign_spacing_stays_text() {
+        let (mut wb, s) = one_sheet();
+        let texts = [
+            "\u{a0}2024-03-05",
+            "2024-03-05\u{a0}",
+            "\u{3000}2024-03-05",
+            "2024-03-05\u{2009}18:00",
+            "2024-03-05 \u{a0}18:00",
+            "2024-03-05 18:00\u{a0}",
+            "\u{ff12}024-03-05",
+            "2024-03-05 1e1:00",
+            "2024-03-05 +6:00",
+        ];
+        for (row, text) in texts.iter().enumerate() {
+            let row = row + 1;
+            put_text(&mut wb, s, &format!("A{row}"), text);
+            put_cached_formula(
+                &mut wb,
+                s,
+                &format!("B{row}"),
+                &format!("A{row}+0"),
+                CellValue::Error {
+                    value: ErrorValue::Value,
+                },
+            );
+        }
+        put_text(&mut wb, s, "C1", "  2024-03-05  ");
+        put_text(&mut wb, s, "C2", "2024-03-05   18:00 ");
+        put_formula(&mut wb, s, "D1", "C1+0");
+        put_formula(&mut wb, s, "D2", "C2+0");
+        rebuild_and_recalc_all(&mut wb, None);
+        for (row, text) in texts.iter().enumerate() {
+            assert_eq!(
+                value(&wb, s, &format!("B{}", row + 1)),
+                CellValue::Error {
+                    value: ErrorValue::Value
+                },
+                "{text:?}"
+            );
+        }
+        assert_eq!(value(&wb, s, "D1"), num(45_356.0));
+        assert_eq!(value(&wb, s, "D2"), num(45_356.75));
+    }
+
     #[test]
     fn an_array_formula_over_date_text_keeps_its_cached_rectangle() {
         for (formula, first, second) in [
@@ -1739,6 +1842,27 @@ mod tests {
         let result = recalc_after(&mut wb, &mut graph, &[(SheetId(1), a1("A2"))], None);
         assert_eq!(value(&wb, SheetId(0), "A1"), num(24.0));
         assert_eq!(result.changed, vec![(SheetId(0), a1("A1"))]);
+    }
+
+    #[test]
+    fn names_edited_after_the_graph_was_built_still_evaluate_from_the_workbook() {
+        let mut wb = Workbook::default();
+        wb.sheets.push(Sheet::new("Data"));
+        for index in 0..3 {
+            wb.defined_names.push(DefinedName {
+                name: format!("Rate_{index}"),
+                formula: format!("{index}"),
+                local_sheet: None,
+                hidden: index == 1,
+            });
+        }
+        put_formula(&mut wb, SheetId(0), "A1", "Rate_1*2");
+        let (mut graph, _) = rebuild_and_recalc_all(&mut wb, None);
+        assert_eq!(value(&wb, SheetId(0), "A1"), num(2.0));
+
+        wb.defined_names[1].formula = "5".into();
+        recalc_after(&mut wb, &mut graph, &[(SheetId(0), a1("A1"))], None);
+        assert_eq!(value(&wb, SheetId(0), "A1"), num(10.0));
     }
 
     /// recalc runs on open, so a `Chain_0=Chain_1+Chain_1` ladder in an
@@ -2681,11 +2805,15 @@ mod tests {
             assert_eq!(value(&wb, s, "E2"), refused, "{formula} {spent}");
             assert!(result.limited_cells.contains(&(s, a1("E1"))), "{formula}");
         }
-        let (mut wb, s) = inputs(false);
-        put_formula(&mut wb, s, "E1", lookup);
-        let (_, result) = rebuild_and_recalc_all(&mut wb, None);
-        assert_eq!(value(&wb, s, "E1"), num(43.0));
-        assert!(result.limited_cells.is_empty());
+        let missing =
+            "IFERROR(IFERROR(_xlfn.XLOOKUP(1,NA(),OFFSET(D1,0,0,SUM(A:A))),42)+SUM(A:A),0)";
+        for formula in [lookup, missing] {
+            let (mut wb, s) = inputs(false);
+            put_formula(&mut wb, s, "E1", formula);
+            let (_, result) = rebuild_and_recalc_all(&mut wb, None);
+            assert_eq!(value(&wb, s, "E1"), num(43.0), "{formula}");
+            assert!(result.limited_cells.is_empty(), "{formula}");
+        }
     }
 
     #[test]

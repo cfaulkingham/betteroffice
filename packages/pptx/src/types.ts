@@ -224,7 +224,7 @@ export interface CommentSnapshot {
   created: string | null;
   xEmu: number;
   yEmu: number;
-  /** Set on a reply; names the thread root. Modern decks only. */
+  /** Set on a reply; names the thread root. */
   parentId: string | null;
   resolved: boolean;
 }
@@ -606,4 +606,12 @@ export interface TextParagraphDraft {
   bullet?: boolean;
   alignment?: ParagraphAlignment | null;
   runs: Array<{ text: string; style?: TextStyle }>;
+}
+
+export interface TableReceipt {
+  slideId: string;
+  shapeId: string;
+  rowCount: number;
+  columnCount: number;
+  newCellRefs: string[];
 }

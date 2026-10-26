@@ -193,6 +193,7 @@ enum DeleteDirection {
 enum AdjacentStoryUnit {
     Content(u32),
     Pilcrow,
+    Table,
 }
 
 /// Resolves a paragraph to its story span via the committed paragraph index.
@@ -311,7 +312,21 @@ fn adjacent_story_unit(
             AdjacentStoryUnit::Content(width)
         }
         SegKind::Pilcrow => AdjacentStoryUnit::Pilcrow,
+        SegKind::Embed if table_embed_at(doc, story, segment.start)? => AdjacentStoryUnit::Table,
         SegKind::Embed => AdjacentStoryUnit::Content(1),
+    }))
+}
+
+fn table_embed_at(doc: &EditingDoc, story: &str, index: u32) -> Result<bool, JsValue> {
+    let txn = doc.yrs_doc().transact();
+    let text = crate::story_ref(&txn, story).map_err(js_err)?;
+    let chunks = crate::ops::snapshot_range(&text, &txn, index, index.saturating_add(1));
+    Ok(chunks.first().is_some_and(|chunk| {
+        matches!(
+            &chunk.kind,
+            crate::ops::ChunkKind::Embed(Some(map))
+                if crate::map_string(map, &txn, crate::KIND_KEY).as_deref() == Some("table")
+        )
     }))
 }
 
@@ -1258,6 +1273,30 @@ fn thin_docx_envelope(envelope: &docx_parse::S9WireEnvelope) -> docx_parse::S9Wi
 }
 
 impl EditSession {
+    /// The source package's style cascade, built on first use and cached until the source changes.
+    fn paragraph_style_resolver(
+        &self,
+    ) -> Result<std::cell::RefMut<'_, Option<crate::seed::StyleResolver>>, JsValue> {
+        let mut styles = self.paragraph_styles.borrow_mut();
+        if styles.is_none()
+            && let Some(source) = self.docx_source.borrow().as_ref()
+        {
+            let parts = ooxml_opc::unzip_parts_where(
+                source,
+                ooxml_opc::MAX_TOTAL_UNCOMPRESSED_BYTES,
+                |name| {
+                    matches!(
+                        name,
+                        "word/styles.xml" | "word/theme/theme1.xml" | "word/settings.xml"
+                    )
+                },
+            )
+            .map_err(js_err)?;
+            *styles = Some(crate::seed::StyleResolver::from_parts(&parts).map_err(js_err)?);
+        }
+        Ok(styles)
+    }
+
     pub fn seed_from_docx(
         &self,
         bytes: &[u8],
@@ -1336,6 +1375,8 @@ impl EditSession {
         let (envelope, parts, media) =
             crate::seed::parse_docx_package_with_media(source.clone(), digest.clone())?;
         let host_envelope = thin_docx_envelope(&envelope);
+        // Only stories seeded into an empty replica are what a fresh seed of the package holds.
+        let fresh_seed = seed_stories && self.engine.doc().holds_nothing();
         let fonts = if seed_stories {
             let seed_media = if self.media_tokens.get() {
                 crate::seed::SeedMedia::AsParsed
@@ -1389,6 +1430,9 @@ impl EditSession {
         self.engine.set_partial_document(false);
         self.engine.set_relayout_trigger(RelayoutTrigger::Open);
         self.engine.doc().rotate_version(js_entropy());
+        if fresh_seed {
+            self.engine.doc().mark_seeded();
+        }
         Ok(json)
     }
 
@@ -1524,6 +1568,11 @@ impl EditSession {
         let ctx = EditCtx::local("", "");
 
         match (direction, adjacent) {
+            (_, Some(AdjacentStoryUnit::Table)) => {
+                return Err(js_err(
+                    "resident input state is not ready for this paragraph",
+                ));
+            }
             (DeleteDirection::Backward, Some(AdjacentStoryUnit::Content(width))) => {
                 self.engine
                     .edit_resident_text(
@@ -3817,12 +3866,21 @@ impl EditSession {
         author_date: Option<String>,
     ) -> Result<String, JsValue> {
         let at = loc_index(self.engine.doc(), story, para_id, offset)?;
-        let ctx = edit_ctx(author_name, author_date)?;
-        let receipt = self
-            .engine
-            .doc()
-            .split_paragraph(&ctx, Position::new(story, at), None)
-            .map_err(js_err)?;
+        let receipt = if author_name.is_none() && author_date.is_none() {
+            let receipt = self
+                .engine
+                .split_resident_paragraph(Position::new(story, at))
+                .map_err(js_err)?;
+            self.resident_text_edit
+                .replace(Some((story.to_owned(), self.engine.doc_epoch())));
+            receipt
+        } else {
+            let ctx = edit_ctx(author_name, author_date)?;
+            self.engine
+                .doc()
+                .split_paragraph(&ctx, Position::new(story, at), None)
+                .map_err(js_err)?
+        };
         Ok(json!({
             "firstParaId": receipt.first_para_id,
             "secondParaId": receipt.second_para_id,
@@ -3979,6 +4037,32 @@ impl EditSession {
             .map_err(js_err)
     }
 
+    /// The style a paragraph break at `(story, para_id, offset)` gives the new paragraph: the
+    /// paragraph style's `w:next` when the break falls at the paragraph end and `w:next` names
+    /// another paragraph style. `None` otherwise, and for a session without a source package.
+    pub fn next_paragraph_style(
+        &self,
+        story: &str,
+        para_id: &str,
+        offset: u32,
+    ) -> Result<Option<String>, JsValue> {
+        let span = find_para_span(self.engine.doc(), story, para_id)?;
+        if offset != span.pilcrow - span.start {
+            return Ok(None);
+        }
+        let styles = self.paragraph_style_resolver()?;
+        let Some(styles) = styles.as_ref() else {
+            return Ok(None);
+        };
+        let current = self
+            .engine
+            .doc()
+            .selection_context(&StoryRange::new(story, span.pilcrow, span.pilcrow))
+            .map_err(js_err)?
+            .style_id;
+        Ok(styles.next_paragraph_style(current.as_deref()))
+    }
+
     /// Applies a paragraph style and rebases inherited character formatting, preserving direct
     /// formatting. Without a source package, only `pStyle` changes.
     #[allow(clippy::too_many_arguments)]
@@ -3997,23 +4081,7 @@ impl EditSession {
         let end = loc_index(self.engine.doc(), story, end_para, end_offset)?;
         let selector = ParaSelector::Range(StoryRange::new(story, start, end));
         let ctx = edit_ctx(author_name, author_date)?;
-        let mut styles = self.paragraph_styles.borrow_mut();
-        if styles.is_none()
-            && let Some(source) = self.docx_source.borrow().as_ref()
-        {
-            let parts = ooxml_opc::unzip_parts_where(
-                source,
-                ooxml_opc::MAX_TOTAL_UNCOMPRESSED_BYTES,
-                |name| {
-                    matches!(
-                        name,
-                        "word/styles.xml" | "word/theme/theme1.xml" | "word/settings.xml"
-                    )
-                },
-            )
-            .map_err(js_err)?;
-            *styles = Some(crate::seed::StyleResolver::from_parts(&parts).map_err(js_err)?);
-        }
+        let styles = self.paragraph_style_resolver()?;
         if let Some(styles) = styles.as_ref() {
             self.engine
                 .doc()
@@ -4101,6 +4169,32 @@ impl EditSession {
             .engine
             .doc()
             .insert_embed(&ctx, Position::new(story, index), "image", entries)
+            .map_err(js_err)?;
+        Ok(text_receipt_json(receipt))
+    }
+
+    /// Moves one inline embed in one local transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn move_embed(
+        &self,
+        story: &str,
+        para_id: &str,
+        offset: u32,
+        to_story: &str,
+        to_para_id: &str,
+        to_offset: u32,
+    ) -> Result<String, JsValue> {
+        let index = loc_index(self.engine.doc(), story, para_id, offset)?;
+        let to_index = loc_index(self.engine.doc(), to_story, to_para_id, to_offset)?;
+        let ctx = EditCtx::local(String::new(), String::new());
+        let receipt = self
+            .engine
+            .doc()
+            .move_embed(
+                &ctx,
+                Position::new(story, index),
+                Position::new(to_story, to_index),
+            )
             .map_err(js_err)?;
         Ok(text_receipt_json(receipt))
     }
@@ -7053,6 +7147,189 @@ mod tests {
 
     /// A package whose paragraph text id is invalid, so parsing generates
     /// one from the package digest.
+    fn fixture_packages() -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut pending = vec![root.join("tests/fixtures")];
+        let mut found = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path
+                    .extension()
+                    .is_some_and(|extension| extension == "docx")
+                {
+                    let bytes = std::fs::read(&path).unwrap();
+                    found.push((path, bytes));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn an_unchanged_session_plans_its_save_from_what_a_reseed_would_hold() {
+        let mut checked = 0;
+        for (path, bytes) in fixture_packages() {
+            let label = path.display().to_string();
+            let session = EditSession::new(81.0).unwrap();
+            if session
+                .open_docx_retaining(&bytes, true, None, None)
+                .is_err()
+            {
+                continue;
+            }
+            let doc = session.engine.doc();
+            assert!(doc.unchanged_since_seeded(), "{label}");
+            let reused = doc.paragraph_save_plan();
+            crate::identity::assert_seed_states_match_a_reseed(doc, &label);
+            let reseeding = EditSession::new(82.0).unwrap();
+            reseeding
+                .open_docx_retaining(&bytes, true, None, None)
+                .unwrap();
+            reseeding.engine.doc().forget_seeding();
+            assert_eq!(
+                reseeding.engine.doc().paragraph_save_plan(),
+                reused,
+                "{label}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 50, "{checked} fixtures opened");
+    }
+
+    #[test]
+    fn an_open_into_a_session_holding_stories_plans_from_a_reseed() {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/footnote-anchor.docx"),
+        )
+        .unwrap();
+        let opened = |client: f64| {
+            let session = EditSession::new(client).unwrap();
+            session
+                .create_story("fn:99", "Existing note", "Normal", "left")
+                .unwrap();
+            session
+                .open_docx_retaining(&bytes, true, None, None)
+                .unwrap();
+            session
+        };
+        let session = opened(86.0);
+        assert!(!session.engine.doc().unchanged_since_seeded());
+        let plan = session.engine.doc().paragraph_save_plan();
+        let reseeding = opened(87.0);
+        reseeding.engine.doc().forget_seeding();
+        assert_eq!(reseeding.engine.doc().paragraph_save_plan(), plan);
+    }
+
+    #[test]
+    fn seeding_comment_metadata_keeps_a_session_planning_from_its_own_stories() {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/structured-export/principal.docx"),
+        )
+        .unwrap();
+        let opened = |client: f64| {
+            let session = EditSession::new(client).unwrap();
+            session
+                .open_docx_retaining(&bytes, true, None, None)
+                .unwrap();
+            let comments: Vec<Value> =
+                serde_json::from_str(&session.list_comments().unwrap()).unwrap();
+            assert!(!comments.is_empty());
+            for comment in &comments {
+                let id = match &comment["id"] {
+                    Value::String(id) => id.clone(),
+                    id => id.to_string(),
+                };
+                session
+                    .seed_comment_metadata_json(
+                        &id,
+                        r#"{"author":"A","date":"2026-01-01T00:00:00Z","done":true,"parentId":null,"body":null}"#,
+                    )
+                    .unwrap();
+            }
+            session
+                .seed_comment_metadata_json("reply-1", r#"{"author":"B","parentId":"1"}"#)
+                .unwrap();
+            session
+        };
+        let session = opened(88.0);
+        assert!(session.engine.doc().unchanged_since_seeded());
+        let plan = session.engine.doc().paragraph_save_plan();
+        crate::identity::assert_seed_states_match_a_reseed(session.engine.doc(), "principal");
+        let reseeding = opened(89.0);
+        reseeding.engine.doc().forget_seeding();
+        assert_eq!(reseeding.engine.doc().paragraph_save_plan(), plan);
+    }
+
+    #[test]
+    fn an_open_under_another_digest_plans_from_a_reseed() {
+        let bytes = unidentified_docx("Alpha");
+        let digest = "0".repeat(64);
+        let opened = |client: f64| {
+            let session = EditSession::new(client).unwrap();
+            session
+                .open_docx_retaining(&bytes, true, Some("fixed"), Some(&digest))
+                .unwrap();
+            session
+        };
+        let session = opened(91.0);
+        let plan = session.engine.doc().paragraph_save_plan();
+        let reseeding = opened(92.0);
+        reseeding.engine.doc().forget_seeding();
+        assert_eq!(reseeding.engine.doc().paragraph_save_plan(), plan);
+    }
+
+    #[test]
+    fn a_session_edited_since_seeding_plans_from_a_reseed() {
+        let session = EditSession::new(83.0).unwrap();
+        session
+            .open_docx_retaining(&unidentified_docx("Alpha"), true, None, None)
+            .unwrap();
+        assert!(session.engine.doc().unchanged_since_seeded());
+        let para_id = session.engine.doc().paragraphs("body").unwrap()[0]
+            .para_id
+            .clone();
+        session
+            .insert_text("body", &para_id, 1, "!", None, None)
+            .unwrap();
+        assert!(!session.engine.doc().unchanged_since_seeded());
+        session.engine.doc().paragraph_save_plan();
+        crate::identity::assert_seed_states_match_a_reseed(session.engine.doc(), "edited");
+
+        let restored = EditSession::new(84.0).unwrap();
+        restored
+            .open_docx_retaining(&unidentified_docx("Alpha"), true, None, None)
+            .unwrap();
+        let para_id = restored.engine.doc().paragraphs("body").unwrap()[0]
+            .para_id
+            .clone();
+        restored
+            .insert_text("body", &para_id, 1, "!", None, None)
+            .unwrap();
+        restored
+            .delete_range("body", &para_id, 1, &para_id, 2, None, None)
+            .unwrap();
+        assert_eq!(
+            restored.engine.doc().paragraphs("body").unwrap()[0].text,
+            "Alpha"
+        );
+        assert!(!restored.engine.doc().unchanged_since_seeded());
+
+        let remote = EditSession::new(85.0).unwrap();
+        remote
+            .open_docx_retaining(&unidentified_docx("Alpha"), true, None, None)
+            .unwrap();
+        remote.apply_update(&session.encode_state()).unwrap();
+        assert!(!remote.engine.doc().unchanged_since_seeded());
+        remote.engine.doc().paragraph_save_plan();
+        crate::identity::assert_seed_states_match_a_reseed(remote.engine.doc(), "remote");
+    }
+
     fn unidentified_docx(text: &str) -> Vec<u8> {
         let document = format!(
             r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"><w:body><w:p w14:textId="invalid"><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>"#
@@ -7125,6 +7402,11 @@ mod tests {
         assert_eq!(
             unused_script_fonts(&latin(text_box), "", true),
             json!(["Batang", "Times New Roman", "宋体"])
+        );
+        let vml_text_box = r#"<w:r><w:pict xmlns:v="urn:schemas-microsoft-com:vml"><v:shape style="width:72pt;height:36pt"><v:textbox><w:txbxContent><w:p><w:r><w:t>漢字</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>"#;
+        assert_eq!(
+            unused_script_fonts(&latin(vml_text_box), "", true),
+            json!(["Times New Roman"])
         );
     }
 
