@@ -101,6 +101,108 @@ fn criteria_index_scale_matches_rust_loop_without_budget_refusal() {
     }
 }
 
+#[test]
+fn criteria_index_cse_scale_matches_rust_loop_without_budget_refusal() {
+    let mut wb = scale();
+    for row in 0..1_500 {
+        let at = CellRef::new(row, 0);
+        let product = format!(
+            "SUMPRODUCT((Data!A1:A20000=\"a{}\")*(Data!B1:B20000=\"b{}\")*(Data!C1:C20000={})*Data!D1:D20000)",
+            row % 100,
+            row % 37,
+            row % 13
+        );
+        formula(
+            &mut wb.sheets[1],
+            row,
+            0,
+            &format!("IF(MOD({},2)=0,{product},{product})", row),
+        );
+        wb.sheets[1].set_array_formula(at, xlsx_model::CellRange::new(at, at));
+    }
+    let (_, result) = rebuild_and_recalc_all(&mut wb, None);
+    assert!(!result.budget_exhausted);
+    assert!(
+        result.limited_cells.is_empty(),
+        "{:?}",
+        result.limited_cells
+    );
+    for key in 0..1_500 {
+        let mut expected = 0.0;
+        for row in 0..20_000 {
+            if row % 100 == key % 100 && row % 37 == key % 37 && row % 13 == key % 13 {
+                expected += (row % 17) as f64 / 8.0;
+            }
+        }
+        assert_eq!(
+            wb.value(SheetId(1), CellRef::new(key, 0)),
+            number(expected),
+            "dashboard row {key}"
+        );
+    }
+}
+
+fn formula_range_scale(criteria: bool, arrays: bool) {
+    let mut wb = scale();
+    let col = if criteria { 2 } else { 3 };
+    let mut inputs = Sheet::new("Inputs");
+    put(&mut inputs, 0, 0, number(3.0));
+    wb.sheets.push(inputs);
+    put(&mut wb.sheets[0], 0, 7, number(4.0));
+    for (row, source) in [(0, "1+1"), (1, "Inputs!A1"), (2, "H1")] {
+        formula(&mut wb.sheets[0], row, col, source);
+    }
+    if arrays {
+        for row in 0..1_500 {
+            let at = CellRef::new(row, 0);
+            wb.sheets[1].set_array_formula(at, xlsx_model::CellRange::new(at, at));
+        }
+    }
+    let (_, result) = rebuild_and_recalc_all(&mut wb, None);
+    assert!(!result.budget_exhausted);
+    assert!(result.limited_cells.is_empty());
+    for key in 0..1_500 {
+        let mut expected = 0.0;
+        for row in 0..20_000 {
+            let replacement = match row {
+                0 => 2.0,
+                1 => 3.0,
+                _ => 4.0,
+            };
+            let criterion = if criteria && row < 3 {
+                replacement
+            } else {
+                (row % 13) as f64
+            };
+            let value = if !criteria && row < 3 {
+                replacement
+            } else {
+                (row % 17) as f64 / 8.0
+            };
+            if row % 100 == key % 100 && row % 37 == key % 37 && criterion == (key % 13) as f64 {
+                expected += value;
+            }
+        }
+        assert_eq!(wb.value(SheetId(1), CellRef::new(key, 0)), number(expected));
+    }
+}
+
+#[test]
+fn criteria_index_formula_values_scale_without_cached_values() {
+    formula_range_scale(false, false);
+}
+
+#[test]
+fn criteria_index_formula_criteria_scale_without_cached_values() {
+    formula_range_scale(true, false);
+}
+
+#[test]
+fn criteria_index_formula_ranges_cse_scale() {
+    formula_range_scale(false, true);
+    formula_range_scale(true, true);
+}
+
 fn mixed() -> Workbook {
     let mut sheet = Sheet::new("Data");
     for (row, value) in [
