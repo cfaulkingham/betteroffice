@@ -7,9 +7,11 @@ import { createFontProvider } from '../../packages/fonts/src/cdn';
 import { MAX_LOCAL_REFERENCE_PAGES } from '../office-quality/reference.mjs';
 import {
   capturePageExtent,
+  extentMatches,
   validatePageBounds,
   type OfficePageBounds,
 } from '../office-quality/page-bounds';
+import { hasInk, isUnpaintedCanvas, layoutWaitMs, settleCanvas } from './capture-wait';
 
 declare const __QUALITY_FONT_BASE__: string | null;
 declare const __QUALITY_FONT_BASE_CJK__: string | null;
@@ -109,7 +111,7 @@ api.oracleInit = async (input: number[], fonts: boolean, profile?: unknown) => {
     if (complete === null && editor.current) {
       complete = typeof editor.current.whenLayoutComplete !== 'function';
       if (!complete) {
-        editor.current.whenLayoutComplete().then(
+        editor.current.whenLayoutComplete({ timeoutMs: layoutWaitMs(captureProfile?.pages.length) }).then(
           () => (complete = true),
           (error: unknown) => (failure = error)
         );
@@ -131,15 +133,25 @@ api.oracleInit = async (input: number[], fonts: boolean, profile?: unknown) => {
     await sleep(100);
   }
 };
+const canvasHasInk = (canvas: HTMLCanvasElement) => {
+  const probe = document.createElement('canvas');
+  probe.width = canvas.width;
+  probe.height = canvas.height;
+  const context = probe.getContext('2d', { willReadFrequently: true })!;
+  context.drawImage(canvas, 0, 0);
+  const inked = hasInk(context.getImageData(0, 0, probe.width, probe.height).data);
+  probe.width = 0;
+  probe.height = 0;
+  return inked;
+};
 api.oraclePage = async (index: number) => {
   editor.current.scrollToPage(index + 1);
-  let previous = '';
-  let equal = 0;
-  for (;;) {
-    const canvas = document.querySelector<HTMLCanvasElement>(
-      `canvas[data-page-index="${index}"]`
-    );
-    if (canvas?.width && canvas?.height) {
+  const frame = await settleCanvas({
+    read: () => {
+      const canvas = document.querySelector<HTMLCanvasElement>(
+        `canvas[data-page-index="${index}"]`
+      );
+      if (!canvas?.width || !canvas?.height) return null;
       const extent = capturePageExtent(captureProfile, index, canvas.width, canvas.height, true);
       const output = document.createElement('canvas');
       output.width = extent.output.width_px;
@@ -151,22 +163,23 @@ api.oraclePage = async (index: number) => {
       const value = output.toDataURL('image/png');
       output.width = 0;
       output.height = 0;
-      equal = value === previous ? equal + 1 : 0;
-      if (equal >= 2) {
-        // local captures keep a page whose size differs from Word's page at that index
-        pageExtents[index] = capturePageExtent(
-          captureProfile,
-          index,
-          canvas.width,
-          canvas.height,
-          maxPages !== undefined
-        );
-        return value;
-      }
-      previous = value;
-    }
-    await sleep(200);
-  }
+      const painted =
+        !isUnpaintedCanvas(canvas.width, canvas.height, false) || canvasHasInk(canvas);
+      return { width: canvas.width, height: canvas.height, value, painted };
+    },
+    matches: (width, height) => extentMatches(captureProfile, index, width, height),
+    sleep,
+    now: () => Date.now(),
+  });
+  // local captures keep a page whose size differs from Word's page at that index
+  pageExtents[index] = capturePageExtent(
+    captureProfile,
+    index,
+    frame.width,
+    frame.height,
+    maxPages !== undefined
+  );
+  return frame.value;
 };
 api.oracleCaptureMetadata = () => ({
   capture_profile: captureProfile,
