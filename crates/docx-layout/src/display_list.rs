@@ -2685,6 +2685,8 @@ struct ChartAxisIn {
     #[serde(default)]
     minor_tick_mark: Option<String>,
     #[serde(default)]
+    tick_label_position: Option<String>,
+    #[serde(default)]
     major_gridlines: bool,
     #[serde(default)]
     minor_gridlines: bool,
@@ -9280,6 +9282,7 @@ fn plot_axis_from(axis: &ChartAxisIn) -> PlotAxis<'_> {
         minor_unit: axis.minor_unit,
         major_tick_mark: axis.major_tick_mark.as_deref(),
         minor_tick_mark: axis.minor_tick_mark.as_deref(),
+        tick_label_position: axis.tick_label_position.as_deref(),
         major_gridlines: axis.major_gridlines,
         minor_gridlines: axis.minor_gridlines,
         cross_between: axis.cross_between.as_deref(),
