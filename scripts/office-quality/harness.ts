@@ -5,7 +5,10 @@ import JSZip from 'jszip';
 import { createFontProvider } from '../../packages/fonts/src/cdn';
 import {
   maxDigitWidth,
+  resolveLastResortFace,
+  resolveMetricCompatFace,
   resolveScriptFallbackFace,
+  type BundledFontFace,
   type BundledFontScript,
 } from '../../packages/fonts/src/manifest';
 import { normalFontIndex } from './xlsx-styles';
@@ -37,15 +40,13 @@ async function fontsFor(bytes: Uint8Array) {
       [false, true],
       [true, true],
     ]) {
-      const load =
-        provider.resolve(family, bold, italic) ??
-        provider.resolveLastResort(family, bold, italic);
+      const named = provider.resolve(family, bold, italic);
+      const load = named ?? provider.resolveLastResort(family, bold, italic);
       const buffer = await load();
-      const face = new FontFace(family, buffer.slice(0), {
-        weight: bold ? '700' : '400',
-        style: italic ? 'italic' : 'normal',
-      });
-      document.fonts.add(await face.load());
+      const face =
+        resolveMetricCompatFace(family, bold, italic) ??
+        resolveLastResortFace(family, bold, italic);
+      await registerBrowserFace(family, face, buffer, !named);
       faces.push({ family, bold, italic, bytes: new Uint8Array(buffer) });
     }
   }
@@ -63,6 +64,38 @@ function fontProvider() {
         }
       : {}
   );
+}
+
+const registeredBrowserFaces = new Map<string, { family: string; face: FontFace; lastResort: boolean }>();
+
+/**
+ * A real face replaces every last-resort alias registered under its family, so
+ * the browser synthesizes the missing styles from it.
+ */
+async function registerBrowserFace(
+  family: string,
+  face: BundledFontFace,
+  buffer: ArrayBuffer,
+  lastResort = false
+) {
+  const key = JSON.stringify([family, face.weight, face.style]);
+  const registered = registeredBrowserFaces.get(key);
+  if (registered && !registered.lastResort) return;
+  const sameFamily = [...registeredBrowserFaces].filter(([, entry]) => entry.family === family);
+  if (lastResort && (registered || sameFamily.some(([, entry]) => !entry.lastResort))) return;
+  const fontFace = await new FontFace(family, buffer.slice(0), {
+    weight: String(face.weight),
+    style: face.style,
+  }).load();
+  if (!lastResort) {
+    for (const [aliasKey, alias] of sameFamily) {
+      if (!alias.lastResort) continue;
+      document.fonts.delete(alias.face);
+      registeredBrowserFaces.delete(aliasKey);
+    }
+  }
+  document.fonts.add(fontFace);
+  registeredBrowserFaces.set(key, { family, face: fontFace, lastResort });
 }
 
 const RTL_SCRIPTS: Array<[BundledFontScript, RegExp]> = [
@@ -120,8 +153,7 @@ async function fallbackFontsFor(bytes: Uint8Array) {
       const load = provider.resolveScriptFallback(script, bold, false);
       if (!face || !load) continue;
       const buffer = await load();
-      const fontFace = new FontFace(face.family, buffer.slice(0), { weight: bold ? '700' : '400' });
-      document.fonts.add(await fontFace.load());
+      await registerBrowserFace(face.family, face, buffer);
       faces.push({ family: face.family, bold, italic: false, bytes: new Uint8Array(buffer) });
     }
   }
