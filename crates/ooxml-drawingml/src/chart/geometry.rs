@@ -3447,30 +3447,32 @@ fn point_label(
         return Some(
             runs.iter()
                 .map(|run| match run {
-                    super::model::ChartLabelRun::Text(text) => text.clone(),
+                    super::model::ChartLabelRun::Text(text) => label_part(text),
                     super::model::ChartLabelRun::Field(field) => {
                         label_field(field, family, series, index, percent_total, number_format)
                     }
                 })
+                .flat_map(|part| part.chars().collect::<Vec<_>>())
+                .take(5 * MAX_LABEL_CHARS)
                 .collect(),
         );
     }
     if let Some(text) = point.and_then(|point| point.label) {
-        return Some(text.to_owned());
+        return Some(label_part(text));
     }
     let spec = spec_for_runs?;
     if !spec.shows_anything() {
         return None;
     }
-    let separator = spec.separator.unwrap_or(", ");
+    let separator = label_part(spec.separator.unwrap_or(", "));
     let mut parts: Vec<String> = Vec::with_capacity(4);
     if spec.show_series_name
         && let Some(name) = series.series.name
     {
-        parts.push(name.to_owned());
+        parts.push(label_part(name));
     }
     if spec.show_category_name {
-        parts.push(category_label(family.series, index));
+        parts.push(label_category(family.series, index));
     }
     let value = series.value(index);
     if spec.show_value {
@@ -3490,7 +3492,25 @@ fn point_label(
     if spec.show_bubble_size {
         parts.push(format_number(series.bubble_size(index)));
     }
-    (!parts.is_empty()).then(|| parts.join(separator))
+    (!parts.is_empty()).then(|| {
+        parts
+            .iter()
+            .map(|part| label_part(part))
+            .collect::<Vec<_>>()
+            .join(&separator)
+    })
+}
+
+fn label_part(text: &str) -> String {
+    text.chars().take(MAX_LABEL_CHARS).collect()
+}
+
+fn label_category(series: &[SeriesView<'_>], index: usize) -> String {
+    series
+        .iter()
+        .find_map(|series| series.series.categories.get(index))
+        .map(|text| label_part(text))
+        .unwrap_or_else(|| (index + 1).to_string())
 }
 
 /// What an `a:fld` inside a `c:tx` stands for, drawn from the point it labels.
@@ -3508,8 +3528,8 @@ fn label_field(
             .unwrap_or_else(|| format_number(value))
     };
     match field {
-        "SERIESNAME" => series.series.name.unwrap_or_default().to_owned(),
-        "CATEGORYNAME" => category_label(family.series, index),
+        "SERIESNAME" => label_part(series.series.name.unwrap_or_default()),
+        "CATEGORYNAME" => label_category(family.series, index),
         "VALUE" => formatted(series.value(index)),
         "PERCENTAGE" => {
             let share = if percent_total > 0.0 {
@@ -3729,14 +3749,82 @@ fn bar_label_anchor(position: &str, base: f64, end: f64, fallback: f64, gap: f64
     (base + (end - base) * fraction + direction * offset, side)
 }
 
-/// Where `c:dLblPos` puts a wedge label, as a fraction of the pie radius.
-fn pie_label_reach(position: Option<&str>) -> f64 {
-    match position {
-        Some("ctr") => 0.5,
-        Some("inEnd") => 0.8,
-        Some("outEnd") => 1.15,
-        _ => 0.62,
+/// Radius reduction from PowerPoint and Excel measurements of automatic pie labels.
+const PIE_LABEL_RADIUS_SCALE: f64 = 0.865;
+/// Inside-end rim clearance from PowerPoint and Excel measurements, in pixels.
+const PIE_LABEL_INSIDE_GAP: f64 = 10.0;
+/// Best-fit rim clearance from PowerPoint and Excel measurements, in pixels.
+const PIE_LABEL_BEST_FIT_GAP: f64 = 7.0;
+/// Outside rim clearance from PowerPoint and Excel measurements, in pixels.
+const PIE_LABEL_OUTSIDE_GAP: f64 = 4.0;
+/// Radius-dependent outside clearance from PowerPoint and Excel measurements.
+const PIE_LABEL_OUTSIDE_RADIUS_GAP: f64 = 0.04;
+
+/// Distance from a wedge's centre to its measured label box's centre.
+fn pie_label_reach(
+    position: Option<&str>,
+    r: f64,
+    inner_r: Option<f64>,
+    (half_w, half_h): (f64, f64),
+    middle: f64,
+    sweep: f64,
+) -> f64 {
+    if let Some(inner_r) = inner_r {
+        return (r + inner_r) / 2.0;
     }
+    if position == Some("ctr") {
+        return r / 2.0;
+    }
+    let (sin, cos) = middle.sin_cos();
+    let farthest = |d: f64| (d * cos.abs() + half_w).hypot(d * sin.abs() + half_h);
+    let nearest = |d: f64| {
+        (d * cos.abs() - half_w)
+            .max(0.0)
+            .hypot((d * sin.abs() - half_h).max(0.0))
+    };
+    let gap = if position == Some("inEnd") {
+        PIE_LABEL_INSIDE_GAP
+    } else {
+        PIE_LABEL_BEST_FIT_GAP
+    };
+    let target = (r - gap).max(0.0);
+    let mut low = 0.0;
+    let mut high = r;
+    for _ in 0..64 {
+        let d = (low + high) / 2.0;
+        if farthest(d) > target {
+            high = d;
+        } else {
+            low = d;
+        }
+    }
+    let inside = (low + high) / 2.0;
+    let whole = sweep >= std::f64::consts::TAU - 1e-9;
+    let clear_of_centre = inside * cos.abs() > half_w || inside * sin.abs() > half_h;
+    let fits = farthest(inside) <= target + 0.5
+        && (whole
+            || (clear_of_centre
+                && [-half_w, half_w].into_iter().all(|dx| {
+                    [-half_h, half_h].into_iter().all(|dy| {
+                        let angle = (inside * sin + dy).atan2(inside * cos + dx) - middle;
+                        angle.sin().atan2(angle.cos()).abs() <= sweep / 2.0
+                    })
+                })));
+    if position == Some("inEnd") || (position != Some("outEnd") && fits) {
+        return inside;
+    }
+    let target = r + PIE_LABEL_OUTSIDE_GAP + PIE_LABEL_OUTSIDE_RADIUS_GAP * r;
+    low = 0.0;
+    high = target + half_w + half_h;
+    for _ in 0..64 {
+        let d = (low + high) / 2.0;
+        if nearest(d) < target {
+            low = d;
+        } else {
+            high = d;
+        }
+    }
+    (low + high) / 2.0
 }
 
 /// Where one category's bars sit inside its slot, from `c:gapWidth` and
@@ -4992,12 +5080,24 @@ fn emit_pie<S: PlotSink + ?Sized>(
         .take(available)
         .map(|(_, value)| value)
         .sum();
-    if total <= 0.0 {
+    if total <= 0.0 || !total.is_finite() {
         return;
     }
-    // The plot rect already excludes the legend and the title, so the pie is
-    // centred in what is left and drawn as large as the labels allow.
-    let r = (width.min(height) * 0.45).max(10.0_f64.min(width.min(height) / 2.0).max(0.0));
+    let wedges: Vec<_> = (0..scanned)
+        .map(|index| (index, series.value(index)))
+        .filter(|(_, value)| *value > 0.0 && value.is_finite())
+        .take(available)
+        .collect();
+    let automatic_labels = wedges.iter().any(|(index, _)| {
+        matches!(
+            point_label_spec(series, *index).and_then(|labels| labels.position),
+            None | Some("bestFit") | Some("outEnd")
+        ) && point_label(family, series, *index, total).is_some_and(|text| !text.trim().is_empty())
+    });
+    let mut r = (width.min(height) * 0.45).max(10.0_f64.min(width.min(height) / 2.0).max(0.0));
+    if automatic_labels {
+        r *= PIE_LABEL_RADIUS_SCALE;
+    }
     let cx = x + width / 2.0;
     let cy = y + height / 2.0;
     let group = family.group;
@@ -5019,11 +5119,7 @@ fn emit_pie<S: PlotSink + ?Sized>(
             .rem_euclid(360.0)
             .to_radians();
     let mut angle = start;
-    for (index, value) in (0..scanned)
-        .map(|index| (index, series.value(index)))
-        .filter(|(_, value)| *value > 0.0 && value.is_finite())
-        .take(available)
-    {
+    for (index, value) in wedges {
         let sweep = (value / total) * std::f64::consts::TAU;
         let middle = angle + sweep / 2.0;
         let offset = r * series.explosion(index) / 100.0;
@@ -5043,20 +5139,52 @@ fn emit_pie<S: PlotSink + ?Sized>(
                 width: 1.0,
             }),
         });
-        let reach =
-            r * pie_label_reach(point_label_spec(series, index).and_then(|labels| labels.position));
-        push_point_label(
-            ops,
-            family,
-            series,
-            index,
-            index,
-            ox + reach * middle.cos(),
-            oy + reach * middle.sin(),
-            48.0,
-            total,
-            TextAnchor::Start,
-        );
+        if let Some(text) = point_label(family, series, index, total) {
+            let spec = point_label_spec(series, index);
+            let style = family.scoped(spec.map(|labels| labels.text).unwrap_or_default());
+            let lines: Vec<String> = text
+                .split('\n')
+                .map(|line| line.trim().chars().take(MAX_LABEL_CHARS).collect())
+                .collect();
+            let mut label_width = 1.0_f64;
+            for line in &lines {
+                if ops.exhausted() {
+                    break;
+                }
+                label_width = label_width.max(text_width(line, &style, ops));
+            }
+            let step = style.font.size_px * 1.2;
+            let label_height = style.font.size_px * 1.22 + step * (lines.len() - 1) as f64;
+            let key_width = if spec.is_some_and(|labels| labels.show_legend_key) {
+                10.0
+            } else {
+                0.0
+            };
+            let box_width = label_width + key_width;
+            let reach = pie_label_reach(
+                spec.and_then(|labels| labels.position),
+                r,
+                (family.chart_type == "doughnut").then_some(inner_r),
+                (box_width / 2.0, label_height / 2.0),
+                middle,
+                sweep,
+            );
+            let left = ox + reach * middle.cos() - box_width / 2.0 + key_width;
+            let baseline = oy + reach * middle.sin() + style.font.size_px * 0.34;
+            push_legend_key(ops, series, index, index, left, baseline);
+            let top = baseline - step * (lines.len() - 1) as f64 / 2.0;
+            for (line, text) in lines.iter().enumerate() {
+                push_text_aligned(
+                    ops,
+                    text,
+                    left,
+                    top + step * line as f64,
+                    label_width,
+                    &style,
+                    TextAnchor::Center,
+                );
+            }
+        }
         angle += sweep;
     }
 }
@@ -8517,6 +8645,390 @@ mod tests {
         };
         assert!(inner(Some(20.0)) < inner(None));
         assert!(inner(None) < inner(Some(80.0)));
+    }
+
+    fn pie_label_geometry(
+        values: &[f64],
+        position: Option<&str>,
+        hole: Option<f64>,
+        angle: f64,
+        labelled: bool,
+    ) -> (f64, Vec<(f64, f64, f64, f64)>) {
+        let data = source(values);
+        let mut series = series("Share", &data);
+        if labelled {
+            series.labels = Some(PlotDataLabels {
+                show_value: true,
+                position,
+                text: PlotTextStyle {
+                    size_pt: Some(10.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        let kind = if hole.is_some() { "doughnut" } else { "pie" };
+        let mut group = group(kind, vec![series]);
+        group.hole_size = hole;
+        group.first_slice_angle = Some(angle);
+        let mut chart = grouped(kind, group);
+        chart.legend = Some(PlotLegend {
+            visible: Some(false),
+            ..Default::default()
+        });
+        let mut sink = AxisLabelSink {
+            ops: Vec::new(),
+            end_aligned: Vec::new(),
+            measured: true,
+        };
+        plot_chart_into(
+            &chart,
+            PlotRect {
+                w: 240.0,
+                h: 240.0,
+                ..rect()
+            },
+            &mut sink,
+        );
+        let (cx, cy, radius) = sink
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                PlotOp::Path { x, y, w, h, .. } => Some((x + w / 2.0, y + h / 2.0, w / 2.0)),
+                _ => None,
+            })
+            .expect("a wedge");
+        let boxes = sink
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                PlotOp::Text {
+                    text,
+                    x,
+                    baseline_y,
+                    width,
+                    font,
+                    align,
+                    ..
+                } => {
+                    assert_eq!(*align, PlotTextAlign::Center);
+                    let advance = text.chars().count() as f64 * 0.8 * font.size_px;
+                    let left = x + (width - advance) / 2.0;
+                    let top = baseline_y - 0.95 * font.size_px;
+                    let bottom = baseline_y + 0.27 * font.size_px;
+                    Some((
+                        left + advance / 2.0 - cx,
+                        (top + bottom) / 2.0 - cy,
+                        advance / 2.0,
+                        (bottom - top) / 2.0,
+                    ))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(boxes.len(), if labelled { values.len() } else { 0 });
+        (radius, boxes)
+    }
+
+    fn pie_label_distances((x, y, half_w, half_h): (f64, f64, f64, f64)) -> (f64, f64) {
+        (
+            ((x.abs() - half_w).max(0.0)).hypot((y.abs() - half_h).max(0.0)),
+            (x.abs() + half_w).hypot(y.abs() + half_h),
+        )
+    }
+
+    #[test]
+    fn pie_labels_bound_long_series_names_before_drawing() {
+        let name = "界".repeat(10_000);
+        let data = source(&vec![1.0; 2_000]);
+        let mut labelled = series(&name, &data);
+        labelled.labels = Some(PlotDataLabels {
+            show_series_name: true,
+            show_value: true,
+            ..Default::default()
+        });
+        let mut chart = grouped("pie", group("pie", vec![labelled]));
+        chart.legend = Some(PlotLegend {
+            visible: Some(false),
+            ..Default::default()
+        });
+        let views = series_views(&chart.plot_groups[0].series, &mut ScanBudget::new());
+        let style = PlotTextStyle::default().resolve(CHART_LABEL_SIZE_PX, 400);
+        let family = family(&chart, &views, &style);
+        let text = point_label(family, &views[0], 0, 2_000.0).expect("a label");
+        assert!(text.chars().count() <= 4 * MAX_LABEL_CHARS);
+        assert!(text.ends_with(", 1"));
+        let ops = plot_chart(&chart, rect());
+        let labels: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match op {
+                PlotOp::Text { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 2_000);
+        for text in labels {
+            assert!(
+                text.lines()
+                    .all(|line| line.chars().count() <= MAX_LABEL_CHARS)
+            );
+        }
+    }
+
+    #[test]
+    fn a_pie_shrinks_for_its_labels_only_when_they_draw() {
+        let data = source(&[3.0, 1.0]);
+        let radius = |plotted: PlotSeries<'_>| {
+            let mut chart = grouped("pie", group("pie", vec![plotted]));
+            chart.legend = Some(PlotLegend {
+                visible: Some(false),
+                ..Default::default()
+            });
+            plot_chart(&chart, rect())
+                .iter()
+                .find_map(|op| match op {
+                    PlotOp::Path { w, .. } => Some(w / 2.0),
+                    _ => None,
+                })
+                .expect("a wedge")
+        };
+        let plain = radius(series("Share", &data));
+        let mut literal = series("Share", &data);
+        literal.points = vec![PlotPoint {
+            index: Some(0),
+            label: Some("Slice A"),
+            ..PlotPoint::default()
+        }];
+        assert!((radius(literal) - plain * PIE_LABEL_RADIUS_SCALE).abs() < 0.01);
+        let mut nameless = series("Share", &data);
+        nameless.name = None;
+        nameless.labels = Some(PlotDataLabels {
+            show_series_name: true,
+            ..PlotDataLabels::default()
+        });
+        assert!((radius(nameless) - plain).abs() < 0.01);
+    }
+
+    #[test]
+    fn pie_label_legend_keys_obey_inside_and_outside_clearances() {
+        let data = source(&[1.0; 4]);
+        for position in ["outEnd", "inEnd"] {
+            for angle in [0.0, 45.0] {
+                let mut labelled = series("Share", &data);
+                labelled.labels = Some(PlotDataLabels {
+                    show_value: true,
+                    show_legend_key: true,
+                    position: Some(position),
+                    text: PlotTextStyle {
+                        size_pt: Some(10.0),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+                let mut group = group("pie", vec![labelled]);
+                group.first_slice_angle = Some(angle);
+                let mut chart = grouped("pie", group);
+                chart.legend = Some(PlotLegend {
+                    visible: Some(false),
+                    ..Default::default()
+                });
+                let mut sink = AxisLabelSink {
+                    ops: Vec::new(),
+                    end_aligned: Vec::new(),
+                    measured: true,
+                };
+                plot_chart_into(
+                    &chart,
+                    PlotRect {
+                        w: 240.0,
+                        h: 240.0,
+                        ..rect()
+                    },
+                    &mut sink,
+                );
+                let (cx, cy, r) = sink
+                    .ops
+                    .iter()
+                    .find_map(|op| match op {
+                        PlotOp::Path { x, y, w, h, .. } => {
+                            Some((x + w / 2.0, y + h / 2.0, w / 2.0))
+                        }
+                        _ => None,
+                    })
+                    .expect("a wedge");
+                let keys: Vec<_> = sink
+                    .ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        PlotOp::Rect { x, y, w, h, .. } if *w == 7.0 && *h == 7.0 => {
+                            Some((x + w / 2.0 - cx, y + h / 2.0 - cy, w / 2.0, h / 2.0))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(keys.len(), 4);
+                for key in keys {
+                    let (nearest, farthest) = pie_label_distances(key);
+                    if position == "outEnd" {
+                        assert!(nearest >= r + 4.0 + 0.04 * r - 2.0);
+                    } else {
+                        assert!(farthest <= r - 10.0 + 2.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pie_label_box_obeys_its_position_at_cardinal_and_diagonal_angles() {
+        for angle in [0.0, 45.0] {
+            for position in [
+                Some("ctr"),
+                Some("inEnd"),
+                Some("bestFit"),
+                None,
+                Some("outEnd"),
+            ] {
+                let (r, boxes) = pie_label_geometry(&[1.0; 4], position, None, angle, true);
+                for box_ in boxes {
+                    let (nearest, farthest) = pie_label_distances(box_);
+                    let (actual, expected) = match position {
+                        Some("ctr") => (box_.0.hypot(box_.1), r * 0.5),
+                        Some("inEnd") => (farthest, r - 10.0),
+                        Some("outEnd") => (nearest, r + 4.0 + 0.04 * r),
+                        _ => (farthest, r - 7.0),
+                    };
+                    assert!(
+                        (actual - expected).abs() < 2.0,
+                        "{position:?}, {angle}: {actual} vs {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_best_fit_label_too_big_for_a_large_slice_goes_outside() {
+        let data = source(&[55.0, 45.0]);
+        let mut labelled = series("Share", &data);
+        labelled.labels = Some(PlotDataLabels {
+            show_value: true,
+            position: Some("bestFit"),
+            ..Default::default()
+        });
+        let mut chart = grouped("pie", group("pie", vec![labelled]));
+        chart.legend = Some(PlotLegend {
+            visible: Some(false),
+            ..Default::default()
+        });
+        let ops = plot_chart(
+            &chart,
+            PlotRect {
+                w: 40.0,
+                h: 40.0,
+                ..rect()
+            },
+        );
+        let (cx, cy, r) = ops
+            .iter()
+            .find_map(|op| match op {
+                PlotOp::Path { x, y, w, h, .. } => Some((x + w / 2.0, y + h / 2.0, w / 2.0)),
+                _ => None,
+            })
+            .expect("a wedge");
+        let centres: Vec<(f64, f64)> = ops
+            .iter()
+            .filter_map(|op| match op {
+                PlotOp::Text {
+                    x,
+                    width,
+                    baseline_y,
+                    font,
+                    ..
+                } => Some((x + width / 2.0 - cx, baseline_y - 0.34 * font.size_px - cy)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(centres.len(), 2);
+        for (dx, dy) in centres {
+            assert!(
+                dx.hypot(dy) > r,
+                "label centre {dx}, {dy} inside radius {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pie_label_on_a_doughnut_stays_in_the_middle_of_the_ring() {
+        for hole in [50.0, 75.0] {
+            for position in [
+                Some("ctr"),
+                Some("inEnd"),
+                Some("bestFit"),
+                None,
+                Some("outEnd"),
+            ] {
+                let (r, boxes) = pie_label_geometry(&[1.0; 4], position, Some(hole), 0.0, true);
+                for (x, y, ..) in boxes {
+                    assert!((x.hypot(y) - r * (1.0 + hole / 100.0) / 2.0).abs() < 2.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pie_label_with_best_fit_moves_outside_a_small_slice() {
+        let (r, boxes) = pie_label_geometry(
+            &[60.0, 25.0, 10.0, 3.0, 2.0],
+            Some("bestFit"),
+            None,
+            0.0,
+            true,
+        );
+        assert!((r - 90.0).abs() < 10.0, "{r}");
+        for (index, box_) in boxes.into_iter().enumerate() {
+            let (nearest, farthest) = pie_label_distances(box_);
+            if index >= 3 {
+                assert!(nearest > r, "slice {index}");
+            } else {
+                assert!(farthest < r, "slice {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pie_label_with_automatic_or_outside_position_reduces_the_radius() {
+        let values = [60.0, 25.0, 10.0, 3.0, 2.0];
+        let (inside, _) = pie_label_geometry(&values, Some("inEnd"), None, 0.0, true);
+        let (bare, _) = pie_label_geometry(&values, None, None, 0.0, false);
+        assert!((inside - bare).abs() < 0.5);
+        for position in [Some("bestFit"), Some("outEnd"), None] {
+            let (r, _) = pie_label_geometry(&values, position, None, 0.0, true);
+            assert!((r - 0.865 * inside).abs() < 0.5);
+        }
+    }
+
+    #[test]
+    fn a_pie_label_box_centre_lies_on_its_slice_bisector() {
+        let values = [60.0, 25.0, 10.0, 3.0, 2.0];
+        for rotation in [0.0, 45.0] {
+            for position in [
+                Some("ctr"),
+                Some("inEnd"),
+                Some("bestFit"),
+                None,
+                Some("outEnd"),
+            ] {
+                let (_, boxes) = pie_label_geometry(&values, position, None, rotation, true);
+                let mut angle = -std::f64::consts::FRAC_PI_2 + rotation.to_radians();
+                for (value, (x, y, ..)) in values.into_iter().zip(boxes) {
+                    let sweep = value / 100.0 * std::f64::consts::TAU;
+                    let middle = angle + sweep / 2.0;
+                    assert!((x * middle.sin() - y * middle.cos()).abs() < 1.0);
+                    angle += sweep;
+                }
+            }
+        }
     }
 
     #[test]
