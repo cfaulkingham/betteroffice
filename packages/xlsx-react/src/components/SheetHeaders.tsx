@@ -5,7 +5,7 @@ import {
   type PointerEvent,
 } from 'react';
 import { createPortal } from 'react-dom';
-import type { GridMeta, Selection } from '@betteroffice/xlsx';
+import { normalizeRange, type GridMeta, type Selection } from '@betteroffice/xlsx';
 import { TrackMenu, trackLimit, type TrackAction, type TrackTarget } from './TrackMenu';
 
 export type TrackAxis = 'row' | 'column';
@@ -92,9 +92,9 @@ export function SheetHeaders({
   const closeMenu = () => { setMenu(null); onFocusGrid(); };
   const openMenu = (axis: TrackAxis, index: number, left: number, top: number) => {
     if (readOnly || !onBegin()) return;
-    const key = axis === 'row' ? 'row' : 'col';
-    const first = selection ? Math.min(selection.anchor[key], selection.focus[key]) : index;
-    const last = selection ? Math.max(selection.anchor[key], selection.focus[key]) : index;
+    const range = selection ? normalizeRange(selection) : null;
+    const first = range ? (axis === 'row' ? range.top : range.left) : index;
+    const last = range ? (axis === 'row' ? range.bottom : range.right) : index;
     const at = index >= first && index <= last ? first : index;
     const count = index >= first && index <= last ? last - first + 1 : 1;
     const from = Math.max(0, at - 1);
@@ -167,18 +167,9 @@ export function SheetHeaders({
     const offsets = isRow ? grid.rowOffsets : grid.colOffsets;
     const indices = isRow ? grid.rowIndices : grid.colIndices;
     const start = isRow ? grid.startRow : grid.startCol;
-    const selectedStart = selection
-      ? Math.min(
-          selection.anchor[isRow ? 'row' : 'col'],
-          selection.focus[isRow ? 'row' : 'col']
-        )
-      : -1;
-    const selectedEnd = selection
-      ? Math.max(
-          selection.anchor[isRow ? 'row' : 'col'],
-          selection.focus[isRow ? 'row' : 'col']
-        )
-      : -1;
+    const selectedRange = selection ? normalizeRange(selection) : null;
+    const selectedStart = selectedRange ? (isRow ? selectedRange.top : selectedRange.left) : -1;
+    const selectedEnd = selectedRange ? (isRow ? selectedRange.bottom : selectedRange.right) : -1;
     return (
       <div
         data-testid={`xlsx-${axis}-headers`}

@@ -138,8 +138,14 @@ export interface XlsxInThreadEditorProps extends XlsxEditorPluginProps, XlsxHost
   onSave?: (bytes: Uint8Array) => void;
   /** Return true for built-in saving; false or void handles/cancels the request. */
   onSaveRequest?: () => boolean | void | Promise<boolean | void>;
-  /** Called after a user edit changes the workbook. */
+  /** Called when a user draft or committed edit changes. */
   onChange?: () => void;
+  /** Host clipboard adapter for native webviews. */
+  clipboard?: { readText: () => Promise<string>; writeText: (text: string) => Promise<void> };
+  /** Host print action. */
+  onPrint?: () => void;
+  /** Save a rendered viewport through the host application. */
+  onExportPng?: (bytes: Uint8Array, name: string) => void | Promise<void>;
   /** Open a network-ready Yrs replica and repaint when peer updates arrive. */
   collaboration?: XlsxEditorCollaborationOptions;
   i18n?: Translations;

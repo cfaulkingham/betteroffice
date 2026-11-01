@@ -1335,6 +1335,139 @@ describe('XlsxEditor pending host edits', () => {
   });
 });
 
+async function mountTracks(readOnly = false, hidden = false) {
+  const seed = openWorkbook(plain.bytes);
+  let bytes: Uint8Array;
+  try {
+    seed.editCells(0, [
+      { row: 0, col: 0, input: '10' },
+      { row: 1, col: 0, input: '20' },
+      { row: 2, col: 0, input: '30' },
+      { row: 0, col: 1, input: '=SUM(A1:A3)' },
+      { row: 1, col: 1, input: 'middle' },
+      { row: 1, col: 2, input: 'right' },
+    ]);
+    if (hidden) seed.applyOps([
+      { type: 'setRowHeight', sheet: 0, row: 1, height: 0 },
+      { type: 'setColWidth', sheet: 0, col: 1, width: 0 },
+    ]);
+    bytes = seed.save();
+  } finally { seed.dispose(); }
+  let api: XlsxEditorApi | null = null;
+  const changes: number[] = [];
+  const view = render(<XlsxEditor legacySyncApi experimentalWorkerOpen={false} file={bytes} readOnly={readOnly}
+    onReady={(ready) => { api = ready; }} onChange={() => changes.push(1)} />);
+  await waitFor(() => expect(api).not.toBeNull());
+  await waitFor(() => expect(view.queryByTestId('xlsx-row-header-0')).not.toBeNull());
+  return { ...view, api: () => api!, changes };
+}
+
+describe('XlsxEditor row and column actions', () => {
+  for (const axis of ['row', 'column'] as const) {
+    it(`inserts and deletes a ${axis}, commits drafts, shifts formulas, and preserves undo and saved data`, async () => {
+      const view = await mountTracks();
+      const cell = (row: number, col: number) => view.api().handle.cell(0, row, col).input;
+      fireEvent.change(view.getByTestId('xlsx-formula-input'), { target: { value: '15' } });
+      fireEvent.contextMenu(view.getByTestId(`xlsx-${axis}-header-0`), { clientX: 100, clientY: 100 });
+      fireEvent.click(view.getByRole('menuitem', { name: axis === 'row' ? 'Insert row above' : 'Insert column left' }));
+      await waitFor(() => expect(cell(axis === 'row' ? 1 : 0, axis === 'row' ? 0 : 1)).toBe('15'));
+      expect(cell(axis === 'row' ? 1 : 0, axis === 'row' ? 1 : 2)).toBe(
+        axis === 'row' ? '=SUM(A2:A4)' : '=SUM(B1:B3)'
+      );
+      expect(view.changes.length).toBeGreaterThan(1);
+      fireEvent.click(view.getByTestId('xlsx-undo'));
+      expect(cell(0, 0)).toBe('15');
+      fireEvent.click(view.getByTestId('xlsx-redo'));
+      expect(cell(axis === 'row' ? 1 : 0, axis === 'row' ? 0 : 1)).toBe('15');
+      fireEvent.contextMenu(view.getByTestId(`xlsx-${axis}-header-0`));
+      fireEvent.click(view.getByRole('menuitem', { name: `Delete ${axis}` }));
+      expect(cell(0, 0)).toBe('15');
+      expect(cell(0, 1)).toBe('=SUM(A1:A3)');
+      fireEvent.contextMenu(view.getByTestId(`xlsx-${axis}-header-1`));
+      fireEvent.click(view.getByRole('menuitem', { name: `Delete ${axis}` }));
+      expect(cell(axis === 'row' ? 1 : 0, axis === 'row' ? 0 : 1)).not.toBe(axis === 'row' ? '20' : '=SUM(A1:A3)');
+      fireEvent.click(view.getByTestId('xlsx-undo'));
+      expect(cell(1, 0)).toBe('20');
+      expect(cell(0, 1)).toBe('=SUM(A1:A3)');
+      let saved!: Uint8Array;
+      await act(async () => { saved = view.api().save(); });
+      const reopened = openWorkbook(saved);
+      try {
+        expect(reopened.cell(0, 0, 0).input).toBe('15');
+        expect(reopened.cell(0, 1, 0).input).toBe('20');
+        expect(reopened.cell(0, 0, 1).input).toBe('=SUM(A1:A3)');
+      } finally { reopened.dispose(); }
+    });
+
+    it(`inserts after and deletes a selected range of ${axis}s as one undo step`, async () => {
+      const view = await mountTracks();
+      const range = axis === 'row'
+        ? { anchor: { row: 0, col: 0 }, focus: { row: 1, col: 0 } }
+        : { anchor: { row: 0, col: 0 }, focus: { row: 0, col: 1 } };
+      await act(async () => { view.api().selectCells(0, range); });
+      fireEvent.contextMenu(view.getByTestId(`xlsx-${axis}-header-1`));
+      fireEvent.click(view.getByRole('menuitem', { name: axis === 'row' ? 'Insert 2 rows below' : 'Insert 2 columns right' }));
+      const shifted = axis === 'row' ? { row: 4, col: 0 } : { row: 1, col: 4 };
+      const original = axis === 'row' ? { row: 2, col: 0 } : { row: 1, col: 2 };
+      const value = axis === 'row' ? '30' : 'right';
+      expect(view.api().handle.cell(0, shifted.row, shifted.col).input).toBe(value);
+      fireEvent.click(view.getByTestId('xlsx-undo'));
+      expect(view.api().handle.cell(0, original.row, original.col).input).toBe(value);
+      fireEvent.click(view.getByTestId('xlsx-redo'));
+      const inserted = axis === 'row'
+        ? { anchor: { row: 2, col: 0 }, focus: { row: 3, col: 0 } }
+        : { anchor: { row: 0, col: 2 }, focus: { row: 0, col: 3 } };
+      await act(async () => { view.api().selectCells(0, inserted); });
+      fireEvent.contextMenu(view.getByTestId(`xlsx-${axis}-header-2`));
+      fireEvent.click(view.getByRole('menuitem', { name: `Delete 2 ${axis}s` }));
+      expect(view.api().handle.cell(0, original.row, original.col).input).toBe(value);
+    });
+
+    it(`unhides an adjacent ${axis} and restores its visibility with undo and save`, async () => {
+      const view = await mountTracks(false, true);
+      expect(view.queryByTestId(`xlsx-${axis}-header-1`)).toBeNull();
+      fireEvent.contextMenu(view.getByTestId(`xlsx-${axis}-header-0`));
+      fireEvent.click(view.getByRole('menuitem', { name: `Unhide ${axis}s` }));
+      await waitFor(() => expect(view.queryByTestId(`xlsx-${axis}-header-1`)).not.toBeNull());
+      expect(view.api().handle.cell(0, 1, 0).input).toBe('20');
+      expect(view.api().handle.cell(0, 0, 1).input).toBe('=SUM(A1:A3)');
+      fireEvent.click(view.getByTestId('xlsx-undo'));
+      await waitFor(() => expect(view.queryByTestId(`xlsx-${axis}-header-1`)).toBeNull());
+      fireEvent.click(view.getByTestId('xlsx-redo'));
+      let saved!: Uint8Array;
+      await act(async () => { saved = view.api().save(); });
+      const reopened = openWorkbook(saved);
+      try {
+        const size = reopened.cellPosition(0, axis === 'row' ? 1 : 0, axis === 'row' ? 0 : 1);
+        expect(axis === 'row' ? size.height : size.width).toBeGreaterThan(0);
+      } finally { reopened.dispose(); }
+    });
+  }
+
+  it('opens header actions from the keyboard and dismisses them without modifying the workbook', async () => {
+    const view = await mountTracks();
+    fireEvent.keyDown(view.getByTestId('xlsx-row-header-0'), { key: 'F10', shiftKey: true });
+    const first = view.getByRole('menuitem', { name: 'Insert row above' });
+    expect(document.activeElement).toBe(first);
+    fireEvent.keyDown(first, { key: 'ArrowDown' });
+    expect(document.activeElement).toBe(view.getByRole('menuitem', { name: 'Insert row below' }));
+    fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
+    expect(view.queryByRole('menu')).toBeNull();
+    expect(document.activeElement).toBe(view.getByTestId('xlsx-scroll'));
+    expect(view.api().handle.historyState().canUndo).toBe(false);
+    expect(view.changes).toHaveLength(0);
+  });
+
+  it('exposes no row or column mutation menu in viewing mode', async () => {
+    const view = await mountTracks(true);
+    for (const axis of ['row', 'column']) {
+      fireEvent.contextMenu(view.getByTestId(`xlsx-${axis}-header-0`));
+      expect(view.queryByRole('menu')).toBeNull();
+    }
+    expect(view.api().handle.historyState().canUndo).toBe(false);
+  });
+});
+
 describe('XlsxEditor commands', () => {
   const MOD = isMacPlatform() ? { metaKey: true } : { ctrlKey: true };
   const target = { row: 2, col: 0 };
@@ -1399,7 +1532,8 @@ describe('XlsxEditor commands', () => {
     expect(await editor.execute('bold', null)).toEqual({ ok: true, status: 'executed' });
     await waitFor(() => expect(commands.getState('bold').active).toBe(true));
     expect(editor.api().handle.selectionFormatting(0, 'A3:A3').bold).toBe(true);
-    expect(failure(await editor.execute('searchMenus', null))).toBe('unsupported-command');
+    expect(await editor.execute('searchMenus', null)).toEqual({ ok: true, status: 'executed' });
+    expect(editor.view.getByRole('dialog', { name: 'Search menus' })).toBeDefined();
     expect(commands.getState('exportPng').enabled).toBe(isPngExportAvailable());
   });
 
@@ -1411,7 +1545,7 @@ describe('XlsxEditor commands', () => {
     expect(editor.view.queryByTestId('xlsx-cell-editor')).toBeNull();
     expect(editor.api().handle.selectionFormatting(0, 'A3:A3').bold).toBe(true);
     fireEvent.blur(input);
-    expect(editor.changes()).toBe(2);
+    expect(editor.changes()).toBe(3);
     expect((editor.view.getByTestId('xlsx-name-box') as HTMLInputElement).value).toBe('A3');
   });
 
@@ -2769,7 +2903,7 @@ describe('XlsxEditor edit batches', () => {
     };
   }
 
-  it('commits drafts first, applies against the caller version and notifies once', async () => {
+  it('commits drafts first, applies against the caller version and notifies drafts and committed changes', async () => {
     let changes = 0;
     const { view, api } = await mountApi({ onChange: () => changes++ });
     const target = { row: 2, col: 1 };
@@ -2785,16 +2919,16 @@ describe('XlsxEditor edit batches', () => {
     const version = await settled(() => api.version());
     expect(api.handle.cell(0, 2, 1).input).toBe('321');
     expect(version).not.toBe(beforeDraft);
-    expect(changes).toBe(1);
+    expect(changes).toBe(2);
 
     const stale = await settled(() => api.applyEdits(setB3(beforeDraft, '999')));
     expect(stale.ok).toBe(false);
     if (!stale.ok) expect(stale.failure.code).toBe('stale-version');
-    expect(changes).toBe(1);
+    expect(changes).toBe(2);
 
     const result = await settled(() => api.applyEdits(setB3(version, '4242')));
     expect(result.ok && result.applied).toBe(true);
-    expect(changes).toBe(2);
+    expect(changes).toBe(3);
     await waitFor(() =>
       expect((view.getByTestId('xlsx-formula-input') as HTMLInputElement).value).toBe('4242')
     );
@@ -3496,137 +3630,4 @@ it('async host save calls the latest onSave once without a request or download',
     expect(latest[0]).toBe(bytes);
     expect(click).not.toHaveBeenCalled();
   } finally { click.mockRestore(); }
-});
-
-async function mountTracks(readOnly = false, hidden = false) {
-  const seed = openWorkbook(plain.bytes);
-  let bytes: Uint8Array;
-  try {
-    seed.editCells(0, [
-      { row: 0, col: 0, input: '10' },
-      { row: 1, col: 0, input: '20' },
-      { row: 2, col: 0, input: '30' },
-      { row: 0, col: 1, input: '=SUM(A1:A3)' },
-      { row: 1, col: 1, input: 'middle' },
-      { row: 1, col: 2, input: 'right' },
-    ]);
-    if (hidden) seed.applyOps([
-      { type: 'setRowHeight', sheet: 0, row: 1, height: 0 },
-      { type: 'setColWidth', sheet: 0, col: 1, width: 0 },
-    ]);
-    bytes = seed.save();
-  } finally { seed.dispose(); }
-  let api: XlsxEditorApi | null = null;
-  const changes: number[] = [];
-  const view = render(<XlsxEditor file={bytes} readOnly={readOnly}
-    onReady={(ready) => { api = ready; }} onChange={() => changes.push(1)} />);
-  await waitFor(() => expect(api).not.toBeNull());
-  await waitFor(() => expect(view.queryByTestId('xlsx-row-header-0')).not.toBeNull());
-  return { ...view, api: () => api!, changes };
-}
-
-describe('XlsxEditor row and column actions', () => {
-  for (const axis of ['row', 'column'] as const) {
-    it(`inserts and deletes a ${axis}, commits drafts, shifts formulas, and preserves undo and saved data`, async () => {
-      const view = await mountTracks();
-      const cell = (row: number, col: number) => view.api().handle.cell(0, row, col).input;
-      fireEvent.change(view.getByTestId('xlsx-formula-input'), { target: { value: '15' } });
-      fireEvent.contextMenu(view.getByTestId(`xlsx-${axis}-header-0`), { clientX: 100, clientY: 100 });
-      fireEvent.click(view.getByRole('menuitem', { name: axis === 'row' ? 'Insert row above' : 'Insert column left' }));
-      await waitFor(() => expect(cell(axis === 'row' ? 1 : 0, axis === 'row' ? 0 : 1)).toBe('15'));
-      expect(cell(axis === 'row' ? 1 : 0, axis === 'row' ? 1 : 2)).toBe(
-        axis === 'row' ? '=SUM(A2:A4)' : '=SUM(B1:B3)'
-      );
-      expect(view.changes.length).toBeGreaterThan(1);
-      fireEvent.click(view.getByTestId('xlsx-undo'));
-      expect(cell(0, 0)).toBe('15');
-      fireEvent.click(view.getByTestId('xlsx-redo'));
-      expect(cell(axis === 'row' ? 1 : 0, axis === 'row' ? 0 : 1)).toBe('15');
-      fireEvent.contextMenu(view.getByTestId(`xlsx-${axis}-header-0`));
-      fireEvent.click(view.getByRole('menuitem', { name: `Delete ${axis}` }));
-      expect(cell(0, 0)).toBe('15');
-      expect(cell(0, 1)).toBe('=SUM(A1:A3)');
-      fireEvent.contextMenu(view.getByTestId(`xlsx-${axis}-header-1`));
-      fireEvent.click(view.getByRole('menuitem', { name: `Delete ${axis}` }));
-      expect(cell(axis === 'row' ? 1 : 0, axis === 'row' ? 0 : 1)).not.toBe(axis === 'row' ? '20' : '=SUM(A1:A3)');
-      fireEvent.click(view.getByTestId('xlsx-undo'));
-      expect(cell(1, 0)).toBe('20');
-      expect(cell(0, 1)).toBe('=SUM(A1:A3)');
-      let saved!: Uint8Array;
-      await act(async () => { saved = view.api().save(); });
-      const reopened = openWorkbook(saved);
-      try {
-        expect(reopened.cell(0, 0, 0).input).toBe('15');
-        expect(reopened.cell(0, 1, 0).input).toBe('20');
-        expect(reopened.cell(0, 0, 1).input).toBe('=SUM(A1:A3)');
-      } finally { reopened.dispose(); }
-    });
-
-    it(`inserts after and deletes a selected range of ${axis}s as one undo step`, async () => {
-      const view = await mountTracks();
-      const range = axis === 'row'
-        ? { anchor: { row: 0, col: 0 }, focus: { row: 1, col: 0 } }
-        : { anchor: { row: 0, col: 0 }, focus: { row: 0, col: 1 } };
-      await act(async () => { view.api().selectCells(0, range); });
-      fireEvent.contextMenu(view.getByTestId(`xlsx-${axis}-header-1`));
-      fireEvent.click(view.getByRole('menuitem', { name: axis === 'row' ? 'Insert 2 rows below' : 'Insert 2 columns right' }));
-      const shifted = axis === 'row' ? { row: 4, col: 0 } : { row: 1, col: 4 };
-      const original = axis === 'row' ? { row: 2, col: 0 } : { row: 1, col: 2 };
-      const value = axis === 'row' ? '30' : 'right';
-      expect(view.api().handle.cell(0, shifted.row, shifted.col).input).toBe(value);
-      fireEvent.click(view.getByTestId('xlsx-undo'));
-      expect(view.api().handle.cell(0, original.row, original.col).input).toBe(value);
-      fireEvent.click(view.getByTestId('xlsx-redo'));
-      const inserted = axis === 'row'
-        ? { anchor: { row: 2, col: 0 }, focus: { row: 3, col: 0 } }
-        : { anchor: { row: 0, col: 2 }, focus: { row: 0, col: 3 } };
-      await act(async () => { view.api().selectCells(0, inserted); });
-      fireEvent.contextMenu(view.getByTestId(`xlsx-${axis}-header-2`));
-      fireEvent.click(view.getByRole('menuitem', { name: `Delete 2 ${axis}s` }));
-      expect(view.api().handle.cell(0, original.row, original.col).input).toBe(value);
-    });
-
-    it(`unhides an adjacent ${axis} and restores its visibility with undo and save`, async () => {
-      const view = await mountTracks(false, true);
-      expect(view.queryByTestId(`xlsx-${axis}-header-1`)).toBeNull();
-      fireEvent.contextMenu(view.getByTestId(`xlsx-${axis}-header-0`));
-      fireEvent.click(view.getByRole('menuitem', { name: `Unhide ${axis}s` }));
-      await waitFor(() => expect(view.queryByTestId(`xlsx-${axis}-header-1`)).not.toBeNull());
-      expect(view.api().handle.cell(0, 1, 0).input).toBe('20');
-      expect(view.api().handle.cell(0, 0, 1).input).toBe('=SUM(A1:A3)');
-      fireEvent.click(view.getByTestId('xlsx-undo'));
-      await waitFor(() => expect(view.queryByTestId(`xlsx-${axis}-header-1`)).toBeNull());
-      fireEvent.click(view.getByTestId('xlsx-redo'));
-      let saved!: Uint8Array;
-      await act(async () => { saved = view.api().save(); });
-      const reopened = openWorkbook(saved);
-      try {
-        const size = reopened.cellPosition(0, axis === 'row' ? 1 : 0, axis === 'row' ? 0 : 1);
-        expect(axis === 'row' ? size.height : size.width).toBeGreaterThan(0);
-      } finally { reopened.dispose(); }
-    });
-  }
-
-  it('opens header actions from the keyboard and dismisses them without modifying the workbook', async () => {
-    const view = await mountTracks();
-    fireEvent.keyDown(view.getByTestId('xlsx-row-header-0'), { key: 'F10', shiftKey: true });
-    const first = view.getByRole('menuitem', { name: 'Insert row above' });
-    expect(document.activeElement).toBe(first);
-    fireEvent.keyDown(first, { key: 'ArrowDown' });
-    expect(document.activeElement).toBe(view.getByRole('menuitem', { name: 'Insert row below' }));
-    fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
-    expect(view.queryByRole('menu')).toBeNull();
-    expect(document.activeElement).toBe(view.getByTestId('xlsx-scroll'));
-    expect(view.api().handle.historyState().canUndo).toBe(false);
-    expect(view.changes).toHaveLength(0);
-  });
-
-  it('exposes no row or column mutation menu in viewing mode', async () => {
-    const view = await mountTracks(true);
-    for (const axis of ['row', 'column']) {
-      fireEvent.contextMenu(view.getByTestId(`xlsx-${axis}-header-0`));
-      expect(view.queryByRole('menu')).toBeNull();
-    }
-    expect(view.api().handle.historyState().canUndo).toBe(false);
-  });
 });

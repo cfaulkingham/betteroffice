@@ -66,9 +66,9 @@ function session() {
     captureFormat: mock<WorkbookSession['call']['captureFormat']>(async () => { throw new Error('Unexpected format capture'); }),
     frame: mock(async (viewport: Viewport, options?: { sheet?: number }) => frame(options?.sheet ?? 0, viewport)),
     sheetView: mock(async (sheet: number) => sheetView(sheet)),
-    cellGeometry: mock(async (sheet: number, row: number, col: number) => ({
+    cellGeometry: mock(async (sheet: number, row: number, col: number): Promise<xlsx.WorkbookCellGeometry> => ({
       sheet, version: 'v1', rect: { x: col * 96, y: row * 24, w: 96, h: 24 },
-      scrollPosition: { x: col * 96, y: row * 24 },
+      scrollPosition: { x: col * 96, y: row * 24, width: 96, height: 24, columnWidth: 13, rowHeight: 18, rowHeightScale: 4 / 3 },
     })),
     selectionData: mock<WorkbookSession['call']['selectionData']>(async () => ({ edge: null, region: null })),
     cellInputs: mock(async (sheet: number, range: string) => ({
@@ -748,7 +748,7 @@ describe('workbook session viewer', () => {
       frozenRows: 1, frozenCols: 1, frozenWidth: 96, frozenHeight: 24 });
     call.cellGeometry.mockImplementation(async (sheet, row, col) => ({
       sheet, version: 'v1', rect: { x: col * 96, y: row * 24, w: 96, h: 24 },
-      scrollPosition: { x: Math.max(0, col * 96 - 96), y: Math.max(0, row * 24 - 24) },
+      scrollPosition: { x: Math.max(0, col * 96 - 96), y: Math.max(0, row * 24 - 24), width: 96, height: 24, columnWidth: 13, rowHeight: 18, rowHeightScale: 4 / 3 },
     }));
     open(viewer);
     let api!: XlsxWorkerViewerApi;
@@ -781,7 +781,7 @@ describe('workbook session viewer', () => {
   it('accepts a painted target with a positive partial viewport intersection', async () => {
     const { viewer, call } = session();
     call.cellGeometry.mockResolvedValue({ sheet: 0, version: 'v1',
-      rect: { x: 0, y: 0, w: 900, h: 700 }, scrollPosition: { x: 0, y: 0 } });
+      rect: { x: 0, y: 0, w: 900, h: 700 }, scrollPosition: { x: 0, y: 0, width: 96, height: 24, columnWidth: 13, rowHeight: 18, rowHeightScale: 4 / 3 } });
     call.frame.mockImplementation(async (viewport, options) => ({
       ...frame(options?.sheet ?? 0, viewport),
       displayList: { ...frame(options?.sheet ?? 0, viewport).displayList,
@@ -802,7 +802,7 @@ describe('workbook session viewer', () => {
     const { viewer, call } = session();
     call.sheetView.mockResolvedValue({ ...sheetView(0), contentWidth: 96, contentHeight: 24 });
     call.cellGeometry.mockResolvedValue({ sheet: 0, version: 'v1',
-      rect: { x: 96, y: 0, w: 0, h: 24 }, scrollPosition: { x: 96, y: 0 } });
+      rect: { x: 96, y: 0, w: 0, h: 24 }, scrollPosition: { x: 96, y: 0, width: 96, height: 24, columnWidth: 13, rowHeight: 18, rowHeightScale: 4 / 3 } });
     call.frame.mockImplementation(async (viewport, options) => ({
       ...frame(options?.sheet ?? 0, viewport),
       mergedRanges: [{ start: { row: 0, col: 0 }, end: { row: 0, col: 1 } }],
@@ -855,7 +855,7 @@ describe('workbook session viewer', () => {
     const selected = api.selectCellsAsync(1, xlsx.selectionAt({ row: 2, col: 2 }));
     fireEvent.click(view.getByRole('tab', { name: 'First' }));
     await act(async () => geometry.resolve({ sheet: 1, version: 'v1', rect: { x: 192, y: 48, w: 96, h: 24 },
-      scrollPosition: { x: 192, y: 48 } }));
+      scrollPosition: { x: 192, y: 48, width: 96, height: 24, columnWidth: 13, rowHeight: 18, rowHeightScale: 4 / 3 } }));
     expect(await selected).toBe(false);
   });
 

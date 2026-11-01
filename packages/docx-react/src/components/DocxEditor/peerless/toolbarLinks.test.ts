@@ -15,4 +15,3 @@ test('worker insertLink is enabled at a collapsed caret', () => {
   } });
   expect(controller.commands.store.getState('insertLink')).toMatchObject({ enabled: false, disabledReason: { code: 'unsupported-story' } });
 });
-

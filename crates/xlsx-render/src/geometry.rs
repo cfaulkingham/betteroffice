@@ -864,7 +864,7 @@ pub struct GridGeometry {
 impl GridGeometry {
     /// Scale applied to explicit row heights by the screen renderer.
     pub fn row_height_scale(sheet: &Sheet, styles: &Stylesheet) -> f64 {
-        stored_height_scale(sheet, NormalFace::from_styles(styles)).unwrap_or(1.0)
+        stored_height_scale(sheet, NormalFace::from_styles(styles), RowFit::Screen).unwrap_or(1.0)
     }
 
     /// build cumulative offset tables from a sheet's custom widths/heights.

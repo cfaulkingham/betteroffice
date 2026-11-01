@@ -12,4 +12,3 @@ export async function sectionPackage(boundary = false): Promise<Uint8Array> {
   zip.file('custom/opaque.xml', '<opaque spelling="unchanged"/>');
   return zip.generateAsync({ type: 'uint8array' });
 }
-

@@ -728,7 +728,7 @@ export function useDocxCommandBinding(inputs: DocxCommandInputs): DocxCommandsHa
               assertCurrent();
               await job.prepare(displayList);
               assertCurrent();
-              return executed(job.print());
+              return executed(await job.print());
             } catch (error) {
               job.cancel();
               throw error;

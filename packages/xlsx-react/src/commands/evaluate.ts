@@ -64,6 +64,7 @@ export interface XlsxCommandEnvironment {
   borderStyle: BorderStyle | null;
   borderColor: string | null;
   pngExport: boolean;
+  menuSearch?: boolean;
   /** `null` when the engine was built without proposals. */
   proposals: readonly XlsxProposalEnvironment[] | null;
   proposalsPanelOpen: boolean;
@@ -489,7 +490,7 @@ function evaluate<K extends XlsxCommandId>(
   args: XlsxCommandArgs[K] | undefined,
   env: XlsxCommandEnvironment
 ): Evaluation<K> {
-  if (id === 'searchMenus') return { gate: 'unsupported-command' };
+  if (id === 'searchMenus' && !env.menuSearch) return { gate: 'unsupported-command' };
   if (id === 'zoom') {
     return {
       gate: null,

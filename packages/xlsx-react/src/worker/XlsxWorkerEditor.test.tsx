@@ -43,6 +43,10 @@ let nextAnimation = 0;
 let painted: DisplayList[];
 let observers: { disconnect: ReturnType<typeof mock> }[];
 
+function scrollAt(x: number, y: number): xlsx.CellPosition {
+  return { x, y, width: 96, height: 24, columnWidth: null, rowHeight: null, rowHeightScale: 1 };
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (error: unknown) => void;
@@ -205,7 +209,7 @@ function harness(realFacade = false, normalizeInput = false) {
     selectionData: mock<WorkbookSession['call']['selectionData']>(async (sheet) => peerMethods.selectionData(sheet)),
     cellGeometry: mock(async (sheet: number, row: number, col: number): Promise<xlsx.WorkbookCellGeometry> => ({
       sheet, version: `v${version}`, rect: { x: col * 96, y: row * 24, w: 96, h: 24 },
-      scrollPosition: { x: col * 96, y: row * 24 },
+      scrollPosition: scrollAt(col * 96, row * 24),
     })),
   };
   const sessionSave = mock<WorkbookSession['save']>(async () => new Uint8Array([0]));
@@ -461,7 +465,7 @@ function peerlessHarness(toolbarCommands = false, workerCommands = false, defaul
   });
   const cellGeometry = mock(async (sheet: number, row: number, col: number): Promise<xlsx.WorkbookCellGeometry> => ({
     sheet, version: 'v1', rect: { x: col * 96, y: row * 24, w: 96, h: 24 },
-    scrollPosition: { x: col * 96, y: row * 24 },
+    scrollPosition: scrollAt(col * 96, row * 24),
   }));
   const frame = mock(async (viewport: xlsx.Viewport, options?: { sheet?: number }) => ({
     displayList: display(viewport), viewport, sheet: options?.sheet ?? 0, sequence: 100 + throughSeq,
@@ -1593,7 +1597,7 @@ for (const cached of [true, false]) describe(`peerless F2 prefill keyboard repla
       await act(async () => prefill.resolve({ sheet: 0, version: 'v1', cells: [[{ a1: 'A251', input: value, isFormula: false }]] }));
       await waitFor(() => expect(host.sent.some((command) => command.kind === 'editCell')).toBe(true));
       expect(host.sent.filter((command) => command.kind === 'editCell')[0]).toMatchObject({ payload: { args: [0, 250, 0, scenario.expected] } });
-      await act(async () => geometry.resolve({ sheet: 0, version: 'v1', rect: { x: 0, y: 6000, w: 96, h: 24 }, scrollPosition: { x: 0, y: 6000 } }));
+      await act(async () => geometry.resolve({ sheet: 0, version: 'v1', rect: { x: 0, y: 6000, w: 96, h: 24 }, scrollPosition: scrollAt(0, 6000) }));
     });
   });
 
@@ -1630,7 +1634,7 @@ for (const cached of [true, false]) describe(`peerless F2 prefill keyboard repla
     fireEvent.keyDown(scroll, { key: '@', altKey: true });
     fireEvent.keyDown(scroll, { key: 'Enter' });
     expect(host.sent.filter((command) => command.kind === 'editCell')[0]).toMatchObject({ payload: { args: [0, 250, 0, 'a@'] } });
-    await act(async () => geometry.resolve({ sheet: 0, version: 'v1', rect: { x: 0, y: 6000, w: 96, h: 24 }, scrollPosition: { x: 0, y: 6000 } }));
+    await act(async () => geometry.resolve({ sheet: 0, version: 'v1', rect: { x: 0, y: 6000, w: 96, h: 24 }, scrollPosition: scrollAt(0, 6000) }));
   });
 });
 
@@ -3949,7 +3953,7 @@ describe('peerless workbook worker editor', () => {
     fireEvent.keyDown(scroll, { key: 'z' });
     expect(view.queryByTestId('xlsx-cell-editor')).toBeNull();
     await act(async () => geometry.resolve({ sheet: 0, version: 'v1',
-      rect: { x: 0, y: 6000, w: 96, h: 24 }, scrollPosition: { x: 0, y: 6000 } }));
+      rect: { x: 0, y: 6000, w: 96, h: 24 }, scrollPosition: scrollAt(0, 6000) }));
     await advance();
     expect(scroll.scrollTop).toBe(6024 - 600 + 2);
     expect((view.getByTestId('xlsx-cell-editor') as HTMLInputElement).value).toBe('z');
@@ -4022,7 +4026,7 @@ describe('peerless workbook worker editor', () => {
     await act(async () => {
       host.ack(host.sent[0]);
       geometry.resolve({ sheet: 0, version: 'v1', rect: { x: 0, y: 6000, w: 96, h: 24 },
-        scrollPosition: { x: 0, y: 6000 } });
+        scrollPosition: scrollAt(0, 6000) });
     });
     await advance();
     expect(view.queryByTestId('xlsx-cell-editor')).toBeNull();
@@ -4043,7 +4047,7 @@ describe('peerless workbook worker editor', () => {
     await act(async () => {
       host.ack(host.sent[0]); host.ack(host.sent[1]);
       geometry.resolve({ sheet: 0, version: 'v1', rect: { x: 0, y: 6000, w: 96, h: 24 },
-        scrollPosition: { x: 0, y: 6000 } });
+        scrollPosition: scrollAt(0, 6000) });
     });
     await advance();
     expect(host.cells.get('0:250:0')).toBe('z');
@@ -4730,7 +4734,7 @@ describe('workbook worker editor', () => {
     host.hydrate.mockReturnValue(hydration.promise);
     const cellGeometry = mock(async (sheet: number, row: number, col: number): Promise<xlsx.WorkbookCellGeometry> => ({
       sheet, version: 'v1', rect: { x: col * 96, y: row * 24, w: 96, h: 24 },
-      scrollPosition: { x: col * 96, y: row * 24 },
+      scrollPosition: scrollAt(col * 96, row * 24),
     }));
     Object.assign(host.sessionMethods, { cellGeometry });
     let api!: XlsxWorkerEditorApi;

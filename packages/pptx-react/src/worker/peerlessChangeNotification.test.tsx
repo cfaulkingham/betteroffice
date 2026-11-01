@@ -99,4 +99,3 @@ test('idle delivers the committed change exactly once without failure', async ()
   expect(value.changed).toHaveBeenCalledTimes(1);
   expect(value.error).not.toHaveBeenCalled();
 });
-

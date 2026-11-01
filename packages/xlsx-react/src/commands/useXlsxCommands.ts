@@ -69,6 +69,8 @@ export interface XlsxEditorBridge {
   refreshProposals(): void;
   deliver(bytes: Uint8Array): void;
   exportPng(): Promise<void>;
+  print?(): void | Promise<void>;
+  searchMenus?(): void;
   /** True once the canvas paints every committed change; false if it does not in time. */
   afterPaint(): Promise<boolean>;
   focusGrid(): void;
@@ -214,6 +216,7 @@ export function useXlsxCommandBinding(
         borderStyle: view.borderStyle ?? read?.formatting?.borderStyle ?? null,
         borderColor: view.borderColor ?? read?.formatting?.borderColor ?? null,
         pngExport: view.pngExport,
+        menuSearch: current.searchMenus !== undefined,
         proposals: view.proposalsAvailable
           ? view.proposals.map((proposal) => ({ id: proposal.id, label: proposal.agentId }))
           : null,
@@ -356,6 +359,11 @@ export function useXlsxCommandBinding(
             current.deliver(handle.save());
             return done();
           });
+        case 'searchMenus':
+          return attempt(() => {
+            current.searchMenus?.();
+            return done();
+          });
         case 'exportPng': {
           const generation = current.generation();
           let exported: Promise<void>;
@@ -368,11 +376,17 @@ export function useXlsxCommandBinding(
         }
         case 'print': {
           const generation = current.generation();
-          return current.afterPaint().then((painted) => {
+          return current.afterPaint().then(async (painted) => {
             if (bridgeRef.current.generation() !== generation) return fail('document-replaced');
             if (!painted) return fail('render-failed');
-            window.print();
-            return done();
+            try {
+              if (current.print) await current.print();
+              else window.print();
+              return done();
+            } catch (error) {
+              current.fail(error);
+              return fail('command-failed');
+            }
           });
         }
         case 'zoom':
